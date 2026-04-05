@@ -31,6 +31,7 @@ SITES = [
 
 app = FastAPI()
 
+# --- ФУНКЦИИ БД ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -48,12 +49,11 @@ def get_historical_data(site, days=30):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        # Группируем данные по дням для графиков
         cur.execute("""
             SELECT 
                 DATE(timestamp) as date,
                 ROUND(AVG(response_time)::numeric, 3) as avg_resp,
-                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / COUNT(*))::numeric, 2) as uptime
+                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as uptime
             FROM logs 
             WHERE site = %s AND timestamp > NOW() - INTERVAL %s
             GROUP BY DATE(timestamp)
@@ -105,33 +105,76 @@ def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
 
+# --- ГЛАВНАЯ СТРАНИЦА ---
 @app.get("/", response_class=HTMLResponse)
 async def index():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
     
-    html = """
+    current_time = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    
+    html = f"""
     <html>
     <head>
-        <title>Sibur Advanced Monitor</title>
+        <title>Sibur Dashboard</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; }
-            .container { max-width: 1200px; margin: auto; background: white; padding: 20px; border-radius: 8px; shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
-            th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
-            th { background: #007bff; color: white; }
-            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 20px; }
-            .chart-card { background: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 8px; }
-            .up { color: #28a745; font-weight: bold; }
-            .down { color: #dc3545; font-weight: bold; }
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1200px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }}
+            
+            .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 20px; }}
+            .refresh-btn {{ background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.3s; }}
+            .refresh-btn:hover {{ background: #0056b3; }}
+            .last-update {{ color: #666; font-size: 0.9em; }}
+
+            .tabs {{ display: flex; gap: 10px; margin-bottom: 20px; }}
+            .tab-btn {{ padding: 10px 25px; border: none; background: #e9ecef; border-radius: 6px; cursor: pointer; font-weight: 600; color: #495057; }}
+            .tab-btn.active {{ background: #007bff; color: white; }}
+            
+            .tab-content {{ display: none; }}
+            .tab-content.active {{ display: block; }}
+
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 15px; text-align: left; border-bottom: 1px solid #edf2f7; }}
+            th {{ background: #f8f9fa; color: #4a5568; text-transform: uppercase; font-size: 0.85em; letter-spacing: 0.05em; }}
+            tr:hover {{ background: #fcfcfc; }}
+            
+            .site-link {{ color: #007bff; text-decoration: none; font-weight: 500; }}
+            .site-link:hover {{ text-decoration: underline; }}
+            
+            .up {{ color: #2ecc71; font-weight: bold; }}
+            .down {{ color: #e74c3c; font-weight: bold; }}
+
+            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 25px; }}
+            .chart-card {{ border: 1px solid #edf2f7; border-radius: 10px; padding: 15px; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🚀 Мониторинг систем СИБУР</h1>
-            <table>
-                <tr><th>Сайт</th><th>Uptime</th><th>Ответ</th><th>SSL</th></tr>
+            <div class="header">
+                <div>
+                    <h1 style="margin:0; color: #2d3748;">Мониторинг СИБУР</h1>
+                    <span class="last-update">Данные актуальны на: <strong>{current_time}</strong></span>
+                </div>
+                <button class="refresh-btn" onclick="location.reload()">🔄 Обновить данные</button>
+            </div>
+
+            <div class="tabs">
+                <button class="tab-btn active" onclick="openTab(event, 'table-view')">📊 Таблица</button>
+                <button class="tab-btn" onclick="openTab(event, 'charts-view')">📈 Графики (30д)</button>
+            </div>
+
+            <div id="table-view" class="tab-content active">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Сайт</th>
+                            <th>Uptime (30д)</th>
+                            <th>Последний ответ</th>
+                            <th>SSL Сертификат</th>
+                        </tr>
+                    </thead>
+                    <tbody>
     """
     
     chart_data = {}
@@ -145,29 +188,56 @@ async def index():
         
         uptime_val = history['uptime'][-1] if history['uptime'] else 0
         status_class = "up" if last and last['status'] == 200 else "down"
+        resp_time = round(last['response_time'], 3) if last else 0
+        ssl_days = last['ssl_days'] if last and last['ssl_days'] is not None else "N/A"
         
         html += f"""
             <tr>
-                <td><strong>{site}</strong></td>
+                <td><a href="https://{site}" target="_blank" class="site-link">{site}</a></td>
                 <td class="{status_class}">{uptime_val}%</td>
-                <td>{round(last['response_time'], 3) if last else 0} сек</td>
-                <td>{last['ssl_days'] if last else 'N/A'} дн.</td>
+                <td>{resp_time} сек</td>
+                <td>{ssl_days} дн.</td>
             </tr>
         """
     
-    html += """</table><h2>📈 Графики производительности (30 дней)</h2><div class="grid">"""
+    html += """
+                    </tbody>
+                </table>
+            </div>
+
+            <div id="charts-view" class="tab-content">
+                <div class="grid">
+    """
     
     for site in SITES:
         html += f"""
             <div class="chart-card">
-                <h3>{site}</h3>
+                <h3 style="margin-top:0; color:#4a5568; font-size: 1em;">{site}</h3>
                 <canvas id="chart-{site.replace('.', '_')}"></canvas>
             </div>
         """
 
-    html += """</div></div><script>"""
+    html += """
+                </div>
+            </div>
+        </div>
+
+        <script>
+            function openTab(evt, tabName) {
+                var i, tabcontent, tablinks;
+                tabcontent = document.getElementsByClassName("tab-content");
+                for (i = 0; i < tabcontent.length; i++) {
+                    tabcontent[i].classList.remove("active");
+                }
+                tablinks = document.getElementsByClassName("tab-btn");
+                for (i = 0; i < tablinks.length; i++) {
+                    tablinks[i].classList.remove("active");
+                }
+                document.getElementById(tabName).classList.add("active");
+                evt.currentTarget.classList.add("active");
+            }
+    """
     
-    # Передаем данные в JS
     for site, data in chart_data.items():
         safe_id = site.replace('.', '_')
         html += f"""
@@ -176,15 +246,17 @@ async def index():
             data: {{
                 labels: {json.dumps(data['labels'])},
                 datasets: [
-                    {{ label: 'Uptime %', data: {json.dumps(data['uptime'])}, borderColor: '#28a745', yAxisID: 'y' }},
-                    {{ label: 'Ответ (сек)', data: {json.dumps(data['resp'])}, borderColor: '#007bff', yAxisID: 'y1' }}
+                    {{ label: 'Uptime %', data: {json.dumps(data['uptime'])}, borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.1)', fill: true, tension: 0.3, yAxisID: 'y' }},
+                    {{ label: 'Ответ (сек)', data: {json.dumps(data['resp'])}, borderColor: '#3498db', tension: 0.3, yAxisID: 'y1' }}
                 ]
             }},
             options: {{
+                responsive: true,
                 scales: {{
-                    y: {{ type: 'linear', position: 'left', min: 0, max: 100 }},
+                    y: {{ type: 'linear', position: 'left', min: 0, max: 105, display: false }},
                     y1: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }} }}
-                }}
+                }},
+                plugins: {{ legend: {{ display: false }} }}
             }}
         }});
         """
@@ -193,3 +265,8 @@ async def index():
     cur.close()
     conn.close()
     return html
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
