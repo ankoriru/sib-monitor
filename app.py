@@ -71,13 +71,12 @@ def get_stats_period(hours=24):
 # --- ВОРКЕР И ОПОВЕЩЕНИЯ ---
 def check_worker():
     last_status_map = {}
-    last_latency_map = {} # True если был > 20 сек
+    last_latency_map = {}
     last_ssl_notification_date = None
 
     while True:
         now_msk = datetime.datetime.now(TZ_MOSCOW)
         
-        # Ежедневное уведомление SSL в 09:00
         if now_msk.hour == 9 and last_ssl_notification_date != now_msk.date():
             ssl_alerts = []
             for site in SITES:
@@ -90,7 +89,6 @@ def check_worker():
 
         for site in SITES:
             try:
-                # Текущая проверка
                 start = time.time()
                 try:
                     r = requests.get(f"https://{site}", timeout=25)
@@ -101,30 +99,21 @@ def check_worker():
                 prev_status = last_status_map.get(site, 200)
                 was_slow = last_latency_map.get(site, False)
 
-                # 1. Оповещение UP/DOWN
                 if prev_status == 200 and curr_status != 200:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                                  json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
                 elif prev_status != 200 and curr_status == 200:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                                  json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP! Доступ восстановлен."})
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
                 
-                # 2. Оповещение Latency (Задержка)
                 if resp_time > 20 and not was_slow:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                                  json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site} отвечает слишком долго: {round(resp_time, 2)} сек."})
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = True
                 elif resp_time < 10 and was_slow:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                                  json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site} теперь отвечает за {round(resp_time, 2)} сек."})
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = False
 
                 last_status_map[site] = curr_status
-
-                # Сохранение в БД
                 conn = get_db_connection(); cur = conn.cursor()
-                cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)", 
-                           (site, curr_status, resp_time, ssl_d))
+                cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)", (site, curr_status, resp_time, ssl_d))
                 conn.commit(); cur.close(); conn.close()
             except: pass
         time.sleep(300)
@@ -150,26 +139,23 @@ async def index(auth: bool = Depends(check_auth)):
     conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
     
-    # KPI Данные
     up24, resp24 = get_stats_period(24)
     up30, resp30 = get_stats_period(720)
     
     cur.execute("SELECT COUNT(DISTINCT site) FROM logs l1 WHERE status=200 AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
     sites_online = cur.fetchone()[0] or 0
-    
     cur.execute("SELECT COUNT(DISTINCT site) FROM logs l1 WHERE (status != 200 OR response_time > 20) AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
     incident_count = cur.fetchone()[0] or 0
-
-    cur.execute("SELECT site, ssl_days FROM logs l1 WHERE ssl_days <= 20 AND ssl_days >= 0 AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
+    cur.execute("SELECT site, ssl_days FROM logs l1 WHERE (ssl_days <= 20 OR ssl_days < 0) AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
     ssl_issues = cur.fetchall()
 
     html = f"""
     <html><head><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
-        .container {{ max-width: 1300px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+        .container {{ max-width: 1300px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
-        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-bottom: 25px; }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }}
         .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; }}
         .kpi-label {{ font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }}
         .kpi-val {{ font-size: 20px; font-weight: 800; display: block; margin-top: 5px; }}
@@ -184,17 +170,22 @@ async def index(auth: bool = Depends(check_auth)):
         .row-err {{ background-color: #fff1f2; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
+        .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
+        .refresh-btn:hover {{ background: #2563eb; }}
     </style></head><body><div class="container">
         <div class="header">
             <h1 style="margin:0">📊 Мониторинг сайтов</h1>
-            <div style="text-align:right"><span style="font-size:12px; color:#64748b">Обновлено:</span><br><strong>{now_msk} МСК</strong></div>
+            <div style="text-align:right">
+                <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
+            </div>
         </div>
 
         <div class="kpi-grid">
-            <div class="kpi-card"><span class="kpi-label">Сайтов доступно</span><span class="kpi-val">{sites_online} / {len(SITES)}</span></div>
+            <div class="kpi-card"><span class="kpi-label">Доступно</span><span class="kpi-val">{sites_online} / {len(SITES)}</span></div>
             <div class="kpi-card"><span class="kpi-label">Uptime (24ч / 30д)</span><span class="kpi-val">{up24}% / {up30}%</span></div>
-            <div class="kpi-card"><span class="kpi-label">Средний ответ (24ч / 30д)</span><span class="kpi-val">{resp24}с / {resp30}с</span></div>
+            <div class="kpi-card"><span class="kpi-label">Ответ (24ч / 30д)</span><span class="kpi-val">{resp24}с / {resp30}с</span></div>
             <div class="kpi-card { 'danger-card' if incident_count > 0 else '' }"><span class="kpi-label">Инциденты</span><span class="kpi-val">{incident_count}</span></div>
+            <div class="kpi-card { 'danger-card' if ssl_issues else '' }"><span class="kpi-label">SSL под угрозой</span><span class="kpi-val">{len(ssl_issues)}</span></div>
         </div>
 
         {" <div class='alert-box'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
