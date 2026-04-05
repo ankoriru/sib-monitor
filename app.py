@@ -4,17 +4,21 @@ import socket
 import requests
 import psycopg2 
 import json
+import base64
+import pytz
 from psycopg2.extras import DictCursor
 import threading
 import time
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response, Depends, HTTPException
 from fastapi.responses import HTMLResponse
+from starlette.status import HTTP_401_UNAUTHORIZED
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://siburdb_user:IbaJQKbh6DQ5z9i3J82EWRJFnl1z3gkt@dpg-d797355m5p6s739tgr1g-a/siburdb")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeTOLrO9I")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
+TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
 SITES = [
     "sibur.ru", "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -31,7 +35,21 @@ SITES = [
 
 app = FastAPI()
 
-# --- ФУНКЦИИ БД ---
+# --- АВТОРИЗАЦИЯ ---
+def check_auth(request: Request):
+    auth = request.headers.get("Authorization")
+    if not auth:
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
+    try:
+        scheme, credentials = auth.split()
+        decoded = base64.b64decode(credentials).decode("ascii")
+        username, password = decoded.split(":")
+        if username == "sibur" and password == "sibur":
+            return True
+    except: pass
+    raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
+
+# --- РАБОТА С БД ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -45,31 +63,30 @@ def init_db():
     cur.close()
     conn.close()
 
+def get_global_stats(hours=24):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(f"SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2), ROUND(AVG(response_time)::numeric, 3) FROM logs WHERE timestamp > NOW() - INTERVAL '{hours} hours'")
+        res = cur.fetchone()
+        conn.close()
+        return res if res[0] is not None else (0, 0)
+    except: return (0, 0)
+
 def get_historical_data(site, days=30):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("""
-            SELECT 
-                DATE(timestamp) as date,
-                ROUND(AVG(response_time)::numeric, 3) as avg_resp,
-                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as uptime
-            FROM logs 
-            WHERE site = %s AND timestamp > NOW() - INTERVAL %s
-            GROUP BY DATE(timestamp)
-            ORDER BY DATE(timestamp) ASC
-        """, (site, f'{days} days'))
+        cur.execute("""SELECT DATE(timestamp) as d, ROUND(AVG(response_time)::numeric, 3), 
+                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2)
+                    FROM logs WHERE site = %s AND timestamp > NOW() - INTERVAL %s 
+                    GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) ASC""", (site, f'{days} days'))
         rows = cur.fetchall()
         conn.close()
-        return {
-            "labels": [r['date'].strftime('%d.%m') for r in rows],
-            "uptime": [float(r['uptime']) for r in rows],
-            "resp": [float(r['avg_resp']) for r in rows]
-        }
-    except:
-        return {"labels": [], "uptime": [], "resp": []}
+        return {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
+    except: return {"labels": [], "uptime": [], "resp": []}
 
-# --- ВОРКЕР (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- ПРОВЕРКИ ---
 def get_real_ssl(hostname):
     try:
         context = ssl.create_default_context()
@@ -81,23 +98,45 @@ def get_real_ssl(hostname):
     except: return -1
 
 def check_worker():
+    last_ssl_alert = {}
     while True:
         for site in SITES:
             try:
-                start = time.time()
-                r = requests.get(f"https://{site}", timeout=10)
-                status, resp_time = r.status_code, time.time() - start
-            except: status, resp_time = 0, 0
-            ssl_d = get_real_ssl(site)
-            try:
+                # Получаем прошлый статус
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)",
-                           (site, status, resp_time, ssl_d))
-                conn.commit()
-                cur.close()
-                conn.close()
-            except: pass
+                cur.execute("SELECT status FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
+                row = cur.fetchone()
+                last_status = row[0] if row else 200
+                cur.close(); conn.close()
+
+                # Текущая проверка
+                start = time.time()
+                try:
+                    r = requests.get(f"https://{site}", timeout=10)
+                    current_status, resp_time = r.status_code, time.time() - start
+                except: current_status, resp_time = 0, 0
+                
+                ssl_d = get_real_ssl(site)
+
+                # Уведомления UP/DOWN
+                if last_status == 200 and current_status != 200:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {current_status}"})
+                elif last_status != 200 and current_status == 200:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP! Доступ восстановлен."})
+
+                # Уведомление SSL (раз в сутки)
+                if 0 <= ssl_d <= 20:
+                    today = datetime.date.today().isoformat()
+                    if last_ssl_alert.get(site) != today:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚠️ SSL истекает ({ssl_d} дн.): {site}"})
+                        last_ssl_alert[site] = today
+
+                # Сохранение
+                conn = get_db_connection(); cur = conn.cursor()
+                cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)", (site, current_status, resp_time, ssl_d))
+                conn.commit(); cur.close(); conn.close()
+            except Exception as e: print(f"Worker error: {e}")
         time.sleep(300)
 
 @app.on_event("startup")
@@ -105,168 +144,84 @@ def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
 
-# --- ГЛАВНАЯ СТРАНИЦА ---
+# --- ИНТЕРФЕЙС ---
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
+async def index(auth: bool = Depends(check_auth)):
+    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
+    now_moscow = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
+    up24, resp24 = get_global_stats(24)
+    up30, resp30 = get_global_stats(720)
     
-    current_time = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    
+    cur.execute("SELECT COUNT(DISTINCT site) FROM logs l1 WHERE status != 200 AND timestamp = (SELECT MAX(timestamp) FROM logs l2 WHERE l1.site = l2.site)")
+    problems = cur.fetchone()[0] or 0
+    cur.execute("SELECT site, ssl_days FROM logs l1 WHERE ssl_days <= 20 AND ssl_days >= 0 AND timestamp = (SELECT MAX(timestamp) FROM logs l2 WHERE l1.site = l2.site)")
+    ssl_issues = cur.fetchall()
+
     html = f"""
-    <html>
-    <head>
-        <title>Sibur Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; margin: 0; padding: 20px; }}
-            .container {{ max-width: 1200px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }}
-            
-            .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 20px; margin-bottom: 20px; }}
-            .refresh-btn {{ background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.3s; }}
-            .refresh-btn:hover {{ background: #0056b3; }}
-            .last-update {{ color: #666; font-size: 0.9em; }}
-
-            .tabs {{ display: flex; gap: 10px; margin-bottom: 20px; }}
-            .tab-btn {{ padding: 10px 25px; border: none; background: #e9ecef; border-radius: 6px; cursor: pointer; font-weight: 600; color: #495057; }}
-            .tab-btn.active {{ background: #007bff; color: white; }}
-            
-            .tab-content {{ display: none; }}
-            .tab-content.active {{ display: block; }}
-
-            table {{ width: 100%; border-collapse: collapse; }}
-            th, td {{ padding: 15px; text-align: left; border-bottom: 1px solid #edf2f7; }}
-            th {{ background: #f8f9fa; color: #4a5568; text-transform: uppercase; font-size: 0.85em; letter-spacing: 0.05em; }}
-            tr:hover {{ background: #fcfcfc; }}
-            
-            .site-link {{ color: #007bff; text-decoration: none; font-weight: 500; }}
-            .site-link:hover {{ text-decoration: underline; }}
-            
-            .up {{ color: #2ecc71; font-weight: bold; }}
-            .down {{ color: #e74c3c; font-weight: bold; }}
-
-            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 25px; }}
-            .chart-card {{ border: 1px solid #edf2f7; border-radius: 10px; padding: 15px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <div>
-                    <h1 style="margin:0; color: #2d3748;">Мониторинг СИБУР</h1>
-                    <span class="last-update">Данные актуальны на: <strong>{current_time}</strong></span>
-                </div>
-                <button class="refresh-btn" onclick="location.reload()">🔄 Обновить данные</button>
-            </div>
-
-            <div class="tabs">
-                <button class="tab-btn active" onclick="openTab(event, 'table-view')">📊 Таблица</button>
-                <button class="tab-btn" onclick="openTab(event, 'charts-view')">📈 Графики (30д)</button>
-            </div>
-
-            <div id="table-view" class="tab-content active">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Сайт</th>
-                            <th>Uptime (30д)</th>
-                            <th>Последний ответ</th>
-                            <th>SSL Сертификат</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-    """
-    
-    chart_data = {}
-
-    for site in SITES:
-        history = get_historical_data(site)
-        chart_data[site] = history
-        
-        cur.execute("SELECT status, response_time, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
-        last = cur.fetchone()
-        
-        uptime_val = history['uptime'][-1] if history['uptime'] else 0
-        status_class = "up" if last and last['status'] == 200 else "down"
-        resp_time = round(last['response_time'], 3) if last else 0
-        ssl_days = last['ssl_days'] if last and last['ssl_days'] is not None else "N/A"
-        
-        html += f"""
-            <tr>
-                <td><a href="https://{site}" target="_blank" class="site-link">{site}</a></td>
-                <td class="{status_class}">{uptime_val}%</td>
-                <td>{resp_time} сек</td>
-                <td>{ssl_days} дн.</td>
-            </tr>
-        """
-    
-    html += """
-                    </tbody>
-                </table>
-            </div>
-
-            <div id="charts-view" class="tab-content">
-                <div class="grid">
-    """
-    
-    for site in SITES:
-        html += f"""
-            <div class="chart-card">
-                <h3 style="margin-top:0; color:#4a5568; font-size: 1em;">{site}</h3>
-                <canvas id="chart-{site.replace('.', '_')}"></canvas>
-            </div>
-        """
-
-    html += """
-                </div>
-            </div>
+    <html><head><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f4f7f6; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+        .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border-top: 4px solid #007bff; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }}
+        .danger {{ border-top-color: #e74c3c !important; }}
+        .kpi-val {{ font-size: 20px; font-weight: bold; display: block; }}
+        .alert {{ background: #fff5f5; border: 1px solid #feb2b2; padding: 10px; border-radius: 8px; margin-bottom: 20px; color: #c53030; }}
+        .tabs {{ margin-bottom: 15px; }}
+        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 5px; cursor: pointer; font-weight: bold; }}
+        .tab-btn.active {{ background: #007bff; color: white; }}
+        .tab-content {{ display: none; }} .active-content {{ display: block; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 12px; border-bottom: 1px solid #eee; text-align: left; }}
+        .ssl-err {{ background: #fff5f5; color: #c53030; font-weight: bold; }}
+        .up {{ color: #27ae60; font-weight: bold; }} .down {{ color: #e74c3c; font-weight: bold; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 15px; }}
+    </style></head><body><div class="container">
+        <h1>📊 Мониторинг сайтов</h1>
+        <p>Актуально на (МСК): <strong>{now_moscow}</strong></p>
+        <div class="kpi-grid">
+            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><span class="kpi-val">{up24}% / {up30}%</span></div>
+            <div class="kpi-card"><span>Средний ответ (24ч)</span><span class="kpi-val">{resp24} сек</span></div>
+            <div class="kpi-card {'danger' if problems > 0 else ''}"><span>Инциденты</span><span class="kpi-val">{problems}</span></div>
+            <div class="kpi-card {'danger' if ssl_issues else ''}"><span>SSL <= 20д</span><span class="kpi-val">{len(ssl_issues)}</span></div>
         </div>
-
-        <script>
-            function openTab(evt, tabName) {
-                var i, tabcontent, tablinks;
-                tabcontent = document.getElementsByClassName("tab-content");
-                for (i = 0; i < tabcontent.length; i++) {
-                    tabcontent[i].classList.remove("active");
-                }
-                tablinks = document.getElementsByClassName("tab-btn");
-                for (i = 0; i < tablinks.length; i++) {
-                    tablinks[i].classList.remove("active");
-                }
-                document.getElementById(tabName).classList.add("active");
-                evt.currentTarget.classList.add("active");
-            }
+        {"<div class='alert'>⚠️ <strong>Внимание!</strong> Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
+        <div class="tabs">
+            <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
+            <button class="tab-btn" onclick="tab(event, 't2')">Графики</button>
+            <button class="tab-btn" style="float:right; background:#007bff; color:white" onclick="location.reload()">🔄 Обновить</button>
+        </div>
+        <div id="t1" class="tab-content active-content"><table>
+            <thead><tr><th>Сайт</th><th>Uptime</th><th>Ответ</th><th>SSL (дн)</th></tr></thead><tbody>
     """
+    chart_data = {}
+    for s in SITES:
+        h = get_historical_data(s); chart_data[s] = h
+        cur.execute("SELECT status, response_time, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (s,))
+        l = cur.fetchone()
+        ssl_v = l['ssl_days'] if l and l['ssl_days'] is not None else 999
+        st_cl = "up" if l and l['status'] == 200 else "down"
+        html += f"""<tr class="{'ssl-err' if ssl_v <= 20 else ''}">
+            <td><a href="https://{s}" target="_blank" style="color:inherit"><strong>{s}</strong></a></td>
+            <td class="{st_cl}">{h['uptime'][-1] if h['uptime'] else 0}%</td>
+            <td>{round(l['response_time'], 3) if l else 0}</td><td>{ssl_v if ssl_v != 999 else 'N/A'}</td></tr>"""
     
-    for site, data in chart_data.items():
-        safe_id = site.replace('.', '_')
-        html += f"""
-        new Chart(document.getElementById('chart-{safe_id}'), {{
-            type: 'line',
-            data: {{
-                labels: {json.dumps(data['labels'])},
-                datasets: [
-                    {{ label: 'Uptime %', data: {json.dumps(data['uptime'])}, borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.1)', fill: true, tension: 0.3, yAxisID: 'y' }},
-                    {{ label: 'Ответ (сек)', data: {json.dumps(data['resp'])}, borderColor: '#3498db', tension: 0.3, yAxisID: 'y1' }}
-                ]
-            }},
-            options: {{
-                responsive: true,
-                scales: {{
-                    y: {{ type: 'linear', position: 'left', min: 0, max: 105, display: false }},
-                    y1: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }} }}
-                }},
-                plugins: {{ legend: {{ display: false }} }}
-            }}
-        }});
-        """
-    
+    html += """</tbody></table></div><div id="t2" class="tab-content"><div class="grid">"""
+    for s in SITES: html += f"<div style='border:1px solid #eee; padding:10px'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+    html += """</div></div></div><script>
+        function tab(e, n) {
+            var i, x = document.getElementsByClassName("tab-content"), b = document.getElementsByClassName("tab-btn");
+            for (i=0; i<x.length; i++) x[i].className = "tab-content";
+            for (i=0; i<b.length; i++) b[i].className = "tab-btn";
+            document.getElementById(n).className = "tab-content active-content";
+            e.currentTarget.className += " active";
+        }
+    """
+    for s, d in chart_data.items():
+        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#27ae60', yAxisID:'y'}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3498db', yAxisID:'y1'}}]}}, options:{{scales:{{y:{{display:false}},y1:{{position:'right'}}}}}} }});"
     html += "</script></body></html>"
-    cur.close()
-    conn.close()
-    return html
+    cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
