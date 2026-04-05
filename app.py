@@ -155,10 +155,11 @@ async def index(auth: bool = Depends(check_auth)):
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
         .container {{ max-width: 1300px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
-        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }}
-        .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; }}
-        .kpi-label {{ font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }}
-        .kpi-val {{ font-size: 20px; font-weight: 800; display: block; margin-top: 5px; }}
+        /* Измененная сетка для отображения в один ряд */
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 25px; }}
+        .kpi-card {{ background: #fff; padding: 12px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; min-width: 0; }}
+        .kpi-label {{ font-size: 10px; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }}
+        .kpi-val {{ font-size: 18px; font-weight: 800; display: block; margin-top: 5px; }}
         .danger-card {{ border-top-color: #ef4444; color: #991b1b; background: #fef2f2; }}
         .alert-box {{ background: #fff5f5; border: 1px solid #feb2b2; padding: 15px; border-radius: 8px; margin-bottom: 20px; color: #c53030; font-weight: 600; }}
         .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; }}
@@ -172,6 +173,11 @@ async def index(auth: bool = Depends(check_auth)):
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
         .refresh-btn:hover {{ background: #2563eb; }}
+        
+        /* Адаптивность для мобильных устройств */
+        @media (max-width: 1000px) {{
+            .kpi-grid {{ grid-template-columns: repeat(2, 1fr); }}
+        }}
     </style></head><body><div class="container">
         <div class="header">
             <h1 style="margin:0">📊 Мониторинг сайтов</h1>
