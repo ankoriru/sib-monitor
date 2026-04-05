@@ -1,9 +1,8 @@
-
 import datetime
 import ssl
 import socket
 import requests
-import psycopg2 # Библиотека для PostgreSQL
+import psycopg2 
 from psycopg2.extras import DictCursor
 import threading
 import time
@@ -12,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 # --- КОНФИГУРАЦИЯ ---
-# Render автоматически подставляет DATABASE_URL, если ты свяжешь сервисы
+# Используем переменную окружения Render, если она есть
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://siburdb_user:IbaJQKbh6DQ5z9i3J82EWRJFnl1z3gkt@dpg-d797355m5p6s739tgr1g-a/siburdb")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeTOLrO9I")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
@@ -89,7 +88,6 @@ def check_worker():
             
             ssl_d = get_real_ssl(site)
             
-            # Сохранение в Postgres
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
@@ -101,7 +99,6 @@ def check_worker():
             except Exception as e:
                 print(f"DB Error: {e}")
 
-            # Telegram уведомления
             if status != 200:
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
                               json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {status}"})
@@ -115,26 +112,28 @@ def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    @app.get("/", response_class=HTMLResponse)
-async def index():
     conn = get_db_connection()
+    # Используем DictCursor для обращения по именам колонок
     cur = conn.cursor(cursor_factory=DictCursor)
     
     html = """
     <html>
     <head>
         <title>Sibur Monitoring</title>
+        <meta http-equiv="refresh" content="300">
         <style>
-            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; }
-            table { width: 100%; border-collapse: collapse; background: white; }
+            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; color: #333; }
+            table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
             th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
             th { background-color: #007bff; color: white; }
-            .up { color: green; font-weight: bold; }
-            .down { color: red; font-weight: bold; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+            .up { color: #28a745; font-weight: bold; }
+            .down { color: #dc3545; font-weight: bold; }
         </style>
     </head>
     <body>
-        <h1>Мониторинг сайтов</h1>
+        <h1>📊 Мониторинг доступности сайтов</h1>
+        <p>Обновляется каждые 5 минут. В базе хранятся данные последних 30 дней.</p>
         <table>
             <tr>
                 <th>Сайт</th>
@@ -146,16 +145,15 @@ async def index():
     
     for site in SITES:
         uptime, avg_time = get_stats(site)
-        # Получаем последний статус и SSL из базы
         cur.execute("SELECT status, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
         last_log = cur.fetchone()
         
         status_class = "up" if last_log and last_log['status'] == 200 else "down"
-        ssl_days = last_log['ssl_days'] if last_log else "N/A"
+        ssl_days = last_log['ssl_days'] if last_log and last_log['ssl_days'] is not None else "N/A"
         
         html += f"""
             <tr>
-                <td>{site}</td>
+                <td><a href="https://{site}" target="_blank">{site}</a></td>
                 <td class="{status_class}">{uptime}%</td>
                 <td>{avg_time}</td>
                 <td>{ssl_days}</td>
@@ -169,6 +167,5 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    # На Render порт берется из переменной окружения
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
