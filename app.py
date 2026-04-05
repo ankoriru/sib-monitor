@@ -150,99 +150,54 @@ async def index(auth: bool = Depends(check_auth)):
     ssl_issues = cur.fetchall()
 
     html = f"""
-    <html><head><title>Мониторинг сайтов</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <html><head><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; margin: 0; }}
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
         .container {{ max-width: 1300px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
-        
-        /* СТРОГИЙ ОДИН РЯД ДЛЯ KPI */
-        .kpi-grid {{ 
-            display: flex; 
-            flex-direction: row; 
-            flex-wrap: nowrap; 
-            gap: 10px; 
-            margin-bottom: 25px; 
-            overflow-x: auto; /* На случай сверхмалых экранов */
-        }}
-        .kpi-card {{ 
-            flex: 1 1 0; 
-            background: #fff; 
-            padding: 10px; 
-            border-radius: 10px; 
-            border: 1px solid #e2e8f0; 
-            border-top: 4px solid #3b82f6; 
-            min-width: 0; /* Разрешает сжатие */
-            text-align: center;
-        }}
-        .kpi-label {{ 
-            font-size: 9px; 
-            color: #64748b; 
-            text-transform: uppercase; 
-            font-weight: 700; 
-            letter-spacing: 0.02em; 
-            display: block; 
-            white-space: nowrap; 
-            overflow: hidden; 
-            text-overflow: ellipsis;
-        }}
-        .kpi-val {{ 
-            font-size: 14px; 
-            font-weight: 800; 
-            display: block; 
-            margin-top: 5px; 
-            white-space: nowrap;
-        }}
-        
-        @media (min-width: 600px) {{
-            .kpi-label {{ font-size: 11px; }}
-            .kpi-val {{ font-size: 18px; }}
-        }}
-
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }}
+        .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; }}
+        .kpi-label {{ font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }}
+        .kpi-val {{ font-size: 20px; font-weight: 800; display: block; margin-top: 5px; }}
         .danger-card {{ border-top-color: #ef4444; color: #991b1b; background: #fef2f2; }}
         .alert-box {{ background: #fff5f5; border: 1px solid #feb2b2; padding: 15px; border-radius: 8px; margin-bottom: 20px; color: #c53030; font-weight: 600; }}
-        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; overflow-x: auto; }}
-        .tab-btn {{ padding: 10px 15px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; white-space: nowrap; }}
+        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; }}
+        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         .tab-btn.active {{ background: #3b82f6; color: white; }}
         .tab-content {{ display: none; }} .active-content {{ display: block; }}
-        
-        .table-wrapper {{ overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
         .row-err {{ background-color: #fff1f2; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
-        
-        .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }}
+        .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
+        .refresh-btn:hover {{ background: #2563eb; }}
     </style></head><body><div class="container">
         <div class="header">
-            <h1 style="margin:0; font-size: 1.5rem;">📊 Мониторинг</h1>
+            <h1 style="margin:0">📊 Мониторинг сайтов</h1>
             <div style="text-align:right">
-                <button class="refresh-btn" onclick="location.reload()">🔄 {now_msk}</button>
+                <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
             </div>
         </div>
 
         <div class="kpi-grid">
-            <div class="kpi-card"><span class="kpi-label">Доступно</span><span class="kpi-val">{sites_online}/{len(SITES)}</span></div>
-            <div class="kpi-card"><span class="kpi-label">Uptime (24ч/30д)</span><span class="kpi-val">{up24}%/{up30}%</span></div>
-            <div class="kpi-card"><span class="kpi-label">Ответ (24ч/30д)</span><span class="kpi-val">{resp24}с/{resp30}с</span></div>
+            <div class="kpi-card"><span class="kpi-label">Доступно</span><span class="kpi-val">{sites_online} / {len(SITES)}</span></div>
+            <div class="kpi-card"><span class="kpi-label">Uptime (24ч / 30д)</span><span class="kpi-val">{up24}% / {up30}%</span></div>
+            <div class="kpi-card"><span class="kpi-label">Ответ (24ч / 30д)</span><span class="kpi-val">{resp24}с / {resp30}с</span></div>
             <div class="kpi-card { 'danger-card' if incident_count > 0 else '' }"><span class="kpi-label">Инциденты</span><span class="kpi-val">{incident_count}</span></div>
-            <div class="kpi-card { 'danger-card' if ssl_issues else '' }"><span class="kpi-label">SSL <20д</span><span class="kpi-val">{len(ssl_issues)}</span></div>
+            <div class="kpi-card { 'danger-card' if ssl_issues else '' }"><span class="kpi-label">SSL под угрозой</span><span class="kpi-val">{len(ssl_issues)}</span></div>
         </div>
 
-        {" <div class='alert-box'>⚠️ SSL: " + ", ".join([f"{x[0]}({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
+        {" <div class='alert-box'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
 
         <div class="tabs">
-            <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
-            <button class="tab-btn" onclick="tab(event, 't2')">Графики</button>
-            <button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button>
+            <button class="tab-btn active" onclick="tab(event, 't1')">Список сайтов</button>
+            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика (Графики)</button>
+            <button class="tab-btn" onclick="tab(event, 't3')">Журнал ошибок</button>
         </div>
 
         <div id="t1" class="tab-content active-content">
-            <div class="table-wrapper">
-            <table><thead><tr><th>Сайт</th><th>Uptime(30д)</th><th>Ответ</th><th>SSL(дн)</th><th>Простой</th></tr></thead><tbody>
+            <table><thead><tr><th>Сайт</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th><th>Простой (30д)</th></tr></thead><tbody>
     """
     
     chart_data = {}
@@ -264,20 +219,20 @@ async def index(auth: bool = Depends(check_auth)):
         html += f"""<tr class="{'row-err' if is_err else ''}">
             <td><a href="https://{s}" target="_blank" style="color:inherit"><strong>{s}</strong></a></td>
             <td class="{'txt-err' if (upt or 0) < 99 else 'txt-ok'}">{upt or 0}%</td>
-            <td class="{'txt-err' if (last_resp or 0) > 20 else ''}">{round(last_resp or 0, 2)}с</td>
+            <td class="{'txt-err' if (last_resp or 0) > 20 else ''}">{round(last_resp or 0, 2)} сек</td>
             <td class="{'txt-err' if (last_ssl or 999) <= 20 else ''}">{last_ssl if last_ssl is not None else 'N/A'}</td>
-            <td>{down_sec or 0}с</td></tr>"""
+            <td>{down_sec or 0} сек</td></tr>"""
 
-    html += """</tbody></table></div></div>
-        <div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">"""
-    for s in SITES: html += f"<div class='kpi-card' style='text-align:left'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+    html += """</tbody></table></div>
+        <div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
+    for s in SITES: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
     
-    html += """</div></div><div id="t3" class="tab-content"><div class="table-wrapper"><table><thead><tr><th>Время</th><th>Сайт</th><th>Код</th><th>Ответ</th></tr></thead><tbody>"""
-    cur.execute("SELECT timestamp, site, status, response_time FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
+    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Статус</th><th>Ответ</th><th>SSL</th></tr></thead><tbody>"""
+    cur.execute("SELECT timestamp, site, status, response_time, ssl_days FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
     for err in cur.fetchall():
-        html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],1)}</td></tr>"
+        html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}</td><td>{err[4]}</td></tr>"
     
-    html += """</tbody></table></div></div></div><script>
+    html += """</tbody></table></div></div><script>
         function tab(e, n) {
             var i, x = document.getElementsByClassName("tab-content"), b = document.getElementsByClassName("tab-btn");
             for (i=0; i<x.length; i++) x[i].className = "tab-content";
@@ -287,7 +242,7 @@ async def index(auth: bool = Depends(check_auth)):
         }
     """
     for s, d in chart_data.items():
-        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105, ticks:{{display:false}} }},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
+        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105, ticks:{{display:true}} }},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
     html += "</script></body></html>"
     cur.close(); conn.close(); return html
 
