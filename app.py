@@ -115,9 +115,57 @@ def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # Генерируем HTML аналогично предыдущему примеру, используя данные из Postgres
-    # (Код HTML остается таким же, как в прошлом ответе)
-    return "HTML Dashboard Code Here"
+    @app.get("/", response_class=HTMLResponse)
+async def index():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=DictCursor)
+    
+    html = """
+    <html>
+    <head>
+        <title>Sibur Monitoring</title>
+        <style>
+            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; background: white; }
+            th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
+            th { background-color: #007bff; color: white; }
+            .up { color: green; font-weight: bold; }
+            .down { color: red; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>Мониторинг сайтов</h1>
+        <table>
+            <tr>
+                <th>Сайт</th>
+                <th>Uptime (30д)</th>
+                <th>Ответ (сек)</th>
+                <th>SSL (дней)</th>
+            </tr>
+    """
+    
+    for site in SITES:
+        uptime, avg_time = get_stats(site)
+        # Получаем последний статус и SSL из базы
+        cur.execute("SELECT status, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
+        last_log = cur.fetchone()
+        
+        status_class = "up" if last_log and last_log['status'] == 200 else "down"
+        ssl_days = last_log['ssl_days'] if last_log else "N/A"
+        
+        html += f"""
+            <tr>
+                <td>{site}</td>
+                <td class="{status_class}">{uptime}%</td>
+                <td>{avg_time}</td>
+                <td>{ssl_days}</td>
+            </tr>
+        """
+    
+    html += "</table></body></html>"
+    cur.close()
+    conn.close()
+    return html
 
 if __name__ == "__main__":
     import uvicorn
