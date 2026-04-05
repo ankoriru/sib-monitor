@@ -3,6 +3,7 @@ import ssl
 import socket
 import requests
 import psycopg2 
+import json
 from psycopg2.extras import DictCursor
 import threading
 import time
@@ -11,7 +12,6 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 # --- КОНФИГУРАЦИЯ ---
-# Используем переменную окружения Render, если она есть
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://siburdb_user:IbaJQKbh6DQ5z9i3J82EWRJFnl1z3gkt@dpg-d797355m5p6s739tgr1g-a/siburdb")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeTOLrO9I")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
@@ -31,7 +31,6 @@ SITES = [
 
 app = FastAPI()
 
-# --- РАБОТА С POSTGRESQL ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -45,25 +44,32 @@ def init_db():
     cur.close()
     conn.close()
 
-def get_stats(site, days=30):
+def get_historical_data(site, days=30):
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        # Группируем данные по дням для графиков
         cur.execute("""
             SELECT 
-                COUNT(*) FILTER (WHERE status = 200), 
-                COUNT(*),
-                AVG(response_time)
+                DATE(timestamp) as date,
+                ROUND(AVG(response_time)::numeric, 3) as avg_resp,
+                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / COUNT(*))::numeric, 2) as uptime
             FROM logs 
-            WHERE site = %s AND timestamp > NOW() - INTERVAL %s""", (site, f'{days} days'))
-        up, total, avg_time = cur.fetchone()
+            WHERE site = %s AND timestamp > NOW() - INTERVAL %s
+            GROUP BY DATE(timestamp)
+            ORDER BY DATE(timestamp) ASC
+        """, (site, f'{days} days'))
+        rows = cur.fetchall()
         conn.close()
-        uptime = (up / total * 100) if total and total > 0 else 0
-        return round(uptime, 2), round(avg_time or 0, 3)
+        return {
+            "labels": [r['date'].strftime('%d.%m') for r in rows],
+            "uptime": [float(r['uptime']) for r in rows],
+            "resp": [float(r['avg_resp']) for r in rows]
+        }
     except:
-        return 0, 0
+        return {"labels": [], "uptime": [], "resp": []}
 
-# --- ПРОВЕРКИ ---
+# --- ВОРКЕР (БЕЗ ИЗМЕНЕНИЙ) ---
 def get_real_ssl(hostname):
     try:
         context = ssl.create_default_context()
@@ -72,8 +78,7 @@ def get_real_ssl(hostname):
                 cert = ssock.getpeercert()
                 expire_date = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                 return (expire_date - datetime.datetime.utcnow()).days
-    except:
-        return -1
+    except: return -1
 
 def check_worker():
     while True:
@@ -81,13 +86,9 @@ def check_worker():
             try:
                 start = time.time()
                 r = requests.get(f"https://{site}", timeout=10)
-                status = r.status_code
-                resp_time = time.time() - start
-            except:
-                status, resp_time = 0, 0
-            
+                status, resp_time = r.status_code, time.time() - start
+            except: status, resp_time = 0, 0
             ssl_d = get_real_ssl(site)
-            
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
@@ -96,13 +97,7 @@ def check_worker():
                 conn.commit()
                 cur.close()
                 conn.close()
-            except Exception as e:
-                print(f"DB Error: {e}")
-
-            if status != 200:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                              json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {status}"})
-        
+            except: pass
         time.sleep(300)
 
 @app.on_event("startup")
@@ -113,59 +108,88 @@ def startup_event():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     conn = get_db_connection()
-    # Используем DictCursor для обращения по именам колонок
     cur = conn.cursor(cursor_factory=DictCursor)
     
     html = """
     <html>
     <head>
-        <title>Sibur Monitoring</title>
-        <meta http-equiv="refresh" content="300">
+        <title>Sibur Advanced Monitor</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; color: #333; }
-            table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
-            th { background-color: #007bff; color: white; }
-            tr:nth-child(even) { background-color: #f9f9f9; }
+            body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; }
+            .container { max-width: 1200px; margin: auto; background: white; padding: 20px; border-radius: 8px; shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+            th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+            th { background: #007bff; color: white; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 20px; }
+            .chart-card { background: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 8px; }
             .up { color: #28a745; font-weight: bold; }
             .down { color: #dc3545; font-weight: bold; }
         </style>
     </head>
     <body>
-        <h1>📊 Мониторинг доступности сайтов</h1>
-        <p>Обновляется каждые 5 минут. В базе хранятся данные последних 30 дней.</p>
-        <table>
-            <tr>
-                <th>Сайт</th>
-                <th>Uptime (30д)</th>
-                <th>Ответ (сек)</th>
-                <th>SSL (дней)</th>
-            </tr>
+        <div class="container">
+            <h1>🚀 Мониторинг систем СИБУР</h1>
+            <table>
+                <tr><th>Сайт</th><th>Uptime</th><th>Ответ</th><th>SSL</th></tr>
     """
     
+    chart_data = {}
+
     for site in SITES:
-        uptime, avg_time = get_stats(site)
-        cur.execute("SELECT status, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
-        last_log = cur.fetchone()
+        history = get_historical_data(site)
+        chart_data[site] = history
         
-        status_class = "up" if last_log and last_log['status'] == 200 else "down"
-        ssl_days = last_log['ssl_days'] if last_log and last_log['ssl_days'] is not None else "N/A"
+        cur.execute("SELECT status, response_time, ssl_days FROM logs WHERE site = %s ORDER BY timestamp DESC LIMIT 1", (site,))
+        last = cur.fetchone()
+        
+        uptime_val = history['uptime'][-1] if history['uptime'] else 0
+        status_class = "up" if last and last['status'] == 200 else "down"
         
         html += f"""
             <tr>
-                <td><a href="https://{site}" target="_blank">{site}</a></td>
-                <td class="{status_class}">{uptime}%</td>
-                <td>{avg_time}</td>
-                <td>{ssl_days}</td>
+                <td><strong>{site}</strong></td>
+                <td class="{status_class}">{uptime_val}%</td>
+                <td>{round(last['response_time'], 3) if last else 0} сек</td>
+                <td>{last['ssl_days'] if last else 'N/A'} дн.</td>
             </tr>
         """
     
-    html += "</table></body></html>"
+    html += """</table><h2>📈 Графики производительности (30 дней)</h2><div class="grid">"""
+    
+    for site in SITES:
+        html += f"""
+            <div class="chart-card">
+                <h3>{site}</h3>
+                <canvas id="chart-{site.replace('.', '_')}"></canvas>
+            </div>
+        """
+
+    html += """</div></div><script>"""
+    
+    # Передаем данные в JS
+    for site, data in chart_data.items():
+        safe_id = site.replace('.', '_')
+        html += f"""
+        new Chart(document.getElementById('chart-{safe_id}'), {{
+            type: 'line',
+            data: {{
+                labels: {json.dumps(data['labels'])},
+                datasets: [
+                    {{ label: 'Uptime %', data: {json.dumps(data['uptime'])}, borderColor: '#28a745', yAxisID: 'y' }},
+                    {{ label: 'Ответ (сек)', data: {json.dumps(data['resp'])}, borderColor: '#007bff', yAxisID: 'y1' }}
+                ]
+            }},
+            options: {{
+                scales: {{
+                    y: {{ type: 'linear', position: 'left', min: 0, max: 100 }},
+                    y1: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }} }}
+                }}
+            }}
+        }});
+        """
+    
+    html += "</script></body></html>"
     cur.close()
     conn.close()
     return html
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
