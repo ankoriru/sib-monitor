@@ -3,3 +3,4 @@ uvicorn
 requests
 psycopg2-binary
 pytz
+python-multipart
