@@ -268,11 +268,7 @@ async def index(auth: bool = Depends(check_auth)):
     html += "</script></body></html>"
     cur.close(); conn.close(); return html
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-
-    # --- ВРЕМЕННЫЙ СКРИПТ ОЧИСТКИ (Удалить после использования) ---
+# --- ВРЕМЕННЫЙ СКРИПТ ОЧИСТКИ (Удалить после использования) ---
 @app.get("/admin/clear-srm-logs")
 async def clear_srm_logs(auth: bool = Depends(check_auth)):
     try:
@@ -288,3 +284,7 @@ async def clear_srm_logs(auth: bool = Depends(check_auth)):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
