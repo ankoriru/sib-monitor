@@ -56,7 +56,6 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS logs 
                   (site TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
                    status INTEGER, response_time REAL, ssl_days INTEGER)''')
-    # КРИТИЧЕСКИЙ ИНДЕКС ДЛЯ СКОРОСТИ
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_site_ts ON logs (site, timestamp DESC)")
     conn.commit(); cur.close(); conn.close()
 
@@ -85,15 +84,19 @@ def check_worker():
             last_ssl_notification_date = now_msk.date()
 
         for site in SITES:
+            curr_status = 0
+            resp_time = 25.0
+            ssl_d = -1
             try:
                 start = time.time()
                 try:
-                    r = requests.get(f"https://{site}", timeout=25, headers=headers)
-                    curr_status, resp_time = r.status_code, time.time() - start
-                except: curr_status, resp_time = 0, 25.0
-                
-                # Быстрая проверка SSL для лога
-                ssl_d = -1
+                    r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
+                    curr_status = r.status_code
+                    resp_time = time.time() - start
+                except:
+                    curr_status = 0
+                    resp_time = 25.0
+
                 try:
                     context = ssl.create_default_context()
                     with socket.create_connection((site, 443), timeout=3) as sock:
@@ -101,13 +104,13 @@ def check_worker():
                             cert = ssock.getpeercert()
                             exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                             ssl_d = (exp - datetime.datetime.utcnow()).days
-                except: pass
+                except: ssl_d = -1
 
                 if site not in last_status_map: last_status_map[site] = 200
                 if site not in last_latency_map: last_latency_map[site] = False
 
                 if last_status_map[site] == 200 and curr_status != 200:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Статус: {curr_status}"})
                 elif last_status_map[site] != 200 and curr_status == 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
                 
@@ -135,46 +138,15 @@ async def index(auth: bool = Depends(check_auth)):
     conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
 
-    # 1. СТАТИСТИКА 24ч и 30д ОДНИМ ЗАПРОСОМ
-    cur.execute("""
-        SELECT 
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up,
-            ROUND(AVG(response_time)::numeric, 3) as resp
-        FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-    """)
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up, ROUND(AVG(response_time)::numeric, 3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'")
     s30 = cur.fetchone()
-    cur.execute("""
-        SELECT 
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up,
-            ROUND(AVG(response_time)::numeric, 3) as resp
-        FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'
-    """)
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up, ROUND(AVG(response_time)::numeric, 3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
     s24 = cur.fetchone()
-
-    # 2. ПОСЛЕДНЕЕ СОСТОЯНИЕ ВСЕХ САЙТОВ СРАЗУ
-    cur.execute("""
-        SELECT DISTINCT ON (site) site, status, response_time, ssl_days 
-        FROM logs ORDER BY site, timestamp DESC
-    """)
+    cur.execute("SELECT DISTINCT ON (site) site, status, response_time, ssl_days FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
-
-    # 3. АГРЕГАЦИЯ 30 ДНЕЙ ОДНИМ ЗАПРОСОМ
-    cur.execute("""
-        SELECT site, 
-               ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt,
-               COUNT(*) FILTER (WHERE status != 200)*300 as down_sec
-        FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site
-    """)
+    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*300 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats_30d = {r['site']: r for r in cur.fetchall()}
-
-    # 4. ДАННЫЕ ДЛЯ ГРАФИКОВ ОДНИМ ЗАПРОСОМ
-    cur.execute("""
-        SELECT site, DATE(timestamp) as d, 
-               ROUND(AVG(response_time)::numeric,2) as r, 
-               ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u
-        FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-        GROUP BY 1, 2 ORDER BY 2
-    """)
+    cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY 1, 2 ORDER BY 2")
     graph_raw = cur.fetchall()
     chart_data = {}
     for r in graph_raw:
@@ -184,7 +156,6 @@ async def index(auth: bool = Depends(check_auth)):
         chart_data[s]["uptime"].append(float(r['u']))
         chart_data[s]["resp"].append(float(r['r']))
 
-    # Считаем инциденты и SSL из уже полученных данных
     sites_online = sum(1 for s in latest_states.values() if s['status'] == 200)
     incident_count = sum(1 for s in latest_states.values() if s['status'] != 200 or s['response_time'] > 20)
     ssl_issues = [s for s in latest_states.values() if 0 <= s['ssl_days'] <= 20]
@@ -218,7 +189,7 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card"><span>Uptime (24ч / 30д)</span><br><strong>{s24['up']}% / {s30['up']}%</strong></div>
             <div class="kpi-card"><span>Ответ (24ч / 30д)</span><br><strong>{s24['resp']}с / {s30['resp']}с</strong></div>
             <div class="kpi-card {'danger-card' if incident_count > 0 else ''}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
-            <div class="kpi-card {'danger-card' if ssl_issues else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_issues)}</strong></div>
+            <div class="kpi-card {'danger-card' if len(ssl_issues) > 0 else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_issues)}</strong></div>
         </div>
         <div class="tabs">
             <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
@@ -232,11 +203,9 @@ async def index(auth: bool = Depends(check_auth)):
     for s in sorted_sites:
         st = latest_states.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1})
         s30 = stats_30d.get(s, {'upt': 0, 'down_sec': 0})
-        
         h, m, sec = s30['down_sec'] // 3600, (s30['down_sec'] % 3600) // 60, s30['down_sec'] % 60
         is_online = (st['status'] == 200)
         is_row_err = (not is_online or st['response_time'] > 20 or 0 <= st['ssl_days'] <= 20)
-        
         star = "⭐ " if s in PRIORITY_SITES else ""
         html += f"""<tr class="{'row-err' if is_row_err else ''}">
             <td>{star}<a href="https://{s}" target="_blank" style="color:inherit; text-decoration:none;"><strong>{s}</strong></a></td>
@@ -252,10 +221,10 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT timestamp, site, status, response_time FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
     for err in cur.fetchall():
         html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}</td></tr>"
-    html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}"
+    html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}</script>"
     for s, d in chart_data.items():
-        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
-    html += "</script></body></html>"; cur.close(); conn.close(); return html
+        html += f"<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});</script>"
+    html += "</body></html>"; cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
