@@ -20,8 +20,10 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeT
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
+# Список сайтов с учетом приоритетных (сортировка будет в интерфейсе)
 SITES = [
-    "sibur.ru", "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
+    "sibur.ru", "eshop.sibur.ru", "srm.sibur.ru", # Приоритетные
+    "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
     "bopp.sibur.ru", "carbo.sibur.ru", "carbonfootprintcalculator.sibur.ru",
     "career.sibur.ru", "catalog.sibur.ru", "coach.sibur.ru",
     "ecoball.sibur.ru", "greencity-sibur.ru", "guide.sibur.ru",
@@ -32,6 +34,8 @@ SITES = [
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
     "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ]
+
+PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "srm.sibur.ru"]
 
 app = FastAPI()
 
@@ -201,7 +205,12 @@ async def index(auth: bool = Depends(check_auth)):
     """
     
     chart_data = {}
-    for s in SITES:
+    
+    # Сортировка: Сначала приоритетные в заданном порядке, затем остальные по алфавиту
+    other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
+    sorted_sites = PRIORITY_SITES + other_sites
+
+    for s in sorted_sites:
         cur.execute("""SELECT 
             ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2),
             COUNT(*) FILTER (WHERE status != 200)*300,
@@ -216,8 +225,10 @@ async def index(auth: bool = Depends(check_auth)):
         chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
 
         is_err = (last_st != 200 or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
+        display_name = f"⭐ {s}" if s in PRIORITY_SITES else s
+        
         html += f"""<tr class="{'row-err' if is_err else ''}">
-            <td><a href="https://{s}" target="_blank" style="color:inherit"><strong>{s}</strong></a></td>
+            <td><a href="https://{s}" target="_blank" style="color:inherit"><strong>{display_name}</strong></a></td>
             <td class="{'txt-err' if (upt or 0) < 99 else 'txt-ok'}">{upt or 0}%</td>
             <td class="{'txt-err' if (last_resp or 0) > 20 else ''}">{round(last_resp or 0, 2)} сек</td>
             <td class="{'txt-err' if (last_ssl or 999) <= 20 else ''}">{last_ssl if last_ssl is not None else 'N/A'}</td>
@@ -225,7 +236,7 @@ async def index(auth: bool = Depends(check_auth)):
 
     html += """</tbody></table></div>
         <div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
-    for s in SITES: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+    for s in sorted_sites: html += f"<div class='kpi-card'><h4>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
     
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Статус</th><th>Ответ</th><th>SSL</th></tr></thead><tbody>"""
     cur.execute("SELECT timestamp, site, status, response_time, ssl_days FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
