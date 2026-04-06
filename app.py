@@ -20,9 +20,8 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeT
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-# Список сайтов с учетом новых адресов
 SITES = [
-    "sibur.ru", "eshop.sibur.ru", "srm.sibur.ru", # Приоритетные
+    "sibur.ru", "eshop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
     "bopp.sibur.ru", "carbo.sibur.ru", "carbonfootprintcalculator.sibur.ru",
     "career.sibur.ru", "catalog.sibur.ru", "coach.sibur.ru",
@@ -39,7 +38,6 @@ PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "srm.sibur.ru"]
 
 app = FastAPI()
 
-# --- АВТОРИЗАЦИЯ ---
 def check_auth(request: Request):
     auth = request.headers.get("Authorization")
     if not auth: raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic"})
@@ -51,7 +49,6 @@ def check_auth(request: Request):
     except: pass
     raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic"})
 
-# --- БД ---
 def get_db_connection(): return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
@@ -64,21 +61,26 @@ def init_db():
 def get_stats_period(hours=24):
     try:
         conn = get_db_connection(); cur = conn.cursor()
-        cur.execute(f"""SELECT 
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2), 
-            ROUND(AVG(response_time)::numeric, 3) 
-            FROM logs WHERE timestamp > NOW() - INTERVAL '{hours} hours'""")
+        cur.execute(f"SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2), ROUND(AVG(response_time)::numeric, 3) FROM logs WHERE timestamp > NOW() - INTERVAL '{hours} hours'")
         res = cur.fetchone(); conn.close()
         return res if res[0] is not None else (0, 0)
     except: return (0, 0)
 
-# --- ВОРКЕР И ОПОВЕЩЕНИЯ ---
+def get_real_ssl(hostname):
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                return (exp - datetime.datetime.utcnow()).days
+    except: return -1
+
 def check_worker():
     last_status_map = {}
     last_latency_map = {}
     last_ssl_notification_date = None
     
-    # Имитация реального браузера для обхода 503 ошибок
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -87,8 +89,6 @@ def check_worker():
 
     while True:
         now_msk = datetime.datetime.now(TZ_MOSCOW)
-        
-        # Ежедневный отчет в 09:00 МСК
         if now_msk.hour == 9 and last_ssl_notification_date != now_msk.date():
             ssl_alerts = []
             for site in SITES:
@@ -103,7 +103,6 @@ def check_worker():
             try:
                 start = time.time()
                 try:
-                    # Добавлены headers для предотвращения 503 ошибок
                     r = requests.get(f"https://{site}", timeout=25, headers=headers)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
@@ -112,13 +111,11 @@ def check_worker():
                 prev_status = last_status_map.get(site, 200)
                 was_slow = last_latency_map.get(site, False)
 
-                # Уведомления: Down / Up
                 if prev_status == 200 and curr_status != 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
                 elif prev_status != 200 and curr_status == 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
                 
-                # Уведомления: Latency
                 if resp_time > 20 and not was_slow:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = True
@@ -133,30 +130,16 @@ def check_worker():
             except: pass
         time.sleep(300)
 
-def get_real_ssl(hostname):
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((hostname, 443), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert = ssock.getpeercert()
-                exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                return (exp - datetime.datetime.utcnow()).days
-    except: return -1
-
 @app.on_event("startup")
 def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
 
-# --- ИНТЕРФЕЙС ---
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):
     conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
-    
-    up24, resp24 = get_stats_period(24)
-    up30, resp30 = get_stats_period(720)
-    
+    up24, resp24 = get_stats_period(24); up30, resp30 = get_stats_period(720)
     cur.execute("SELECT COUNT(DISTINCT site) FROM logs l1 WHERE status=200 AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
     sites_online = cur.fetchone()[0] or 0
     cur.execute("SELECT COUNT(DISTINCT site) FROM logs l1 WHERE (status != 200 OR response_time > 20) AND timestamp=(SELECT MAX(timestamp) FROM logs l2 WHERE l1.site=l2.site)")
@@ -169,13 +152,9 @@ async def index(auth: bool = Depends(check_auth)):
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
         .container {{ max-width: 1300px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
         .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }}
         .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; }}
-        .kpi-label {{ font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }}
-        .kpi-val {{ font-size: 20px; font-weight: 800; display: block; margin-top: 5px; }}
         .danger-card {{ border-top-color: #ef4444; color: #991b1b; background: #fef2f2; }}
-        .alert-box {{ background: #fff5f5; border: 1px solid #feb2b2; padding: 15px; border-radius: 8px; margin-bottom: 20px; color: #c53030; font-weight: 600; }}
         .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; }}
         .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         .tab-btn.active {{ background: #3b82f6; color: white; }}
@@ -185,88 +164,56 @@ async def index(auth: bool = Depends(check_auth)):
         .row-err {{ background-color: #fff1f2; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
-        .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
-        .refresh-btn:hover {{ background: #2563eb; }}
+        .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
     </style></head><body><div class="container">
-        <div class="header">
-            <h1 style="margin:0">📊 Мониторинг сайтов</h1>
-            <div style="text-align:right">
-                <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
-            </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <h1>📊 Мониторинг сайтов</h1>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
         </div>
-
         <div class="kpi-grid">
-            <div class="kpi-card"><span class="kpi-label">Доступно</span><span class="kpi-val">{sites_online} / {len(SITES)}</span></div>
-            <div class="kpi-card"><span class="kpi-label">Uptime (24ч / 30д)</span><span class="kpi-val">{up24}% / {up30}%</span></div>
-            <div class="kpi-card"><span class="kpi-label">Ответ (24ч / 30д)</span><span class="kpi-val">{resp24}с / {resp30}с</span></div>
-            <div class="kpi-card { 'danger-card' if incident_count > 0 else '' }"><span class="kpi-label">Инциденты</span><span class="kpi-val">{incident_count}</span></div>
-            <div class="kpi-card { 'danger-card' if ssl_issues else '' }"><span class="kpi-label">SSL под угрозой</span><span class="kpi-val">{len(ssl_issues)}</span></div>
+            <div class="kpi-card"><span>Доступно</span><br><strong>{sites_online} / {len(SITES)}</strong></div>
+            <div class="kpi-card"><span>Uptime (30д)</span><br><strong>{up30}%</strong></div>
+            <div class="kpi-card"><span>Ответ (30д)</span><br><strong>{resp30}с</strong></div>
+            <div class="kpi-card {{ 'danger-card' if incident_count > 0 else '' }}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
+            <div class="kpi-card {{ 'danger-card' if ssl_issues else '' }}"><span>SSL под угрозой</span><br><strong>{{len(ssl_issues)}}</strong></div>
         </div>
-
-        {" <div class='alert-box'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
-
+        {" <div style='background:#fff5f5; border:1px solid #feb2b2; padding:15px; border-radius:8px; margin-bottom:20px; color:#c53030; font-weight:600;'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
         <div class="tabs">
             <button class="tab-btn active" onclick="tab(event, 't1')">Список сайтов</button>
-            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика (Графики)</button>
-            <button class="tab-btn" onclick="tab(event, 't3')">Журнал ошибок</button>
+            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
+            <button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button>
         </div>
-
         <div id="t1" class="tab-content active-content">
-            <table><thead><tr><th>Сайт</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th><th>Простой (30д)</th></tr></thead><tbody>
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th></tr></thead><tbody>
     """
-    
     chart_data = {}
-    
-    # Сортировка: Приоритетные в начале, остальные по алфавиту
     other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
     sorted_sites = PRIORITY_SITES + other_sites
-
     for s in sorted_sites:
-        cur.execute("""SELECT 
-            ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2),
-            COUNT(*) FILTER (WHERE status != 200)*300,
-            (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1),
-            (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1),
-            (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1)
-            FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'""", (s, s, s, s))
-        upt, down_sec, last_resp, last_ssl, last_st = cur.fetchone()
-        
+        cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2), (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'", (s, s, s, s))
+        upt, last_resp, last_ssl, last_st = cur.fetchone()
         cur.execute("SELECT DATE(timestamp), ROUND(AVG(response_time)::numeric,2), ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1",(s,))
-        rows = cur.fetchall()
-        chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
-
-        is_err = (last_st != 200 or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
-        display_name = f"⭐ {s}" if s in PRIORITY_SITES else s
+        rows = cur.fetchall(); chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
         
-        html += f"""<tr class="{'row-err' if is_err else ''}">
-            <td><a href="https://{s}" target="_blank" style="color:inherit"><strong>{display_name}</strong></a></td>
-            <td class="{'txt-err' if (upt or 0) < 99 else 'txt-ok'}">{upt or 0}%</td>
-            <td class="{'txt-err' if (last_resp or 0) > 20 else ''}">{round(last_resp or 0, 2)} сек</td>
-            <td class="{'txt-err' if (last_ssl or 999) <= 20 else ''}">{last_ssl if last_ssl is not None else 'N/A'}</td>
-            <td>{down_sec or 0} сек</td></tr>"""
-
-    html += """</tbody></table></div>
-        <div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
-    for s in sorted_sites: html += f"<div class='kpi-card'><h4>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+        is_online = (last_st == 200)
+        status_text = "Online" if is_online else "Offline"
+        status_class = "txt-ok" if is_online else "txt-err"
+        is_row_err = (not is_online or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
+        
+        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td></tr>"
     
+    html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
+    for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Статус</th><th>Ответ</th><th>SSL</th></tr></thead><tbody>"""
     cur.execute("SELECT timestamp, site, status, response_time, ssl_days FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
     for err in cur.fetchall():
         html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}</td><td>{err[4]}</td></tr>"
-    
     html += """</tbody></table></div></div><script>
-        function tab(e, n) {
-            var i, x = document.getElementsByClassName("tab-content"), b = document.getElementsByClassName("tab-btn");
-            for (i=0; i<x.length; i++) x[i].className = "tab-content";
-            for (i=0; i<b.length; i++) b[i].className = "tab-btn";
-            document.getElementById(n).className = "tab-content active-content";
-            e.currentTarget.className += " active";
-        }
+        function tab(e, n) { var i, x = document.getElementsByClassName("tab-content"), b = document.getElementsByClassName("tab-btn"); for (i=0; i<x.length; i++) x[i].className = "tab-content"; for (i=0; i<b.length; i++) b[i].className = "tab-btn"; document.getElementById(n).className = "tab-content active-content"; e.currentTarget.className += " active"; }
     """
     for s, d in chart_data.items():
         html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105, ticks:{{display:true}} }},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
-    html += "</script></body></html>"
-    cur.close(); conn.close(); return html
+    html += "</script></body></html>"; cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
