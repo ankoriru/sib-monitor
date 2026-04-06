@@ -268,6 +268,28 @@ async def index(auth: bool = Depends(check_auth)):
     html += "</script></body></html>"
     cur.close(); conn.close(); return html
 
+
+# --- ВРЕМЕННЫЙ СКРИПТ ПОЛНОЙ ОЧИСТКИ ---
+@app.get("/admin/clear-srm-full")
+async def clear_srm_full(auth: bool = Depends(check_auth)):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Полное удаление всех логов для этого сайта
+        cur.execute("DELETE FROM logs WHERE site = 'srm.sibur.ru'")
+        deleted_rows = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {
+            "status": "success", 
+            "message": f"Удалено ВСЕХ записей ({deleted_rows}) для srm.sibur.ru. Статистика обнулена."
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
