@@ -59,8 +59,7 @@ def init_db():
     conn.commit(); cur.close(); conn.close()
 
 def check_worker():
-    last_status_map = {}
-    last_latency_map = {}
+    last_status_map, last_latency_map = {}, {}
     last_ssl_notification_date = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
@@ -173,6 +172,7 @@ async def index(auth: bool = Depends(check_auth)):
         .tab-content {{ display: none; }} .active-content {{ display: block; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
         th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
+        .row-err {{ background-color: #fff1f2 !important; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }} .txt-ok {{ color: #16a34a; font-weight: bold; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         @media (max-width: 900px) {{ .kpi-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
@@ -188,7 +188,7 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card {'danger-card' if incident_list or slow_list else ''}"><span>Инциденты</span><br><strong>{len(incident_list)+len(slow_list)}</strong></div>
             <div class="kpi-card {'danger-card' if ssl_list else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_list)}</strong></div>
         </div>
-        {f'<div class="error-bar">⚠️ Текущие ошибки: {", ".join(all_errors)}</div>' if all_errors else ''}
+        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_errors)}</div>' if all_errors else ''}
         <div class="tabs">
             <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
