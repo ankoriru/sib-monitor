@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://siburdb_user:IbaJQKbh6DQ5z9i3J82EWRJFnl1z3gkt@dpg-d797355m5p6s739tgr1g-a/siburdb")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeTOLrO9I")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-1003747357407")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
 SITES = [
