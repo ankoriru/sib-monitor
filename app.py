@@ -152,9 +152,10 @@ async def index(auth: bool = Depends(check_auth)):
         s = r['site']; chart_data.setdefault(s, {"labels":[], "uptime":[], "resp":[]})
         chart_data[s]["labels"].append(r['d'].strftime('%d.%m')); chart_data[s]["uptime"].append(float(r['u'])); chart_data[s]["resp"].append(float(r['r']))
 
-    incident_list = [f"{s} (Код: {v['status']})" for s,v in latest_states.items() if v['status']!=200]
-    slow_list = [f"{s} ({round(v['response_time'],1)}с)" for s,v in latest_states.items() if v['status']==200 and v['response_time']>20]
-    ssl_list = [f"{s} ({v['ssl_days']}д)" for s,v in latest_states.items() if 0<=v['ssl_days']<=20]
+    # Улучшенная детализация блока Обратите внимание
+    incident_list = [f"{s} (Ошибка: {v['status']})" for s,v in latest_states.items() if v['status']!=200]
+    slow_list = [f"{s} (Медленно: {round(v['response_time'],1)}с)" for s,v in latest_states.items() if v['status']==200 and v['response_time']>20]
+    ssl_list = [f"{s} (SSL: {v['ssl_days']}д)" for s,v in latest_states.items() if 0<=v['ssl_days']<=20]
     all_errors = incident_list + slow_list + ssl_list
 
     html = f"""
@@ -214,7 +215,7 @@ async def index(auth: bool = Depends(check_auth)):
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Код</th><th>Ответ</th><th>Простой</th><th>Описание ошибки</th></tr></thead><tbody>"""
     cur.execute("""
         SELECT timestamp, site, status, response_time, 
-        CASE WHEN status=0 THEN 'Timeout / Connection Refused' WHEN status=404 THEN 'Not Found' WHEN status=500 THEN 'Internal Server Error' WHEN status=503 THEN 'Service Unavailable' ELSE 'Slow Response' END as descr
+        CASE WHEN status=0 THEN 'Timeout / Connection Refused' WHEN status=404 THEN 'Not Found' WHEN status=500 THEN 'Internal Server Error' WHEN status=502 THEN 'Bad Gateway' WHEN status=503 THEN 'Service Unavailable' ELSE 'Slow Response' END as descr
         FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100
     """)
     for err in cur.fetchall():
