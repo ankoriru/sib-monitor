@@ -173,10 +173,10 @@ async def index(auth: bool = Depends(check_auth)):
         </div>
         <div class="kpi-grid">
             <div class="kpi-card"><span>Доступно</span><br><strong>{sites_online} / {len(SITES)}</strong></div>
-            <div class="kpi-card"><span>Uptime (30д)</span><br><strong>{up30}%</strong></div>
-            <div class="kpi-card"><span>Ответ (30д)</span><br><strong>{resp30}с</strong></div>
-            <div class="kpi-card {'danger-card' if incident_count > 0 else ''}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
-            <div class="kpi-card {'danger-card' if ssl_issues else ''}"><span>SSL под угрозой</span><br><strong>{len(ssl_issues)}</strong></div>
+            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><br><strong>{up24}% / {up30}%</strong></div>
+            <div class="kpi-card"><span>Ответ (24ч / 30д)</span><br><strong>{resp24}с / {resp30}с</strong></div>
+            <div class="kpi-card {{ 'danger-card' if incident_count > 0 else '' }}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
+            <div class="kpi-card {{ 'danger-card' if ssl_issues else '' }}"><span>SSL под угрозой</span><br><strong>{len(ssl_issues)}</strong></div>
         </div>
         {" <div style='background:#fff5f5; border:1px solid #feb2b2; padding:15px; border-radius:8px; margin-bottom:20px; color:#c53030; font-weight:600;'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
         <div class="tabs">
