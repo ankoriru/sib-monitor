@@ -20,7 +20,7 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeT
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-# Список сайтов с учетом приоритетных (сортировка будет в интерфейсе)
+# Список сайтов с учетом новых адресов
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "srm.sibur.ru", # Приоритетные
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -77,10 +77,18 @@ def check_worker():
     last_status_map = {}
     last_latency_map = {}
     last_ssl_notification_date = None
+    
+    # Имитация реального браузера для обхода 503 ошибок
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
 
     while True:
         now_msk = datetime.datetime.now(TZ_MOSCOW)
         
+        # Ежедневный отчет в 09:00 МСК
         if now_msk.hour == 9 and last_ssl_notification_date != now_msk.date():
             ssl_alerts = []
             for site in SITES:
@@ -95,7 +103,8 @@ def check_worker():
             try:
                 start = time.time()
                 try:
-                    r = requests.get(f"https://{site}", timeout=25)
+                    # Добавлены headers для предотвращения 503 ошибок
+                    r = requests.get(f"https://{site}", timeout=25, headers=headers)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
                 
@@ -103,11 +112,13 @@ def check_worker():
                 prev_status = last_status_map.get(site, 200)
                 was_slow = last_latency_map.get(site, False)
 
+                # Уведомления: Down / Up
                 if prev_status == 200 and curr_status != 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
                 elif prev_status != 200 and curr_status == 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
                 
+                # Уведомления: Latency
                 if resp_time > 20 and not was_slow:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = True
@@ -206,7 +217,7 @@ async def index(auth: bool = Depends(check_auth)):
     
     chart_data = {}
     
-    # Сортировка: Сначала приоритетные в заданном порядке, затем остальные по алфавиту
+    # Сортировка: Приоритетные в начале, остальные по алфавиту
     other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
     sorted_sites = PRIORITY_SITES + other_sites
 
