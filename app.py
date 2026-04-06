@@ -20,7 +20,6 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeT
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-# Список сайтов
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -35,7 +34,6 @@ SITES = [
     "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ]
 
-# shop.sibur.ru добавлен в приоритетные
 PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru"]
 
 app = FastAPI()
@@ -82,20 +80,22 @@ def check_worker():
                             if 0 <= d <= 20: ssl_alerts.append(f"{site} ({d}д)")
                 except: pass
             if ssl_alerts:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts)})
+                try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts)})
+                except: pass
             last_ssl_notification_date = now_msk.date()
 
         for site in SITES:
             curr_status = 0
             resp_time = 25.0
             ssl_d = -1
+            
             try:
                 start = time.time()
                 try:
                     r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
                     curr_status = r.status_code
                     resp_time = time.time() - start
-                except:
+                except Exception:
                     curr_status = 0
                     resp_time = 25.0
 
@@ -108,20 +108,42 @@ def check_worker():
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: ssl_d = -1
 
-                if site not in last_status_map: last_status_map[site] = 200
-                if site not in last_latency_map: last_latency_map[site] = False
-
-                if last_status_map[site] == 200 and curr_status != 200:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Статус: {curr_status}"})
-                elif last_status_map[site] != 200 and curr_status == 200:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
-                
-                if resp_time > 20 and not last_latency_map[site]:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."})
-                    last_latency_map[site] = True
-                elif resp_time < 10 and last_latency_map[site]:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."})
+                # Установка начального статуса, если сайта еще нет в карте
+                if site not in last_status_map:
+                    last_status_map[site] = 200
+                if site not in last_latency_map:
                     last_latency_map[site] = False
+
+                # ЛОГИКА ОПОВЕЩЕНИЙ
+                # 1. Падение (был 200, стал не 200)
+                if last_status_map[site] == 200 and curr_status != 200:
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                                      json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"}, timeout=10)
+                    except: pass
+                    last_latency_map[site] = False
+
+                # 2. Восстановление (был не 200, стал 200)
+                elif last_status_map[site] != 200 and curr_status == 200:
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                                      json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"}, timeout=10)
+                    except: pass
+
+                # 3. Задержка
+                if curr_status == 200:
+                    if resp_time > 20 and not last_latency_map[site]:
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                                          json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."}, timeout=10)
+                        except: pass
+                        last_latency_map[site] = True
+                    elif resp_time < 10 and last_latency_map[site]:
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                                          json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."}, timeout=10)
+                        except: pass
+                        last_latency_map[site] = False
 
                 last_status_map[site] = curr_status
                 conn = get_db_connection(); cur = conn.cursor()
