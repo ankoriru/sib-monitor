@@ -104,14 +104,13 @@ def check_worker():
                 try:
                     r = requests.get(f"https://{site}", timeout=25, headers=headers)
                     curr_status, resp_time = r.status_code, time.time() - start
-                except: curr_status, resp_time = 0, 25.0 # Баг исправлен здесь: 0 теперь гарантированно триггерит алерты
+                except: curr_status, resp_time = 0, 25.0
                 
                 ssl_d = get_real_ssl(site)
                 
                 if site not in last_status_map: last_status_map[site] = 200
                 if site not in last_latency_map: last_latency_map[site] = False
 
-                # Исправленная логика уведомлений
                 if last_status_map[site] == 200 and curr_status != 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
                 elif last_status_map[site] != 200 and curr_status == 200:
@@ -163,7 +162,7 @@ async def index(auth: bool = Depends(check_auth)):
         table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
         th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
         .row-err {{ background-color: #fff1f2; }}
-        .txt-err {{ color: #dc2626; font-weight: bold; }} /* Жирный красный для ошибок */
+        .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
         .txt-black {{ color: #1e293b; font-weight: 500; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
@@ -199,14 +198,20 @@ async def index(auth: bool = Depends(check_auth)):
         is_online = (last_st == 200)
         status_text = "Online" if is_online else "Offline"
         
-        # Классы для выделения нарушений
         st_class = "txt-ok" if is_online else "txt-err"
         resp_class = "txt-err" if (last_resp or 0) > 20 else ""
         ssl_class = "txt-err" if (last_ssl or 999) <= 20 else ""
         down_class = "txt-err" if down_sec > 0 else ""
         is_row_err = (not is_online or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
         
-        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{st_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td class='{resp_class}'>{round(last_resp or 0, 2)} сек</td><td class='{ssl_class}'>{last_ssl}д</td><td class='{down_class}'>{down_str}</td></tr>"
+        star = "⭐ " if s in PRIORITY_SITES else ""
+        html += f"""<tr class="{'row-err' if is_row_err else ''}">
+            <td>{star}<a href="https://{s}" target="_blank" style="color:inherit; text-decoration:none;"><strong>{s}</strong></a></td>
+            <td><span class="{st_class}">{status_text}</span></td>
+            <td class="txt-black">{upt or 0}%</td>
+            <td class="{resp_class}">{round(last_resp or 0, 2)} сек</td>
+            <td class="{ssl_class}">{last_ssl}д</td>
+            <td class="{down_class}">{down_str}</td></tr>"""
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
