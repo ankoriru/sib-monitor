@@ -271,3 +271,20 @@ async def index(auth: bool = Depends(check_auth)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+    # --- ВРЕМЕННЫЙ СКРИПТ ОЧИСТКИ (Удалить после использования) ---
+@app.get("/admin/clear-srm-logs")
+async def clear_srm_logs(auth: bool = Depends(check_auth)):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Удаляем только ошибочные записи для конкретного сайта
+        cur.execute("DELETE FROM logs WHERE site = 'srm.sibur.ru' AND status != 200")
+        deleted_rows = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "success", "message": f"Удалено {deleted_rows} ошибочных записей для srm.sibur.ru"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
