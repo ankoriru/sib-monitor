@@ -80,11 +80,7 @@ def check_worker():
     last_status_map = {}
     last_latency_map = {}
     last_ssl_notification_date = None
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
     while True:
         now_msk = datetime.datetime.now(TZ_MOSCOW)
@@ -94,8 +90,7 @@ def check_worker():
                 d = get_real_ssl(site)
                 if 0 <= d <= 20: ssl_alerts.append(f"{site} ({d}д)")
             if ssl_alerts:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                              json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📅 Ежедневный отчет SSL (<=20д):\n" + "\n".join(ssl_alerts)})
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📅 Ежедневный отчет SSL (<=20д):\n" + "\n".join(ssl_alerts)})
             last_ssl_notification_date = now_msk.date()
 
         for site in SITES:
@@ -105,9 +100,7 @@ def check_worker():
                     r = requests.get(f"https://{site}", timeout=25, headers=headers)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
-                
                 ssl_d = get_real_ssl(site)
-                
                 if site not in last_status_map: last_status_map[site] = 200
                 if site not in last_latency_map: last_latency_map[site] = False
 
@@ -186,19 +179,20 @@ async def index(auth: bool = Depends(check_auth)):
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th><th>Простой (30д)</th></tr></thead><tbody>
     """
+    chart_data = {}
     other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
     sorted_sites = PRIORITY_SITES + other_sites
     for s in sorted_sites:
         cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2), COUNT(*) FILTER (WHERE status != 200)*300, (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'", (s, s, s, s))
         upt, down_sec, last_resp, last_ssl, last_st = cur.fetchone()
-        
         h, m, sec = down_sec // 3600, (down_sec % 3600) // 60, down_sec % 60
         down_str = f"{h:02d}:{m:02d}:{sec:02d}"
         
-        is_online = (last_st == 200)
-        status_text = "Online" if is_online else "Offline"
+        cur.execute("SELECT DATE(timestamp), ROUND(AVG(response_time)::numeric,2), ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1",(s,))
+        rows = cur.fetchall(); chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
         
-        st_class = "txt-ok" if is_online else "txt-err"
+        is_online = (last_st == 200)
+        status_text, st_class = ("Online", "txt-ok") if is_online else ("Offline", "txt-err")
         resp_class = "txt-err" if (last_resp or 0) > 20 else ""
         ssl_class = "txt-err" if (last_ssl or 999) <= 20 else ""
         down_class = "txt-err" if down_sec > 0 else ""
@@ -207,19 +201,23 @@ async def index(auth: bool = Depends(check_auth)):
         star = "⭐ " if s in PRIORITY_SITES else ""
         html += f"""<tr class="{'row-err' if is_row_err else ''}">
             <td>{star}<a href="https://{s}" target="_blank" style="color:inherit; text-decoration:none;"><strong>{s}</strong></a></td>
-            <td><span class="{st_class}">{status_text}</span></td>
-            <td class="txt-black">{upt or 0}%</td>
-            <td class="{resp_class}">{round(last_resp or 0, 2)} сек</td>
-            <td class="{ssl_class}">{last_ssl}д</td>
-            <td class="{down_class}">{down_str}</td></tr>"""
+            <td><span class="{st_class}">{status_text}</span></td><td class="txt-black">{upt or 0}%</td>
+            <td class="{resp_class}">{round(last_resp or 0, 2)} сек</td><td class="{ssl_class}">{last_ssl}д</td><td class="{down_class}">{down_str}</td></tr>"""
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+    
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Статус</th><th>Ответ</th><th>SSL</th></tr></thead><tbody>"""
     cur.execute("SELECT timestamp, site, status, response_time, ssl_days FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
     for err in cur.fetchall():
         html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}</td><td>{err[4]}</td></tr>"
-    html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}</script></body></html>"; cur.close(); conn.close(); return html
+    
+    html += """</tbody></table></div></div><script>
+        function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}
+    """
+    for s, d in chart_data.items():
+        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
+    html += "</script></body></html>"; cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
