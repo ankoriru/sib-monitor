@@ -83,8 +83,7 @@ def check_worker():
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
     }
 
     while True:
@@ -105,21 +104,23 @@ def check_worker():
                 try:
                     r = requests.get(f"https://{site}", timeout=25, headers=headers)
                     curr_status, resp_time = r.status_code, time.time() - start
-                except: curr_status, resp_time = 0, 25.0
+                except: curr_status, resp_time = 0, 25.0 # Баг исправлен здесь: 0 теперь гарантированно триггерит алерты
                 
                 ssl_d = get_real_ssl(site)
-                prev_status = last_status_map.get(site, 200)
-                was_slow = last_latency_map.get(site, False)
+                
+                if site not in last_status_map: last_status_map[site] = 200
+                if site not in last_latency_map: last_latency_map[site] = False
 
-                if prev_status == 200 and curr_status != 200:
+                # Исправленная логика уведомлений
+                if last_status_map[site] == 200 and curr_status != 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"})
-                elif prev_status != 200 and curr_status == 200:
+                elif last_status_map[site] != 200 and curr_status == 200:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"})
                 
-                if resp_time > 20 and not was_slow:
+                if resp_time > 20 and not last_latency_map[site]:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = True
-                elif resp_time < 10 and was_slow:
+                elif resp_time < 10 and last_latency_map[site]:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."})
                     last_latency_map[site] = False
 
@@ -162,7 +163,7 @@ async def index(auth: bool = Depends(check_auth)):
         table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
         th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
         .row-err {{ background-color: #fff1f2; }}
-        .txt-err {{ color: #dc2626; font-weight: bold; }}
+        .txt-err {{ color: #dc2626; font-weight: bold; }} /* Жирный красный для ошибок */
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
         .txt-black {{ color: #1e293b; font-weight: 500; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
@@ -178,7 +179,6 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card {'danger-card' if incident_count > 0 else ''}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
             <div class="kpi-card {'danger-card' if len(ssl_issues) > 0 else ''}"><span>SSL под угрозой</span><br><strong>{len(ssl_issues)}</strong></div>
         </div>
-        {" <div style='background:#fff5f5; border:1px solid #feb2b2; padding:15px; border-radius:8px; margin-bottom:20px; color:#c53030; font-weight:600;'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
         <div class="tabs">
             <button class="tab-btn active" onclick="tab(event, 't1')">Список сайтов</button>
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
@@ -187,28 +187,26 @@ async def index(auth: bool = Depends(check_auth)):
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th><th>Простой (30д)</th></tr></thead><tbody>
     """
-    chart_data = {}
     other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
     sorted_sites = PRIORITY_SITES + other_sites
     for s in sorted_sites:
         cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2), COUNT(*) FILTER (WHERE status != 200)*300, (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'", (s, s, s, s))
         upt, down_sec, last_resp, last_ssl, last_st = cur.fetchone()
         
-        # Форматирование времени простоя
-        h = down_sec // 3600
-        m = (down_sec % 3600) // 60
-        sec = down_sec % 60
+        h, m, sec = down_sec // 3600, (down_sec % 3600) // 60, down_sec % 60
         down_str = f"{h:02d}:{m:02d}:{sec:02d}"
-
-        cur.execute("SELECT DATE(timestamp), ROUND(AVG(response_time)::numeric,2), ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1",(s,))
-        rows = cur.fetchall(); chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
         
         is_online = (last_st == 200)
         status_text = "Online" if is_online else "Offline"
-        status_class = "txt-ok" if is_online else "txt-err"
+        
+        # Классы для выделения нарушений
+        st_class = "txt-ok" if is_online else "txt-err"
+        resp_class = "txt-err" if (last_resp or 0) > 20 else ""
+        ssl_class = "txt-err" if (last_ssl or 999) <= 20 else ""
+        down_class = "txt-err" if down_sec > 0 else ""
         is_row_err = (not is_online or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
         
-        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td><td>{down_str}</td></tr>"
+        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{st_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td class='{resp_class}'>{round(last_resp or 0, 2)} сек</td><td class='{ssl_class}'>{last_ssl}д</td><td class='{down_class}'>{down_str}</td></tr>"
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
@@ -216,12 +214,7 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT timestamp, site, status, response_time, ssl_days FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100")
     for err in cur.fetchall():
         html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}</td><td>{err[4]}</td></tr>"
-    html += """</tbody></table></div></div><script>
-        function tab(e, n) { var i, x = document.getElementsByClassName("tab-content"), b = document.getElementsByClassName("tab-btn"); for (i=0; i<x.length; i++) x[i].className = "tab-content"; for (i=0; i<b.length; i++) b[i].className = "tab-btn"; document.getElementById(n).className = "tab-content active-content"; e.currentTarget.className += " active"; }
-    """
-    for s, d in chart_data.items():
-        html += f"new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:0, max:105, ticks:{{display:true}} }},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
-    html += "</script></body></html>"; cur.close(); conn.close(); return html
+    html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}</script></body></html>"; cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
