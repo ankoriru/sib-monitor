@@ -175,8 +175,8 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card"><span>Доступно</span><br><strong>{sites_online} / {len(SITES)}</strong></div>
             <div class="kpi-card"><span>Uptime (24ч / 30д)</span><br><strong>{up24}% / {up30}%</strong></div>
             <div class="kpi-card"><span>Ответ (24ч / 30д)</span><br><strong>{resp24}с / {resp30}с</strong></div>
-            <div class="kpi-card {{ 'danger-card' if incident_count > 0 else '' }}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
-            <div class="kpi-card {{ 'danger-card' if ssl_issues else '' }}"><span>SSL под угрозой</span><br><strong>{len(ssl_issues)}</strong></div>
+            <div class="kpi-card {'danger-card' if incident_count > 0 else ''}"><span>Инциденты</span><br><strong>{incident_count}</strong></div>
+            <div class="kpi-card {'danger-card' if len(ssl_issues) > 0 else ''}"><span>SSL под угрозой</span><br><strong>{len(ssl_issues)}</strong></div>
         </div>
         {" <div style='background:#fff5f5; border:1px solid #feb2b2; padding:15px; border-radius:8px; margin-bottom:20px; color:#c53030; font-weight:600;'>⚠️ Внимание! Истекают SSL: " + ", ".join([f"{x[0]} ({x[1]}д)" for x in ssl_issues]) + "</div>" if ssl_issues else ""}
         <div class="tabs">
@@ -185,14 +185,21 @@ async def index(auth: bool = Depends(check_auth)):
             <button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button>
         </div>
         <div id="t1" class="tab-content active-content">
-            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th></tr></thead><tbody>
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime (30д)</th><th>Ответ</th><th>SSL (дн)</th><th>Простой (30д)</th></tr></thead><tbody>
     """
     chart_data = {}
     other_sites = sorted([s for s in SITES if s not in PRIORITY_SITES])
     sorted_sites = PRIORITY_SITES + other_sites
     for s in sorted_sites:
-        cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2), (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'", (s, s, s, s))
-        upt, last_resp, last_ssl, last_st = cur.fetchone()
+        cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2), COUNT(*) FILTER (WHERE status != 200)*300, (SELECT response_time FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT ssl_days FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1), (SELECT status FROM logs WHERE site=%s ORDER BY timestamp DESC LIMIT 1) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days'", (s, s, s, s))
+        upt, down_sec, last_resp, last_ssl, last_st = cur.fetchone()
+        
+        # Форматирование времени простоя
+        h = down_sec // 3600
+        m = (down_sec % 3600) // 60
+        sec = down_sec % 60
+        down_str = f"{h:02d}:{m:02d}:{sec:02d}"
+
         cur.execute("SELECT DATE(timestamp), ROUND(AVG(response_time)::numeric,2), ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) FROM logs WHERE site=%s AND timestamp > NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1",(s,))
         rows = cur.fetchall(); chart_data[s] = {"labels": [r[0].strftime('%d.%m') for r in rows], "uptime": [float(r[2]) for r in rows], "resp": [float(r[1]) for r in rows]}
         
@@ -201,7 +208,7 @@ async def index(auth: bool = Depends(check_auth)):
         status_class = "txt-ok" if is_online else "txt-err"
         is_row_err = (not is_online or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
         
-        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td></tr>"
+        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td><td>{down_str}</td></tr>"
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
