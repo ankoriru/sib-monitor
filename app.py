@@ -20,8 +20,9 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN", "8305761464:AAE--AkY662Cm3DlKsrd8tcBnxXeT
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "-5282148036")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
+# Список сайтов
 SITES = [
-    "sibur.ru", "eshop.sibur.ru", "srm.sibur.ru", 
+    "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
     "bopp.sibur.ru", "carbo.sibur.ru", "carbonfootprintcalculator.sibur.ru",
     "career.sibur.ru", "catalog.sibur.ru", "coach.sibur.ru",
@@ -34,7 +35,8 @@ SITES = [
     "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ]
 
-PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "srm.sibur.ru"]
+# shop.sibur.ru добавлен в приоритетные
+PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru"]
 
 app = FastAPI()
 
