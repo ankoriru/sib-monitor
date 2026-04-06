@@ -164,6 +164,7 @@ async def index(auth: bool = Depends(check_auth)):
         .row-err {{ background-color: #fff1f2; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
+        .txt-black {{ color: #1e293b; font-weight: 500; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
     </style></head><body><div class="container">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
@@ -200,7 +201,7 @@ async def index(auth: bool = Depends(check_auth)):
         status_class = "txt-ok" if is_online else "txt-err"
         is_row_err = (not is_online or (last_resp or 0) > 20 or (last_ssl or 999) <= 20)
         
-        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td></tr>"
+        html += f"<tr class='{'row-err' if is_row_err else ''}'><td><strong>{'⭐ ' if s in PRIORITY_SITES else ''}{s}</strong></td><td><span class='{status_class}'>{status_text}</span></td><td class='txt-black'>{upt or 0}%</td><td>{round(last_resp or 0, 2)} сек</td><td>{last_ssl}д</td></tr>"
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
