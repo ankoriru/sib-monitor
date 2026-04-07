@@ -58,8 +58,23 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_site_ts ON logs (site, timestamp DESC)")
     conn.commit(); cur.close(); conn.close()
 
+def send_tg_msg(text):
+    """Надежная отправка с повторами и логами"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for i in range(3): # 3 попытки
+        try:
+            r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+            if r.status_code == 200:
+                print(f"✅ TG Alert Sent: {text[:30]}...")
+                return True
+        except Exception as e:
+            print(f"❌ TG Attempt {i+1} failed: {e}")
+            time.sleep(2)
+    return False
+
 def check_worker():
-    last_status_map, last_latency_map = {}, {}
+    last_status_map = {site: 200 for site in SITES} # Принудительный старт как "здоров"
+    last_latency_map = {site: False for site in SITES}
     last_ssl_notification_date = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
@@ -78,8 +93,7 @@ def check_worker():
                             if 0 <= d <= 20: ssl_alerts.append(f"{site} ({d}д)")
                 except: pass
             if ssl_alerts:
-                try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts)})
-                except: pass
+                send_tg_msg(f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts))
             last_ssl_notification_date = now_msk.date()
 
         for site in SITES:
@@ -100,31 +114,27 @@ def check_worker():
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: ssl_d = -1
 
-                if site not in last_status_map: last_status_map[site] = 200
-                if site not in last_latency_map: last_latency_map[site] = False
-
+                # Алерты при смене статуса
                 if last_status_map[site] == 200 and curr_status != 200:
-                    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚨 {site} DOWN! Код: {curr_status}"}, timeout=10)
-                    except: pass
+                    send_tg_msg(f"🚨 {site} DOWN! Код: {curr_status}")
+                    last_latency_map[site] = False
                 elif last_status_map[site] != 200 and curr_status == 200:
-                    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"✅ {site} UP!"}, timeout=10)
-                    except: pass
+                    send_tg_msg(f"✅ {site} UP!")
 
                 if curr_status == 200:
                     if resp_time > 20 and not last_latency_map[site]:
-                        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек."}, timeout=10)
-                        except: pass
+                        send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = True
                     elif resp_time < 10 and last_latency_map[site]:
-                        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."}, timeout=10)
-                        except: pass
+                        send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = False
 
                 last_status_map[site] = curr_status
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)", (site, curr_status, resp_time, ssl_d))
                 conn.commit(); cur.close(); conn.close()
-            except: pass
+            except Exception as e:
+                print(f"Worker cycle error for {site}: {e}")
         time.sleep(300)
 
 @app.on_event("startup")
@@ -152,7 +162,6 @@ async def index(auth: bool = Depends(check_auth)):
         s = r['site']; chart_data.setdefault(s, {"labels":[], "uptime":[], "resp":[]})
         chart_data[s]["labels"].append(r['d'].strftime('%d.%m')); chart_data[s]["uptime"].append(float(r['u'])); chart_data[s]["resp"].append(float(r['r']))
 
-    # Улучшенная детализация блока Обратите внимание
     incident_list = [f"{s} (Ошибка: {v['status']})" for s,v in latest_states.items() if v['status']!=200]
     slow_list = [f"{s} (Медленно: {round(v['response_time'],1)}с)" for s,v in latest_states.items() if v['status']==200 and v['response_time']>20]
     ssl_list = [f"{s} (SSL: {v['ssl_days']}д)" for s,v in latest_states.items() if 0<=v['ssl_days']<=20]
