@@ -135,7 +135,7 @@ def check_worker():
                 conn.commit(); cur.close(); conn.close()
             except Exception as e:
                 print(f"Worker cycle error for {site}: {e}")
-        time.sleep(300)
+        time.sleep(120)
 
 @app.on_event("startup")
 def startup_event():
