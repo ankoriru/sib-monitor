@@ -176,6 +176,7 @@ async def index(auth: bool = Depends(check_auth)):
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
             <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
         </div>
+        
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime</th><th>Ответ</th><th>SSL</th><th>Простой</th></tr></thead><tbody>
     """
@@ -185,7 +186,6 @@ async def index(auth: bool = Depends(check_auth)):
         h, m = s30['down_sec']//3600, (s30['down_sec']%3600)//60
         is_on = (st['status']==200); is_err = (not is_on or st['response_time']>20 or 0<=st['ssl_days']<=20)
         
-        # Динамические классы для выделения деградирующих показателей
         st_cls = "txt-err" if not is_on else "txt-ok"
         resp_cls = "txt-err" if st['response_time'] > 20 else ""
         ssl_cls = "txt-err" if 0 <= st['ssl_days'] <= 20 else ""
@@ -202,7 +202,8 @@ async def index(auth: bool = Depends(check_auth)):
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
     for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
     
-    html += """</tbody></table></div><div id="t3" class="tab-content"><table><thead><tr><th>Время инцидента (МСК)</th><th>Сайт</th><th>Длительность</th><th>Код ошибки</th><th>Описание</th></tr></thead><tbody>"""
+    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время инцидента (МСК)</th><th>Сайт</th><th>Длительность</th><th>Код ошибки</th><th>Описание</th></tr></thead><tbody>"""
+    
     cur.execute("""
         WITH status_logs AS (
             SELECT site, timestamp, status, response_time,
@@ -224,7 +225,7 @@ async def index(auth: bool = Depends(check_auth)):
         dur = int(err[2]); dur_str = f"{dur} мин" if dur < 60 else f"{dur//60}ч {dur%60}м"
         html += f"<tr><td>{err[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td><strong>{err[0]}</strong></td><td class='txt-err'>{dur_str}</td><td>{err[3]}</td><td>{err[4]}</td></tr>"
     
-    html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}"
+    html += """</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}"""
     for s, d in chart_data.items():
         html += f"Chart.defaults.font.size=10; new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:70, max:105}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});"
     html += "</script></body></html>"; cur.close(); conn.close(); return html
