@@ -121,6 +121,7 @@ async def index(auth: bool = Depends(check_auth)):
     s30 = cur.fetchone()
     cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up, ROUND(AVG(response_time)::numeric, 3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
     s24 = cur.fetchone()
+
     cur.execute("SELECT DISTINCT ON (site) site, status, response_time, ssl_days FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
@@ -143,6 +144,8 @@ async def index(auth: bool = Depends(check_auth)):
         .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; margin-bottom: 20px; }}
         .kpi-card {{ background: #fff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; text-align: center; }}
+        .kpi-card span {{ font-size: 13px; color: #64748b; font-weight: 600; }}
+        .kpi-card strong {{ font-size: 18px; display: block; margin-top: 5px; }}
         .danger-card {{ border-top-color: #ef4444; color: #991b1b; background: #fef2f2; }}
         .error-bar {{ background: #fef2f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; font-size: 14px; }}
         .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; }}
@@ -152,6 +155,8 @@ async def index(auth: bool = Depends(check_auth)):
         table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
         th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
         .row-err {{ background-color: #fff1f2 !important; }}
+        .row-err td {{ color: #dc2626 !important; font-weight: bold !important; }}
+        .row-err a {{ color: #dc2626 !important; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }} .txt-ok {{ color: #16a34a; font-weight: bold; }}
         .refresh-btn {{ background: #3b82f6; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         @media (max-width: 900px) {{ .kpi-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
@@ -161,11 +166,11 @@ async def index(auth: bool = Depends(check_auth)):
             <button class="refresh-btn" onclick="location.reload()">🔄 {now_msk}</button>
         </div>
         <div class="kpi-grid">
-            <div class="kpi-card"><span>Доступно</span><br><strong>{sum(1 for s in latest_states.values() if s['status']==200)} / {len(SITES)}</strong></div>
-            <div class="kpi-card"><span>Uptime (30д)</span><br><strong>{s30['up']}%</strong></div>
-            <div class="kpi-card"><span>Ответ (24ч)</span><br><strong>{s24['resp']}с</strong></div>
-            <div class="kpi-card {'danger-card' if inc_list else ''}"><span>Инциденты</span><br><strong>{len(inc_list)}</strong></div>
-            <div class="kpi-card {'danger-card' if ssl_list else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_list)}</strong></div>
+            <div class="kpi-card"><span>Доступно</span><strong>{sum(1 for s in latest_states.values() if s['status']==200)} / {len(SITES)}</strong></div>
+            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><strong>{s24['up']}% / {s30['up']}%</strong></div>
+            <div class="kpi-card"><span>Ответ (24ч / 30д)</span><strong>{s24['resp']}с / {s30['resp']}с</strong></div>
+            <div class="kpi-card {'danger-card' if inc_list else ''}"><span>Инциденты</span><strong>{len(inc_list)}</strong></div>
+            <div class="kpi-card {'danger-card' if ssl_list else ''}"><span>SSL (<=20д)</span><strong>{len(ssl_list)}</strong></div>
         </div>
         {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_err)}</div>' if all_err else ''}
         <div class="tabs">
@@ -182,7 +187,7 @@ async def index(auth: bool = Depends(check_auth)):
         h, m = s30['down_sec']//3600, (s30['down_sec']%3600)//60
         is_on = (st['status']==200); is_err = (not is_on or st['response_time']>20 or 0<=st['ssl_days']<=20)
         html += f"""<tr class="{'row-err' if is_err else ''}">
-            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<strong>{s}</strong></td>
+            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if is_on else 'txt-err'}">{'Online' if is_on else 'Offline'}</span></td>
             <td>{s30['upt']}%</td><td>{round(st['response_time'],2)}с</td><td>{st['ssl_days']}д</td><td>{h}ч {m}м</td></tr>"""
     
