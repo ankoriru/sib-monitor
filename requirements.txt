@@ -4,3 +4,6 @@ requests
 psycopg2-binary
 pytz
 python-multipart
+playwright
+python-whois
+asyncio
