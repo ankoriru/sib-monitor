@@ -6,7 +6,6 @@ import psycopg2
 import json
 import base64
 import pytz
-import asyncio
 from psycopg2.extras import DictCursor
 import threading
 import time
@@ -64,37 +63,44 @@ def init_db():
 def send_tg_msg(text, photo_path=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     try:
-        if photo_path:
+        if photo_path and os.path.exists(photo_path):
             with open(photo_path, 'rb') as photo:
                 requests.post(url + "sendPhoto", data={"chat_id": TELEGRAM_CHAT_ID, "caption": text}, files={"photo": photo}, timeout=20)
+            os.remove(photo_path)
         else:
             requests.post(url + "sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-    except: pass
+    except Exception as e: print(f"TG Error: {e}")
 
 def take_screenshot(site):
     path = f"screenshot_{site.replace('.','_')}.png"
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Важно: аргументы для Docker
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
             page = browser.new_page()
-            page.goto(f"https://{site}", timeout=30000)
+            page.goto(f"https://{site}", timeout=30000, wait_until="networkidle")
             page.screenshot(path=path)
             browser.close()
         return path
-    except: return None
+    except Exception as e:
+        print(f"Screenshot error for {site}: {e}")
+        return None
 
 def get_domain_expiry(site):
     try:
         w = whois.whois(site)
         exp = w.expiration_date
         if isinstance(exp, list): exp = exp[0]
-        days = (exp - datetime.datetime.now()).days
-        return days, exp
-    except: return -1, None
+        if exp:
+            days = (exp - datetime.datetime.now()).days
+            return days
+        return -1
+    except: return -1
 
 def check_worker():
     last_status_map = {site: 200 for site in SITES}
     down_time_tracker = {site: None for site in SITES}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
     while True:
         for site in SITES:
@@ -102,11 +108,11 @@ def check_worker():
             try:
                 start = time.time()
                 try:
-                    r = requests.get(f"https://{site}", timeout=25, allow_redirects=True)
+                    r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
 
-                # SSL
+                # SSL Check
                 try:
                     context = ssl.create_default_context()
                     with socket.create_connection((site, 443), timeout=3) as sock:
@@ -116,33 +122,32 @@ def check_worker():
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: ssl_d = -1
 
-                # Domain (раз в 24 часа для экономии ресурсов, тут упрощенно)
-                dom_d, _ = get_domain_expiry(site)
+                # Domain Check
+                dom_d = get_domain_expiry(site)
 
-                # Логика алертов
-                is_priority = site in PRIORITY_SITES
+                # Alerts Logic
                 if curr_status != 200:
                     if down_time_tracker[site] is None: down_time_tracker[site] = datetime.datetime.now()
-                    
                     seconds_down = (datetime.datetime.now() - down_time_tracker[site]).total_seconds()
                     
                     if last_status_map[site] == 200:
-                        if is_priority:
+                        if site in PRIORITY_SITES:
                             shot = take_screenshot(site)
                             send_tg_msg(f"🚨 CRITICAL DOWN! {site} (Код: {curr_status})", shot)
-                        elif seconds_down >= 300: # 5 минут
+                        elif seconds_down >= 300:
                             send_tg_msg(f"⚠️ Secondary DOWN! {site} (Простой > 5 мин)")
                 else:
                     if last_status_map[site] != 200:
-                        send_tg_msg(f"✅ {site} UP!")
+                        send_tg_msg(f"✅ {site} UP: {site}")
                     down_time_tracker[site] = None
 
                 last_status_map[site] = curr_status
+                
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s, %s, %s, %s, %s)", 
                            (site, curr_status, resp_time, ssl_d, dom_d))
                 conn.commit(); cur.close(); conn.close()
-            except: pass
+            except Exception as e: print(f"Worker loop error: {e}")
         time.sleep(60)
 
 @app.on_event("startup")
@@ -156,31 +161,30 @@ async def index(auth: bool = Depends(check_auth)):
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
 
     cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up, ROUND(AVG(response_time)::numeric, 3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'")
-    s30 = cur.fetchone()
+    s30 = cur.fetchone() or {'up': 0, 'resp': 0}
     cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0 / NULLIF(COUNT(*), 0))::numeric, 2) as up, ROUND(AVG(response_time)::numeric, 3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
-    s24 = cur.fetchone()
+    s24 = cur.fetchone() or {'up': 0, 'resp': 0}
 
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats_30d = {r['site']: r for r in cur.fetchall()}
 
-    # Ошибки для блока Обратите внимание
     inc_list = [f"{s} (Offline)" for s,v in latest_states.items() if v['status']!=200]
     dom_warn = [f"{s} (Домен: {v['domain_days']}д)" for s,v in latest_states.items() if 0<=v['domain_days']<=30]
     all_err = inc_list + dom_warn
 
     html = f"""
-    <html><head><title>Sibur Monitoring</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <html><head><title>Sibur Monitoring</title>
     <style>
-        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
-        .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; }}
+        .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; }}
         .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
-        .kpi-card {{ background: #fff; padding: 10px 5px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #3b82f6; text-align: center; white-space: nowrap; }}
+        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #eee; border-top: 4px solid #3b82f6; text-align: center; }}
         .kpi-card span {{ font-size: 12px; color: #64748b; font-weight: 600; }}
         .kpi-card strong {{ font-size: 16px; display: block; margin-top: 5px; }}
-        .danger-card {{ border-top-color: #ef4444; color: #991b1b; background: #fef2f2; }}
-        .error-bar {{ background: #fef2f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; font-size: 14px; }}
+        .danger-card {{ border-top-color: #ef4444; background: #fef2f2; }}
+        .error-bar {{ background: #fef2f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; }}
         .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; }}
         .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         .tab-btn.active {{ background: #3b82f6; color: white; }}
@@ -205,9 +209,8 @@ async def index(auth: bool = Depends(check_auth)):
         {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_err)}</div>' if all_err else ''}
         <div class="tabs">
             <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
-            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
-            <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
-            <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
+            <button class="tab-btn" onclick="tab(event, 't2')">Инциденты</button>
+            <button class="tab-btn" onclick="tab(event, 't3')">Календарь событий</button>
         </div>
         
         <div id="t1" class="tab-content active-content">
@@ -215,28 +218,46 @@ async def index(auth: bool = Depends(check_auth)):
     """
     sorted_sites = sorted(SITES, key=lambda x: x not in PRIORITY_SITES)
     for s in sorted_sites:
-        st = latest_states.get(s, {'status':0,'response_time':0,'ssl_days':-1, 'domain_days':-1}); s30 = stats_30d.get(s, {'upt':0,'down_sec':0})
-        is_on = (st['status']==200); is_err = (not is_on or 0<=st['ssl_days']<=20 or 0<=st['domain_days']<=30)
+        st = latest_states.get(s, {'status':0,'response_time':0,'ssl_days':-1, 'domain_days':-1})
+        s30_site = stats_30d.get(s, {'upt':0,'down_sec':0})
+        is_on = (st['status']==200)
+        is_row_err = (not is_on or 0<=st['ssl_days']<=20 or 0<=st['domain_days']<=30)
         
         dom_cls = "txt-err" if 0 <= st['domain_days'] <= 30 else ""
-        html += f"""<tr class="{'row-err' if is_err else ''}">
+        html += f"""<tr class="{'row-err' if is_row_err else ''}">
             <td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if is_on else 'txt-err'}">{'Online' if is_on else 'Offline'}</span></td>
-            <td>{s30['upt']}%</td><td>{round(st['response_time'],2)}с</td><td>{st['ssl_days']}д</td>
-            <td class="{dom_cls}">{st['domain_days']}д</td><td>{int(s30['down_sec']//60)}м</td></tr>"""
+            <td>{s30_site['upt']}%</td><td>{round(st['response_time'],2)}с</td><td>{st['ssl_days']}д</td>
+            <td class="{dom_cls}">{st['domain_days']}д</td><td>{int(s30_site['down_sec']//60)}м</td></tr>"""
     
-    html += """</tbody></table></div><div id="t2" class="tab-content">Аналитика загружается...</div>
-    <div id="t3" class="tab-content">Таблица инцидентов...</div>
-    <div id="t4" class="tab-content">
+    html += """</tbody></table></div>
+    <div id="t2" class="tab-content">
+        <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th></tr></thead><tbody>"""
+    
+    cur.execute("""
+        WITH groups AS (
+            SELECT site, timestamp, status,
+            ROW_NUMBER() OVER (PARTITION BY site ORDER BY timestamp) - 
+            ROW_NUMBER() OVER (PARTITION BY site, status != 200 ORDER BY timestamp) as grp
+            FROM logs WHERE status != 200
+        )
+        SELECT site, MIN(timestamp), EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/60 + 1 as dur, MAX(status)
+        FROM groups GROUP BY site, grp ORDER BY MIN(timestamp) DESC LIMIT 20
+    """)
+    for row in cur.fetchall():
+        html += f"<tr><td>{row[1].astimezone(TZ_MOSCOW).strftime('%H:%M')}</td><td>{row[0]}</td><td>{int(row[2])} мин</td><td>{row[3]}</td></tr>"
+
+    html += """</tbody></table></div>
+    <div id="t3" class="tab-content">
         <h3>📅 Ближайшие события</h3>
-        <table><thead><tr><th>Событие</th><th>Сайт</th><th>Осталось дней</th><th>Тип</th></tr></thead><tbody>"""
+        <table><thead><tr><th>Событие</th><th>Сайт</th><th>Осталось дней</th></tr></thead><tbody>"""
     
     events = []
     for s, v in latest_states.items():
         if v['ssl_days'] >= 0: events.append((v['ssl_days'], s, "SSL сертификат"))
         if v['domain_days'] >= 0: events.append((v['domain_days'], s, "Оплата домена"))
-    for days, s, t in sorted(events)[:20]:
-        html += f"<tr><td>{t}</td><td>{s}</td><td class='{'txt-err' if days<=30 else ''}'>{days} дней</td><td>{t}</td></tr>"
+    for days, site, t in sorted(events)[:15]:
+        html += f"<tr><td>{t}</td><td>{site}</td><td class='{'txt-err' if days<=30 else ''}'>{days} дн.</td></tr>"
         
     html += """</tbody></table></div></div>
     <script>
