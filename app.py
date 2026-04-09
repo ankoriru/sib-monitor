@@ -63,12 +63,8 @@ def send_tg_msg(text):
     for i in range(3):
         try:
             r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-            if r.status_code == 200:
-                print(f"✅ TG Alert Sent: {text[:30]}...")
-                return True
-        except Exception as e:
-            print(f"❌ TG Attempt {i+1} failed: {e}")
-            time.sleep(2)
+            if r.status_code == 200: return True
+        except: time.sleep(2)
     return False
 
 def check_worker():
@@ -91,8 +87,7 @@ def check_worker():
                             d = (exp - datetime.datetime.utcnow()).days
                             if 0 <= d <= 20: ssl_alerts.append(f"{site} ({d}д)")
                 except: pass
-            if ssl_alerts:
-                send_tg_msg(f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts))
+            if ssl_alerts: send_tg_msg(f"📅 SSL (<=20д):\n" + "\n".join(ssl_alerts))
             last_ssl_notification_date = now_msk.date()
 
         for site in SITES:
@@ -115,7 +110,6 @@ def check_worker():
 
                 if last_status_map[site] == 200 and curr_status != 200:
                     send_tg_msg(f"🚨 {site} DOWN! Код: {curr_status}")
-                    last_latency_map[site] = False
                 elif last_status_map[site] != 200 and curr_status == 200:
                     send_tg_msg(f"✅ {site} UP!")
 
@@ -131,9 +125,8 @@ def check_worker():
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days) VALUES (%s, %s, %s, %s)", (site, curr_status, resp_time, ssl_d))
                 conn.commit(); cur.close(); conn.close()
-            except Exception as e:
-                print(f"Worker cycle error for {site}: {e}")
-        time.sleep(60) # Интервал 1 минута
+            except: pass
+        time.sleep(60)
 
 @app.on_event("startup")
 def startup_event():
@@ -151,22 +144,19 @@ async def index(auth: bool = Depends(check_auth)):
     s24 = cur.fetchone()
     cur.execute("SELECT DISTINCT ON (site) site, status, response_time, ssl_days FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
-    
-    # Расчет простоя: 1 запись = 60 секунд
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats_30d = {r['site']: r for r in cur.fetchall()}
     
     cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY 1, 2 ORDER BY 2")
-    graph_raw = cur.fetchall()
-    chart_data = {}
+    graph_raw = cur.fetchall(); chart_data = {}
     for r in graph_raw:
         s = r['site']; chart_data.setdefault(s, {"labels":[], "uptime":[], "resp":[]})
         chart_data[s]["labels"].append(r['d'].strftime('%d.%m')); chart_data[s]["uptime"].append(float(r['u'])); chart_data[s]["resp"].append(float(r['r']))
 
-    incident_list = [f"{s} (Ошибка: {v['status']})" for s,v in latest_states.items() if v['status']!=200]
-    slow_list = [f"{s} (Медленно: {round(v['response_time'],1)}с)" for s,v in latest_states.items() if v['status']==200 and v['response_time']>20]
-    ssl_list = [f"{s} (SSL: {v['ssl_days']}д)" for s,v in latest_states.items() if 0<=v['ssl_days']<=20]
-    all_errors = incident_list + slow_list + ssl_list
+    inc = [f"{s} (Ошибка: {v['status']})" for s,v in latest_states.items() if v['status']!=200]
+    slw = [f"{s} (Медленно: {round(v['response_time'],1)}с)" for s,v in latest_states.items() if v['status']==200 and v['response_time']>20]
+    ssl_l = [f"{s} (SSL: {v['ssl_days']}д)" for s,v in latest_states.items() if 0<=v['ssl_days']<=20]
+    all_err = inc + slw + ssl_l
 
     html = f"""
     <html><head><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -196,41 +186,48 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card"><span>Доступно</span><br><strong>{sum(1 for s in latest_states.values() if s['status']==200)} / {len(SITES)}</strong></div>
             <div class="kpi-card"><span>Uptime (24ч/30д)</span><br><strong>{s24['up']}% / {s30['up']}%</strong></div>
             <div class="kpi-card"><span>Ответ (24ч/30д)</span><br><strong>{s24['resp']}с / {s30['resp']}с</strong></div>
-            <div class="kpi-card {'danger-card' if incident_list or slow_list else ''}"><span>Инциденты</span><br><strong>{len(incident_list)+len(slow_list)}</strong></div>
-            <div class="kpi-card {'danger-card' if ssl_list else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_list)}</strong></div>
+            <div class="kpi-card {'danger-card' if inc or slw else ''}"><span>Инциденты</span><br><strong>{len(inc)+len(slw)}</strong></div>
+            <div class="kpi-card {'danger-card' if ssl_l else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_l)}</strong></div>
         </div>
-        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_errors)}</div>' if all_errors else ''}
+        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_err)}</div>' if all_err else ''}
         <div class="tabs"><button class="tab-btn active" onclick="tab(event, 't1')">Список</button><button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button><button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button></div>
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime</th><th>Ответ</th><th>SSL</th><th>Простой</th></tr></thead><tbody>
     """
-    sorted_sites = PRIORITY_SITES + sorted([s for s in SITES if s not in PRIORITY_SITES])
-    for s in sorted_sites:
+    sorted_s = PRIORITY_SITES + sorted([s for s in SITES if s not in PRIORITY_SITES])
+    for s in sorted_s:
         st = latest_states.get(s, {'status':0,'response_time':0,'ssl_days':-1}); s30 = stats_30d.get(s, {'upt':0,'down_sec':0})
         h, m, sec = s30['down_sec']//3600, (s30['down_sec']%3600)//60, s30['down_sec']%60
-        is_online = (st['status']==200); is_row_err = (not is_online or st['response_time']>20 or 0<=st['ssl_days']<=20)
-        html += f"""<tr class="{'row-err' if is_row_err else ''}">
-            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="color:inherit; text-decoration:none;"><strong>{s}</strong></a></td>
-            <td><span class="{'txt-ok' if is_online else 'txt-err'}">{'Online' if is_online else 'Offline'}</span></td>
-            <td>{s30['upt']}%</td><td class="{'txt-err' if st['response_time']>20 else ''}">{round(st['response_time'],2)}с</td>
-            <td class="{'txt-err' if 0<=st['ssl_days']<=20 else ''}">{st['ssl_days']}д</td><td class="{'txt-err' if s30['down_sec']>0 else ''}">{h:02d}:{m:02d}:{sec:02d}</td></tr>"""
+        is_on = (st['status']==200); is_err = (not is_on or st['response_time']>20 or 0<=st['ssl_days']<=20)
+        html += f"""<tr class="{'row-err' if is_err else ''}"><td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="color:inherit; text-decoration:none;"><strong>{s}</strong></a></td><td><span class="{'txt-ok' if is_on else 'txt-err'}">{'Online' if is_on else 'Offline'}</span></td><td>{s30['upt']}%</td><td class="{'txt-err' if st['response_time']>20 else ''}">{round(st['response_time'],2)}с</td><td class="{'txt-err' if 0<=st['ssl_days']<=20 else ''}">{st['ssl_days']}д</td><td class="{'txt-err' if s30['down_sec']>0 else ''}">{h:02d}:{m:02d}:{sec:02d}</td></tr>"""
     
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px;">"""
-    for s in sorted_sites: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+    for s in sorted_s: html += f"<div class='kpi-card'><h4>{s}</h4><canvas id='c-{s.replace('.','_')}'></canvas></div>"
     
-    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Время (МСК)</th><th>Сайт</th><th>Код</th><th>Ответ</th><th>Простой</th><th>Описание ошибки</th></tr></thead><tbody>"""
+    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало (МСК)</th><th>Сайт</th><th>Простой</th><th>Код</th><th>Описание ошибки</th></tr></thead><tbody>"""
+    
+    # НОВЫЙ SQL: Группировка последовательных ошибок в инциденты
     cur.execute("""
-        SELECT timestamp, site, status, response_time, 
-        CASE WHEN status=0 THEN 'Timeout / Connection Refused' WHEN status=404 THEN 'Not Found' WHEN status=500 THEN 'Internal Server Error' WHEN status=502 THEN 'Bad Gateway' WHEN status=503 THEN 'Service Unavailable' ELSE 'Slow Response' END as descr
-        FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100
+        WITH groups AS (
+            SELECT site, timestamp, status, response_time,
+            ROW_NUMBER() OVER (PARTITION BY site ORDER BY timestamp) - 
+            ROW_NUMBER() OVER (PARTITION BY site, (status != 200 OR response_time > 20) ORDER BY timestamp) as grp
+            FROM logs
+            WHERE (status != 200 OR response_time > 20)
+        )
+        SELECT site, MIN(timestamp) as start_time, 
+        EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) / 60 + 1 as duration_min,
+        MAX(status) as last_status,
+        CASE WHEN MAX(status)=0 THEN 'Timeout' WHEN MAX(status)=502 THEN 'Bad Gateway' ELSE 'Server Error/Slow' END as descr
+        FROM groups GROUP BY site, grp ORDER BY start_time DESC LIMIT 50
     """)
     for err in cur.fetchall():
-        # ИСПРАВЛЕНО: Теперь отображается 1 мин, так как дискретность изменена
-        html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}с</td><td>1 мин</td><td>{err['descr']}</td></tr>"
+        dur = int(err[2])
+        dur_str = f"{dur} мин" if dur < 60 else f"{dur//60}ч {dur%60}м"
+        html += f"<tr><td>{err[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[0]}</td><td class='txt-err'>{dur_str}</td><td>{err[3]}</td><td>{err[4]}</td></tr>"
     
     html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}</script>"
-    for s, d in chart_data.items():
-        html += f"<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:75, max:110}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});</script>"
+    for s, d in chart_data.items(): html += f"<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{type:'line', data:{{labels:{json.dumps(d['labels'])}, datasets:[{{label:'Uptime', data:{json.dumps(d['uptime'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},{{label:'Ответ', data:{json.dumps(d['resp'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}]}}, options:{{scales:{{y:{{min:75, max:110}},y1:{{position:'right', grid:{{drawOnChartArea:false}}}} }} }} }});</script>"
     html += "</body></html>"; cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
