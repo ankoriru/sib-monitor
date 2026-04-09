@@ -4,6 +4,6 @@ requests
 psycopg2-binary
 pytz
 python-multipart
-playwright
+playwright==1.42.0
 python-whois
 asyncio
