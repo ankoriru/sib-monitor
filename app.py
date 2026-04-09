@@ -55,26 +55,6 @@ def send_tg_msg(text, photo_path=None):
         print(f"DEBUG: TG Error -> {e}")
 
 
-def init_db():
-    conn = get_db_connection(); cur = conn.cursor()
-    # Создаем таблицу, если её нет
-    cur.execute('''CREATE TABLE IF NOT EXISTS logs 
-                  (site TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
-                   status INTEGER, response_time REAL, ssl_days INTEGER)''')
-    
-    # ПРИНУДИТЕЛЬНО добавляем новую колонку, если её еще нет
-    try:
-        cur.execute("ALTER TABLE logs ADD COLUMN domain_days INTEGER DEFAULT -1;")
-        conn.commit()
-    except Exception as e:
-        print(f"Column already exists or error: {e}")
-        conn.rollback() 
-        
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_site_ts ON logs (site, timestamp DESC)")
-    conn.commit(); cur.close(); conn.close()
-
-
-
 def take_screenshot(site):
     path = f"screenshot_{site.replace('.','_')}.png"
     try:
