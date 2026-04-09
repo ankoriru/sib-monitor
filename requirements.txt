@@ -7,3 +7,4 @@ python-multipart
 playwright==1.42.0
 python-whois
 asyncio
+greenlet>=3.0.0
