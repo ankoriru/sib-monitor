@@ -133,7 +133,7 @@ def check_worker():
                 conn.commit(); cur.close(); conn.close()
             except Exception as e:
                 print(f"Worker cycle error for {site}: {e}")
-        time.sleep(60) # ИЗМЕНЕНО: Опрос раз в 1 минуту
+        time.sleep(60) # Интервал 1 минута
 
 @app.on_event("startup")
 def startup_event():
@@ -152,7 +152,7 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT DISTINCT ON (site) site, status, response_time, ssl_days FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
     
-    # СКОРРЕКТИРОВАНО: Расчет простоя на базе 1-минутного интервала (*60)
+    # Расчет простоя: 1 запись = 60 секунд
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats_30d = {r['site']: r for r in cur.fetchall()}
     
@@ -225,7 +225,8 @@ async def index(auth: bool = Depends(check_auth)):
         FROM logs WHERE (status != 200 OR response_time > 20) AND timestamp > NOW() - INTERVAL '30 days' ORDER BY timestamp DESC LIMIT 100
     """)
     for err in cur.fetchall():
-        html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}с</td><td>5 мин</td><td>{err['descr']}</td></tr>"
+        # ИСПРАВЛЕНО: Теперь отображается 1 мин, так как дискретность изменена
+        html += f"<tr><td>{err[0].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{err[1]}</td><td class='txt-err'>{err[2]}</td><td>{round(err[3],2)}с</td><td>1 мин</td><td>{err['descr']}</td></tr>"
     
     html += "</tbody></table></div></div><script>function tab(e,n){var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');for(i=0;i<x.length;i++)x[i].className='tab-content';for(i=0;i<b.length;i++)b[i].className='tab-btn';document.getElementById(n).className='tab-content active-content';e.currentTarget.className+=' active';}</script>"
     for s, d in chart_data.items():
