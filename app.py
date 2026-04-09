@@ -59,9 +59,8 @@ def init_db():
     conn.commit(); cur.close(); conn.close()
 
 def send_tg_msg(text):
-    """Надежная отправка с повторами и логами"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for i in range(3): # 3 попытки
+    for i in range(3):
         try:
             r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
             if r.status_code == 200:
@@ -73,7 +72,7 @@ def send_tg_msg(text):
     return False
 
 def check_worker():
-    last_status_map = {site: 200 for site in SITES} # Принудительный старт как "здоров"
+    last_status_map = {site: 200 for site in SITES}
     last_latency_map = {site: False for site in SITES}
     last_ssl_notification_date = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -114,7 +113,6 @@ def check_worker():
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: ssl_d = -1
 
-                # Алерты при смене статуса
                 if last_status_map[site] == 200 and curr_status != 200:
                     send_tg_msg(f"🚨 {site} DOWN! Код: {curr_status}")
                     last_latency_map[site] = False
@@ -135,7 +133,7 @@ def check_worker():
                 conn.commit(); cur.close(); conn.close()
             except Exception as e:
                 print(f"Worker cycle error for {site}: {e}")
-        time.sleep(60)
+        time.sleep(60) # ИЗМЕНЕНО: Опрос раз в 1 минуту
 
 @app.on_event("startup")
 def startup_event():
@@ -153,8 +151,11 @@ async def index(auth: bool = Depends(check_auth)):
     s24 = cur.fetchone()
     cur.execute("SELECT DISTINCT ON (site) site, status, response_time, ssl_days FROM logs ORDER BY site, timestamp DESC")
     latest_states = {r['site']: r for r in cur.fetchall()}
-    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*300 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
+    
+    # СКОРРЕКТИРОВАНО: Расчет простоя на базе 1-минутного интервала (*60)
+    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric, 2) as upt, COUNT(*) FILTER (WHERE status != 200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats_30d = {r['site']: r for r in cur.fetchall()}
+    
     cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY 1, 2 ORDER BY 2")
     graph_raw = cur.fetchall()
     chart_data = {}
@@ -199,11 +200,7 @@ async def index(auth: bool = Depends(check_auth)):
             <div class="kpi-card {'danger-card' if ssl_list else ''}"><span>SSL (<=20д)</span><br><strong>{len(ssl_list)}</strong></div>
         </div>
         {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_errors)}</div>' if all_errors else ''}
-        <div class="tabs">
-            <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
-            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
-            <button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button>
-        </div>
+        <div class="tabs"><button class="tab-btn active" onclick="tab(event, 't1')">Список</button><button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button><button class="tab-btn" onclick="tab(event, 't3')">Ошибки</button></div>
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime</th><th>Ответ</th><th>SSL</th><th>Простой</th></tr></thead><tbody>
     """
