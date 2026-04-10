@@ -1,0 +1,10 @@
+meta:
+  name: sib-monitor
+  toolchain:
+    name: docker
+    version: latest
+build:
+  dockerfile: Dockerfile
+run:
+  persistence:
+    /app/screenshots: screenshots
