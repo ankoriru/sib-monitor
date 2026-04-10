@@ -57,11 +57,6 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS logs 
                   (site TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
                    status INTEGER, response_time REAL, ssl_days INTEGER, domain_days INTEGER)''')
-    # Проверка наличия колонки domain_days для старых БД
-    try:
-        cur.execute("ALTER TABLE logs ADD COLUMN domain_days INTEGER DEFAULT -1")
-    except: conn.rollback()
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_site_ts ON logs (site, timestamp DESC)")
     conn.commit(); cur.close(); conn.close()
 
 def send_tg_msg(text, photo_path=None):
@@ -113,7 +108,6 @@ def check_worker():
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
 
-                # SSL & Domain
                 try:
                     ctx = ssl.create_default_context()
                     with socket.create_connection((site, 443), timeout=3) as sock:
@@ -125,21 +119,16 @@ def check_worker():
                 
                 dom_d, _ = get_domain_info(site)
 
-                # Логика алертов
-                is_err = curr_status != 200
-                if is_err:
+                if curr_status != 200:
                     fail_count[site] += 1
-                    # Мгновенно для Critical, на 2-й раз для Secondary
                     if site in PRIORITY_SITES or fail_count[site] >= 2:
                         if last_status[site] == 200:
                             shot = take_screenshot(site) if site in PRIORITY_SITES else None
                             send_tg_msg(f"🚨 DOWN: {site} (Status: {curr_status})", shot)
                             last_status[site] = curr_status
                 else:
-                    if last_status[site] != 200:
-                        send_tg_msg(f"✅ UP: {site}")
-                    last_status[site] = 200
-                    fail_count[site] = 0
+                    if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
+                    last_status[site] = 200; fail_count[site] = 0
 
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", 
@@ -165,134 +154,8 @@ async def index(auth: bool = Depends(check_auth)):
 
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
     latest = {r['site']: r for r in cur.fetchall()}
-    
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*180 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats = {r['site']: r for r in cur.fetchall()}
 
-    # Оповещения
     incidents = [s for s,v in latest.items() if v['status']!=200]
-    ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <= 20]
-    dom_warn = [s for s,v in latest.items() if 0 <= v['domain_days'] <= 30]
-    all_warn_msg = [f"{s} (Offline)" for s in incidents] + [f"{s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"{s} (Домен {latest[s]['domain_days']}д)" for s in dom_warn]
-
-    html = f"""
-    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
-        .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
-        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }}
-        .danger-card {{ border-top-color: #ef4444 !important; background: #fef2f2; }}
-        .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }}
-        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
-        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
-        .tab-btn.active {{ background: #00717a; color: white; }}
-        .tab-content {{ display: none; }} .active-content {{ display: block; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
-        .row-err {{ background-color: #fff1f2 !important; }}
-        .txt-err {{ color: #dc2626; font-weight: bold; }} .txt-ok {{ color: #16a34a; font-weight: bold; }}
-        .refresh-btn {{ background: #00717a; color: white; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; }}
-    </style></head><body><div class="container">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-            <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
-            <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
-        </div>
-        
-        <div class="kpi-grid">
-            <div class="kpi-card"><span>Доступно</span><strong><br>{sum(1 for s in latest.values() if s['status']==200)} / {len(SITES)}</strong></div>
-            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><strong><br>{s24['up']}% / {s30['up']}%</strong></div>
-            <div class="kpi-card"><span>Ответ (24ч / 30д)</span><strong><br>{s24['resp']}с / {s30['resp']}с</strong></div>
-            <div class="kpi-card {'danger-card' if incidents else ''}"><span>Инциденты</span><strong><br>{len(incidents)}</strong></div>
-            <div class="kpi-card {'danger-card' if ssl_warn else ''}"><span>SSL <=20д</span><strong><br>{len(ssl_warn)}</strong></div>
-        </div>
-
-        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_warn_msg)}</div>' if all_warn_msg else ''}
-
-        <div class="tabs">
-            <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
-            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
-            <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
-            <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
-        </div>
-
-        <div id="t1" class="tab-content active-content">
-            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Простой</th></tr></thead><tbody>
-    """
-    
-    sorted_sites = sorted(SITES, key=lambda x: (x not in PRIORITY_SITES, x))
-    for s in sorted_sites:
-        v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
-        st30 = stats.get(s, {'upt':0, 'down_sec':0})
-        is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
-        
-        h, m = st30['down_sec']//3600, (st30['down_sec']%3600)//60
-        
-        html += f"""<tr class="{'row-err' if is_err else ''}">
-            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<strong>{s}</strong></td>
-            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
-            <td>{st30['upt']}%</td>
-            <td>{round(v['response_time'],2)}с</td>
-            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
-            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
-            <td class="{'txt-err' if st30['down_sec']>0 else ''}">{h}ч {m}м</td></tr>"""
-
-    html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
-    
-    # Графики
-    cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '14 days' GROUP BY 1,2 ORDER BY 2")
-    g_data = {}
-    for r in cur.fetchall():
-        s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
-        g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
-
-    for s in sorted_sites:
-        if s in g_data:
-            html += f"<div class='kpi-card'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
-
-    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th></tr></thead><tbody>"""
-    
-    # Журнал инцидентов
-    cur.execute("SELECT site, MIN(timestamp), COUNT(*)*3 as dur, MAX(status) FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp) as grp FROM logs WHERE status!=200) t GROUP BY site, grp ORDER BY 2 DESC LIMIT 20")
-    for r in cur.fetchall():
-        html += f"<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td><td>{r[3]}</td></tr>"
-
-    html += """</tbody></table></div><div id="t4" class="tab-content"><table><thead><tr><th>Событие</th><th>Сайт</th><th>Дата истечения</th><th>Осталось дней</th></tr></thead><tbody>"""
-    
-    # Календарь событий
-    cal_events = []
-    for s in SITES:
-        v = latest.get(s, {})
-        if v.get('ssl_days', -1) >= 0: cal_events.append({'t': 'SSL сертификат', 's': s, 'd': v['ssl_days']})
-        if v.get('domain_days', -1) >= 0: cal_events.append({'t': 'Оплата домена', 's': s, 'd': v['domain_days']})
-    
-    for ev in sorted(cal_events, key=lambda x: x['d']):
-        cls = 'txt-err' if ev['d'] <= 30 else ''
-        html += f"<tr><td>{ev['t']}</td><td>{ev['s']}</td><td>-</td><td class='{cls}'>{ev['d']} дн.</td></tr>"
-
-    html += f"""</tbody></table></div></div>
-    <script>
-    function tab(e,n){{
-        var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn');
-        for(i=0;i<x.length;i++)x[i].className='tab-content';
-        for(i=0;i<b.length;i++)b[i].className='tab-btn';
-        document.getElementById(n).className='tab-content active-content';
-        e.currentTarget.className+=' active';
-    }}
-    """
-    for s, d in g_data.items():
-        html += f"""new Chart(document.getElementById('c-{s.replace('.','_')}'), {{
-            type:'line',
-            data:{{ labels:{json.dumps(d['l'])}, 
-            datasets:[
-                {{label:'Uptime', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}},
-                {{label:'Ответ', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}}
-            ]}},
-            options:{{ scales:{{ y:{{min:75, max:100}}, y1:{{position:'right', grid:{{display:false}}}} }} }}
-        }});"""
-    
-    html += "</script></body></html>"; cur.close(); conn.close(); return html
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <=
