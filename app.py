@@ -102,7 +102,8 @@ def check_worker():
     last_status = {site: 200 for site in SITES}
     fail_count = {site: 0 for site in SITES}
     last_latency_map = {site: False for site in SITES}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, sans-serif)'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    
     while True:
         for site in SITES:
             try:
@@ -124,20 +125,42 @@ def check_worker():
                 
                 dom_d = get_domain_info(site)
 
+                # Логика регистрации и алертов
                 if curr_status != 200:
                     fail_count[site] += 1
                     alert_threshold = 5 if site in PRIORITY_SITES else 10
+                    
+                    # Запись в БД только со 2-й минуты (подтверждение сбоя)
+                    if fail_count[site] >= 2:
+                        conn = get_db_connection(); cur = conn.cursor()
+                        # Если это ровно 2-я минута, записываем и 1-ю тоже для точности
+                        if fail_count[site] == 2:
+                            prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
+                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", 
+                                       (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
+                        
+                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", 
+                                   (site, curr_status, resp_time, ssl_d, dom_d))
+                        conn.commit(); cur.close(); conn.close()
+
+                    # Оповещение в ТГ по порогам
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
-                        # Скриншот теперь для всех
-                        shot = take_screenshot(site) 
-                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
-                        msg += f" [Простой > {alert_threshold} мин]"
+                        shot = take_screenshot(site)
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status}) [Простой > {alert_threshold} мин]"
                         send_tg_msg(msg, shot)
                         last_status[site] = curr_status
                 else:
-                    if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
+                    # Если сайт Online - пишем в базу ВСЕГДА (для аптайма)
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
+                    conn.commit(); cur.close(); conn.close()
+
+                    if last_status[site] != 200: 
+                        send_tg_msg(f"✅ UP: {site}")
+                    
                     last_status[site], fail_count[site] = 200, 0
 
+                    # Латенси (только для Online сайтов)
                     if resp_time > 20 and not last_latency_map[site]:
                         send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = True
@@ -145,12 +168,10 @@ def check_worker():
                         send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = False
 
-                conn = get_db_connection(); cur = conn.cursor()
-                cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
-                conn.commit(); cur.close(); conn.close()
             except: pass
         time.sleep(60)
 
+# Остальная часть (FastAPI, HTML и прочее) остается без изменений
 @app.on_event("startup")
 def startup_event():
     init_db()
