@@ -87,12 +87,10 @@ def take_screenshot(site):
 
 def get_domain_info(site):
     try:
-        # Улучшенный парсинг для международных доменов (.com, .info)
         w = whois.whois(site)
         exp = w.expiration_date
         if isinstance(exp, list): exp = exp[0]
         if exp:
-            # Приводим к наивному формату времени для сравнения
             exp_naive = exp.replace(tzinfo=None)
             now_naive = datetime.datetime.now().replace(tzinfo=None)
             days = (exp_naive - now_naive).days
@@ -103,6 +101,7 @@ def get_domain_info(site):
 def check_worker():
     last_status = {site: 200 for site in SITES}
     fail_count = {site: 0 for site in SITES}
+    last_latency_map = {site: False for site in SITES}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     while True:
         for site in SITES:
@@ -110,7 +109,7 @@ def check_worker():
                 curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
                 start = time.time()
                 try:
-                    r = requests.get(f"https://{site}", timeout=20, headers=headers, allow_redirects=True)
+                    r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
 
@@ -125,6 +124,7 @@ def check_worker():
                 
                 dom_d = get_domain_info(site)
 
+                # Логика алертов (Offline/Online)
                 if curr_status != 200:
                     fail_count[site] += 1
                     alert_threshold = 1 if site in PRIORITY_SITES else 5
@@ -137,6 +137,14 @@ def check_worker():
                 else:
                     if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
                     last_status[site], fail_count[site] = 200, 0
+
+                    # Логика задержек (Latency)
+                    if resp_time > 20 and not last_latency_map[site]:
+                        send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = True
+                    elif resp_time < 10 and last_latency_map[site]:
+                        send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = False
 
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
