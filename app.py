@@ -13,7 +13,7 @@ import whois
 from psycopg2.extras import DictCursor
 from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse # Добавлен FileResponse
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -38,6 +38,14 @@ SITES = [
 PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"]
 
 app = FastAPI()
+
+# Быстрый способ обработки favicon.ico
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    file_path = 'favicon.ico'
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    return Response(status_code=204) # Если файла нет, просто молчим (No Content)
 
 def check_auth(request: Request):
     auth = request.headers.get("Authorization")
@@ -125,15 +133,12 @@ def check_worker():
                 
                 dom_d = get_domain_info(site)
 
-                # Логика регистрации и алертов
                 if curr_status != 200:
                     fail_count[site] += 1
                     alert_threshold = 5 if site in PRIORITY_SITES else 10
                     
-                    # Запись в БД только со 2-й минуты (подтверждение сбоя)
                     if fail_count[site] >= 2:
                         conn = get_db_connection(); cur = conn.cursor()
-                        # Если это ровно 2-я минута, записываем и 1-ю тоже для точности
                         if fail_count[site] == 2:
                             prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
                             cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", 
@@ -143,14 +148,12 @@ def check_worker():
                                    (site, curr_status, resp_time, ssl_d, dom_d))
                         conn.commit(); cur.close(); conn.close()
 
-                    # Оповещение в ТГ по порогам
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
                         shot = take_screenshot(site)
                         msg = f"🚨 DOWN: {site} (Код: {curr_status}) [Простой > {alert_threshold} мин]"
                         send_tg_msg(msg, shot)
                         last_status[site] = curr_status
                 else:
-                    # Если сайт Online - пишем в базу ВСЕГДА (для аптайма)
                     conn = get_db_connection(); cur = conn.cursor()
                     cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
                     conn.commit(); cur.close(); conn.close()
@@ -160,7 +163,6 @@ def check_worker():
                     
                     last_status[site], fail_count[site] = 200, 0
 
-                    # Латенси (только для Online сайтов)
                     if resp_time > 20 and not last_latency_map[site]:
                         send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = True
@@ -171,7 +173,6 @@ def check_worker():
             except: pass
         time.sleep(60)
 
-# Остальная часть (FastAPI, HTML и прочее) остается без изменений
 @app.on_event("startup")
 def startup_event():
     init_db()
@@ -200,7 +201,7 @@ async def index(auth: bool = Depends(check_auth)):
     all_warn_msg = [f"{s} (Offline)" for s in incidents] + [f"{s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"{s} (Домен {latest[s]['domain_days']}д)" for s in dom_warn]
 
     html = f"""
-    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов Pro</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
         .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
@@ -255,7 +256,7 @@ async def index(auth: bool = Depends(check_auth)):
         s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
         g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
     for s in sorted_sites:
-        if s in g_data: html += f"<div class='kpi-card'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+        if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
 
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
     cur.execute("""
