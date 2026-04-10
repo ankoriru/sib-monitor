@@ -21,7 +21,6 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-# Список сайтов (sibur.ru на первом месте)
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -88,11 +87,15 @@ def take_screenshot(site):
 
 def get_domain_info(site):
     try:
+        # Улучшенный парсинг для международных доменов (.com, .info)
         w = whois.whois(site)
         exp = w.expiration_date
         if isinstance(exp, list): exp = exp[0]
         if exp:
-            days = (exp.replace(tzinfo=None) - datetime.datetime.now()).days
+            # Приводим к наивному формату времени для сравнения
+            exp_naive = exp.replace(tzinfo=None)
+            now_naive = datetime.datetime.now().replace(tzinfo=None)
+            days = (exp_naive - now_naive).days
             return days
     except: pass
     return -1
@@ -119,12 +122,11 @@ def check_worker():
                             exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: pass
+                
                 dom_d = get_domain_info(site)
 
-                # Логика алертов
                 if curr_status != 200:
                     fail_count[site] += 1
-                    # Критичные - сразу, Secondary - после 5 минут (5 циклов по 60 сек)
                     alert_threshold = 1 if site in PRIORITY_SITES else 5
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
                         shot = take_screenshot(site) if site in PRIORITY_SITES else None
@@ -133,16 +135,14 @@ def check_worker():
                         send_tg_msg(msg, shot)
                         last_status[site] = curr_status
                 else:
-                    if last_status[site] != 200:
-                        send_tg_msg(f"✅ UP: {site}")
+                    if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
                     last_status[site], fail_count[site] = 200, 0
 
-                # Запись в БД (каждую минуту для всех)
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
                 conn.commit(); cur.close(); conn.close()
             except: pass
-        time.sleep(60) # Частота 1 минута
+        time.sleep(60)
 
 @app.on_event("startup")
 def startup_event():
@@ -204,7 +204,6 @@ async def index(auth: bool = Depends(check_auth)):
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Простой</th></tr></thead><tbody>
     """
-    # Сортировка: sibur.ru всегда первый, затем остальные Critical, затем Secondary
     sorted_sites = sorted(SITES, key=lambda x: (x != "sibur.ru", x not in PRIORITY_SITES, x))
     for s in sorted_sites:
         v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
