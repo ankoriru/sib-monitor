@@ -102,7 +102,7 @@ def check_worker():
     last_status = {site: 200 for site in SITES}
     fail_count = {site: 0 for site in SITES}
     last_latency_map = {site: False for site in SITES}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, sans-serif)'}
     while True:
         for site in SITES:
             try:
@@ -126,11 +126,12 @@ def check_worker():
 
                 if curr_status != 200:
                     fail_count[site] += 1
-                    alert_threshold = 1 if site in PRIORITY_SITES else 5
+                    alert_threshold = 5 if site in PRIORITY_SITES else 10
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
-                        shot = take_screenshot(site) if site in PRIORITY_SITES else None
+                        # Скриншот теперь для всех
+                        shot = take_screenshot(site) 
                         msg = f"🚨 DOWN: {site} (Код: {curr_status})"
-                        if site not in PRIORITY_SITES: msg += " [Простой > 5 мин]"
+                        msg += f" [Простой > {alert_threshold} мин]"
                         send_tg_msg(msg, shot)
                         last_status[site] = curr_status
                 else:
@@ -167,7 +168,6 @@ async def index(auth: bool = Depends(check_auth)):
 
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
     latest_all = {r['site']: r for r in cur.fetchall()}
-    # Фильтруем только те сайты, которые есть в актуальном SITES
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
     
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
