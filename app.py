@@ -124,7 +124,6 @@ def check_worker():
                 
                 dom_d = get_domain_info(site)
 
-                # Логика алертов (Offline/Online)
                 if curr_status != 200:
                     fail_count[site] += 1
                     alert_threshold = 1 if site in PRIORITY_SITES else 5
@@ -138,7 +137,6 @@ def check_worker():
                     if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
                     last_status[site], fail_count[site] = 200, 0
 
-                    # Логика задержек (Latency)
                     if resp_time > 20 and not last_latency_map[site]:
                         send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = True
@@ -168,7 +166,10 @@ async def index(auth: bool = Depends(check_auth)):
     s24 = cur.fetchone() or {'up':0, 'resp':0}
 
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
-    latest = {r['site']: r for r in cur.fetchall()}
+    latest_all = {r['site']: r for r in cur.fetchall()}
+    # Фильтруем только те сайты, которые есть в актуальном SITES
+    latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats = {r['site']: r for r in cur.fetchall()}
 
