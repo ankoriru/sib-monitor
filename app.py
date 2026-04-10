@@ -21,6 +21,7 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
+# Список сайтов (sibur.ru на первом месте)
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -120,21 +121,28 @@ def check_worker():
                 except: pass
                 dom_d = get_domain_info(site)
 
+                # Логика алертов
                 if curr_status != 200:
                     fail_count[site] += 1
-                    if (site in PRIORITY_SITES or fail_count[site] >= 2) and last_status[site] == 200:
+                    # Критичные - сразу, Secondary - после 5 минут (5 циклов по 60 сек)
+                    alert_threshold = 1 if site in PRIORITY_SITES else 5
+                    if fail_count[site] == alert_threshold and last_status[site] == 200:
                         shot = take_screenshot(site) if site in PRIORITY_SITES else None
-                        send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot)
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
+                        if site not in PRIORITY_SITES: msg += " [Простой > 5 мин]"
+                        send_tg_msg(msg, shot)
                         last_status[site] = curr_status
                 else:
-                    if last_status[site] != 200: send_tg_msg(f"✅ UP: {site}")
+                    if last_status[site] != 200:
+                        send_tg_msg(f"✅ UP: {site}")
                     last_status[site], fail_count[site] = 200, 0
 
+                # Запись в БД (каждую минуту для всех)
                 conn = get_db_connection(); cur = conn.cursor()
                 cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
                 conn.commit(); cur.close(); conn.close()
             except: pass
-        time.sleep(180)
+        time.sleep(60) # Частота 1 минута
 
 @app.on_event("startup")
 def startup_event():
@@ -153,7 +161,7 @@ async def index(auth: bool = Depends(check_auth)):
 
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
     latest = {r['site']: r for r in cur.fetchall()}
-    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*180 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
+    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats = {r['site']: r for r in cur.fetchall()}
 
     incidents = [s for s,v in latest.items() if v['status']!=200]
@@ -196,7 +204,8 @@ async def index(auth: bool = Depends(check_auth)):
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Простой</th></tr></thead><tbody>
     """
-    sorted_sites = sorted(SITES, key=lambda x: (x not in PRIORITY_SITES, x))
+    # Сортировка: sibur.ru всегда первый, затем остальные Critical, затем Secondary
+    sorted_sites = sorted(SITES, key=lambda x: (x != "sibur.ru", x not in PRIORITY_SITES, x))
     for s in sorted_sites:
         v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
         st30 = stats.get(s, {'upt':0, 'down_sec':0})
@@ -221,7 +230,7 @@ async def index(auth: bool = Depends(check_auth)):
 
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
     cur.execute("""
-        SELECT site, MIN(timestamp), COUNT(*)*3 as dur, MAX(status),
+        SELECT site, MIN(timestamp), COUNT(*)*1 as dur, MAX(status),
         CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
         FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp) as grp FROM logs WHERE status!=200) t 
         GROUP BY site, grp ORDER BY 2 DESC LIMIT 20
