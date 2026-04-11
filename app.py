@@ -2,7 +2,7 @@ import datetime
 import ssl
 import socket
 import requests
-import psycopg2 
+import psycopg2
 import json
 import base64
 import pytz
