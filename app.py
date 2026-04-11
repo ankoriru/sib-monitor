@@ -252,11 +252,22 @@ async def index(auth: bool = Depends(check_auth)):
         if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
 
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
+    
+    # ИСПРАВЛЕННЫЙ ЗАПРОС: Используем LAG для определения момента смены статуса на ошибку
     cur.execute("""
+        WITH status_changes AS (
+            SELECT site, timestamp, status,
+            CASE WHEN status != 200 AND (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200 OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL) THEN 1 ELSE 0 END as is_start
+            FROM logs
+        ),
+        incident_groups AS (
+            SELECT site, timestamp, status, SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+            FROM status_changes WHERE status != 200
+        )
         SELECT site, MIN(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
         CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
-        FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp) as grp FROM logs WHERE status!=200) t 
-        GROUP BY site, grp ORDER BY start_time DESC LIMIT 20
+        FROM incident_groups 
+        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
     """)
     for r in cur.fetchall():
         html += f"<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td><td>{r[3]}</td><td>{r[4]}</td></tr>"
