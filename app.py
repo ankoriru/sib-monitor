@@ -40,7 +40,11 @@ PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
 
 app = FastAPI()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    file_path = 'favicon.ico'
+    if os.path.exists(file_path): return FileResponse(file_path)
+    return Response(status_code=204)
 
 def check_auth(request: Request):
     auth = request.headers.get("Authorization")
@@ -77,7 +81,8 @@ def send_tg_msg(text, photo_path=None):
     except: pass
 
 async def take_screenshot(site):
-    path = f"debug_{int(time.time())}.jpg"
+    path = f"debug_{int(time.time())}.png"
+    print(f"Запуск быстрого скриншота (2 сек): {site}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -87,25 +92,28 @@ async def take_screenshot(site):
             context = await browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
             page = await context.new_page()
             try:
-                await page.goto(f"https://{site}", timeout=25000, wait_until="domcontentloaded")
-            except: pass
-            
-            await asyncio.sleep(2) # Быстрая пауза 2 сек после начала загрузки
+                await page.goto(f"https://{site}", timeout=20000, wait_until="domcontentloaded")
+            except:
+                print(f"Таймаут DOM для {site}, пробуем сделать скрин того, что успело загрузиться")
+            await asyncio.sleep(2) 
             await page.screenshot(path=path, type="jpeg", quality=80)
             await browser.close()
+            print(f"Быстрый скриншот готов: {path}")
         return path
-    except: return None
+    except Exception as e:
+        print(f"ОШИБКА PLAYWRIGHT на сайте {site}: {str(e)}")
+        return None
 
 def get_domain_info(site):
     try:
         w = whois.whois(site)
         exp = w.expiration_date
         if isinstance(exp, list): exp = exp[0]
-        if exp: return (exp.replace(tzinfo=None) - datetime.datetime.now()).days
+        if exp:
+            days = (exp.replace(tzinfo=None) - datetime.datetime.now()).days
+            return days
     except: pass
     return -1
-
-# --- ТВОЙ ОРИГИНАЛЬНЫЙ ВОРКЕР (БЕЗ УПРОЩЕНИЙ) ---
 
 def check_worker():
     last_status = {site: 200 for site in SITES}
@@ -147,20 +155,21 @@ def check_worker():
 
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
                         shot_path = asyncio.run(take_screenshot(site))
-                        desc = 'Timeout' if curr_status == 0 else ('Error ' + str(curr_status))
-                        send_tg_msg(f"🚨 DOWN: {site} ({desc})", shot_path)
+                        desc = 'Timeout' if curr_status == 0 else ('Bad Gateway' if curr_status == 502 else 'Service Unavailable')
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status}, {desc})"
+                        send_tg_msg(msg, shot_path)
                         last_status[site] = curr_status
                 else:
                     conn = get_db_connection(); cur = conn.cursor()
                     cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
                     conn.commit(); cur.close(); conn.close()
 
-                    if last_status[site] != 200:
-                        send_tg_msg(f"✅ UP: {site} (Был недоступен {fail_count[site]} мин.)")
+                    if last_status[site] != 200: 
+                        duration = fail_count[site]
+                        send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                     
                     last_status[site], fail_count[site] = 200, 0
 
-                    # Мониторинг задержки (твои уведомления)
                     if resp_time > 20 and not last_latency_map[site]:
                         send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = True
@@ -170,18 +179,10 @@ def check_worker():
             except: pass
         time.sleep(60)
 
-# --- РОУТЫ ---
-
 @app.on_event("startup")
 def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
-
-@app.get('/favicon.ico', include_in_schema=False)
-async def favicon():
-    file_path = 'favicon.ico'
-    if os.path.exists(file_path): return FileResponse(file_path)
-    return Response(status_code=204)
 
 @app.get("/test-screen/{site_name}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
@@ -189,7 +190,7 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
     shot = await take_screenshot(site_name)
     if shot:
         send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot)
-        return {"status": "success", "msg": f"Скриншот {site_name} отправлен"}
+        return {"status": "success", "msg": f"Скриншот {site_name} отправлен в ТГ"}
     return JSONResponse({"status": "error", "msg": "Ошибка скриншота"}, status_code=500)
 
 @app.get("/", response_class=HTMLResponse)
@@ -197,51 +198,141 @@ async def index(auth: bool = Depends(check_auth)):
     conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
 
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'")
+    s30 = cur.fetchone() or {'up':0, 'resp':0}
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
+    s24 = cur.fetchone() or {'up':0, 'resp':0}
+
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
-    latest = {r['site']: r for r in cur.fetchall()}
-    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
+    latest_all = {r['site']: r for r in cur.fetchall()}
+    latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    
+    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
     stats = {r['site']: r for r in cur.fetchall()}
 
+    incidents = [s for s,v in latest.items() if v['status']!=200]
+    ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <= 20]
+    dom_warn = [s for s,v in latest.items() if 0 <= v['domain_days'] <= 30]
+    all_warn_msg = [f"{s} (Offline)" for s in incidents] + [f"{s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"{s} (Домен {latest[s]['domain_days']}д)" for s in dom_warn]
+
     html = f"""
-    <html><head><meta charset="UTF-8"><title>Sibur Monitoring</title>
+    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
-        .container {{ max-width: 1200px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        h1 {{ color: #00717a; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-        th {{ text-align: left; padding: 12px; color: #64748b; font-size: 11px; text-transform: uppercase; }}
-        td {{ padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }}
-        .btn-test {{ background: #00717a; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; min-width: 100px; justify-content: center; }}
-        .loader {{ border: 2px solid #f3f3f3; border-top: 2px solid #ffffff; border-radius: 50%; width: 14px; height: 14px; animation: spin 0.8s linear infinite; display: none; margin-right: 8px; }}
+        .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
+        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }}
+        .danger-card {{ border-top-color: #ef4444 !important; background: #fef2f2; }}
+        .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }}
+        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
+        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
+        .tab-btn.active {{ background: #00717a; color: white; }}
+        .tab-content {{ display: none; }} .active-content {{ display: block; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
+        .row-err {{ background-color: #fff1f2 !important; }}
+        .txt-err {{ color: #dc2626; font-weight: bold; }} .txt-ok {{ color: #16a34a; font-weight: bold; }}
+        .refresh-btn {{ background: #00717a; color: white; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; }}
+        .btn-test {{ background: #00717a; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; min-width: 80px; }}
+        .loader {{ border: 2px solid #f3f3f3; border-top: 2px solid #00717a; border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: none; margin-right: 5px; }}
         @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
-        .loading .loader {{ display: block; }} .loading span {{ display: none; }}
-        .toast {{ position: fixed; bottom: 20px; right: 20px; background: #1e293b; color: white; padding: 12px 24px; border-radius: 8px; display: none; font-size: 14px; z-index: 1000; }}
+        .loading .loader {{ display: inline-block; }} .loading span {{ display: none; }}
+        .toast {{ position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
     </style></head><body>
     <div id="toast" class="toast"></div>
     <div class="container">
-        <h1>📊 Sibur Monitoring <span style="font-size: 14px; color: #94a3b8;">{now_msk}</span></h1>
-        <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>SSL</th><th>Проверка</th></tr></thead><tbody>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
+        </div>
+        <div class="kpi-grid">
+            <div class="kpi-card"><span>Доступно</span><strong><br>{sum(1 for s in latest.values() if s['status']==200)} / {len(SITES)}</strong></div>
+            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><strong><br>{s24['up']}% / {s30['up']}%</strong></div>
+            <div class="kpi-card"><span>Ответ (24ч / 30д)</span><strong><br>{s24['resp']}с / {s30['resp']}с</strong></div>
+            <div class="kpi-card {'danger-card' if incidents else ''}"><span>Инциденты</span><strong><br>{len(incidents)}</strong></div>
+            <div class="kpi-card {'danger-card' if ssl_warn else ''}"><span>SSL <=20д</span><strong><br>{len(ssl_warn)}</strong></div>
+        </div>
+        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_warn_msg)}</div>' if all_warn_msg else ''}
+        <div class="tabs"><button class="tab-btn active" onclick="tab(event, 't1')">Список</button><button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button><button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button><button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button></div>
+        <div id="t1" class="tab-content active-content">
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """
     sorted_sites = sorted(SITES, key=lambda x: (x != "sibur.ru", x not in PRIORITY_SITES, x))
     for s in sorted_sites:
-        v = latest.get(s, {'status':0,'ssl_days':-1})
-        st = stats.get(s, {'upt':0})
-        html += f"""<tr><td><strong>{s}</strong></td><td><span style="color: {'#16a34a' if v['status']==200 else '#dc2626'}">● {'Online' if v['status']==200 else 'Offline'}</span></td><td>{st['upt']}%</td><td>{v['ssl_days']}д</td>
-        <td><button class="btn-test" onclick="runTest('{s}', this)"><div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
-    html += """</tbody></table></div>
+        v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
+        st30 = stats.get(s, {'upt':0, 'down_sec':0})
+        is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
+        html += f"""<tr class="{'row-err' if is_err else ''}">
+            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
+            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
+            <td>{st30['upt']}%</td><td>{round(v['response_time'],2)}с</td>
+            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
+            <td><button class="btn-test" onclick="runTest('{s}', this)"><div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
+
+    html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
+    cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '14 days' GROUP BY 1,2 ORDER BY 2")
+    g_data = {}
+    for r in cur.fetchall():
+        s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
+        g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
+    for s in sorted_sites:
+        if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+
+    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
+    
+    cur.execute("""
+        WITH status_changes AS (
+            SELECT site, timestamp, status,
+            CASE WHEN status != 200 AND (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200 OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL) THEN 1 ELSE 0 END as is_start
+            FROM logs
+        ),
+        incident_groups AS (
+            SELECT site, timestamp, status, SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+            FROM status_changes WHERE status != 200
+        )
+        SELECT site, MIN(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
+        CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
+        FROM incident_groups 
+        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+    """)
+    for r in cur.fetchall():
+        html += f"<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td><td>{r[3]}</td><td>{r[4]}</td></tr>"
+
+    html += """</tbody></table></div><div id="t4" class="tab-content"><table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th></tr></thead><tbody>"""
+    cal_events = []
+    for s in SITES:
+        v = latest.get(s, {})
+        if v.get('ssl_days', -1) >= 0: cal_events.append({'t': 'SSL сертификат', 's': s, 'd': v['ssl_days']})
+        if v.get('domain_days', -1) >= 0: cal_events.append({'t': 'Оплата домена', 's': s, 'd': v['domain_days']})
+    for ev in sorted(cal_events, key=lambda x: x['d']):
+        html += f"<tr><td>{ev['t']}</td><td>{ev['s']}</td><td class='{'txt-err' if ev['d']<=30 else ''}'>{ev['d']} дн.</td></tr>"
+
+    html += f"""</tbody></table></div></div>
     <script>
-    async function runTest(site, btn) {
+    function tab(e,n){{ var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn'); for(i=0;i<x.length;i++)x[i].className='tab-content'; for(i=0;i<b.length;i++)b[i].className='tab-btn'; document.getElementById(n).className='tab-content active-content'; e.currentTarget.className+=' active'; }}
+    
+    async function runTest(site, btn) {{
         if (btn.classList.contains('loading')) return;
-        btn.classList.add('loading'); btn.disabled = true;
-        try {
-            const r = await fetch('/test-screen/' + site); const d = await r.json();
-            showToast(d.msg);
-        } catch (e) { showToast('Ошибка сети'); }
-        finally { btn.classList.remove('loading'); btn.disabled = false; }
-    }
-    function showToast(m) { const t = document.getElementById('toast'); t.innerText = m; t.style.display = 'block'; setTimeout(() => t.style.display='none', 4000); }
-    setTimeout(() => location.reload(), 300000);
-    </script></body></html>"""
+        btn.classList.add('loading');
+        btn.disabled = true;
+        try {{
+            const response = await fetch('/test-screen/' + site);
+            const data = await response.json();
+            showToast(data.msg);
+        }} catch (e) {{ showToast('Ошибка связи с сервером'); }}
+        finally {{ btn.classList.remove('loading'); btn.disabled = false; }}
+    }}
+
+    function showToast(msg) {{
+        const t = document.getElementById('toast');
+        t.innerText = msg;
+        t.style.display = 'block';
+        setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
+    }}
+    </script>"""
+    for s, d in g_data.items():
+        html += f"""<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{ type:'line', data:{{ labels:{json.dumps(d['l'])}, datasets:[ {{label:'Uptime %', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}}, {{label:'Ответ сек', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}} ]}}, options:{{ scales:{{ y:{{min:75, max:110}}, y1:{{position:'right', grid:{{display:false}}}} }} }} }});</script>"""
     cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
