@@ -13,7 +13,7 @@ import whois
 from psycopg2.extras import DictCursor
 from playwright.sync_api import sync_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse # Добавлен FileResponse
+from fastapi.responses import HTMLResponse, FileResponse
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -39,13 +39,11 @@ PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
 
 app = FastAPI()
 
-# Быстрый способ обработки favicon.ico
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
     file_path = 'favicon.ico'
-    if os.path.exists(file_path):
-        return FileResponse(file_path)
-    return Response(status_code=204) # Если файла нет, просто молчим (No Content)
+    if os.path.exists(file_path): return FileResponse(file_path)
+    return Response(status_code=204)
 
 def check_auth(request: Request):
     auth = request.headers.get("Authorization")
@@ -75,19 +73,19 @@ def send_tg_msg(text, photo_path=None):
     try:
         if photo_path and os.path.exists(photo_path):
             with open(photo_path, 'rb') as f:
-                requests.post(base_url + "sendPhoto", data={"chat_id": TELEGRAM_CHAT_ID, "caption": text}, files={"photo": f}, timeout=20)
-            os.remove(photo_path)
+                requests.post(base_url + "sendPhoto", data={"chat_id": TELEGRAM_CHAT_ID, "caption": text}, files={"photo": f}, timeout=30)
+            if os.path.exists(photo_path): os.remove(photo_path)
         else:
             requests.post(base_url + "sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
     except: pass
 
 def take_screenshot(site):
-    path = f"debug_{site.replace('.','_')}.png"
+    path = f"debug_{int(time.time())}.png"
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
             page = browser.new_page()
-            page.goto(f"https://{site}", timeout=30000, wait_until="networkidle")
+            page.goto(f"https://{site}", timeout=45000, wait_until="networkidle")
             page.screenshot(path=path)
             browser.close()
         return path
@@ -99,9 +97,7 @@ def get_domain_info(site):
         exp = w.expiration_date
         if isinstance(exp, list): exp = exp[0]
         if exp:
-            exp_naive = exp.replace(tzinfo=None)
-            now_naive = datetime.datetime.now().replace(tzinfo=None)
-            days = (exp_naive - now_naive).days
+            days = (exp.replace(tzinfo=None) - datetime.datetime.now()).days
             return days
     except: pass
     return -1
@@ -130,7 +126,6 @@ def check_worker():
                             exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                             ssl_d = (exp - datetime.datetime.utcnow()).days
                 except: pass
-                
                 dom_d = get_domain_info(site)
 
                 if curr_status != 200:
@@ -141,17 +136,14 @@ def check_worker():
                         conn = get_db_connection(); cur = conn.cursor()
                         if fail_count[site] == 2:
                             prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
-                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", 
-                                       (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
-                        
-                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", 
-                                   (site, curr_status, resp_time, ssl_d, dom_d))
+                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
+                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
                         conn.commit(); cur.close(); conn.close()
 
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
-                        shot = take_screenshot(site)
-                        msg = f"🚨 DOWN: {site} (Код: {curr_status}) [Простой > {alert_threshold} мин]"
-                        send_tg_msg(msg, shot)
+                        shot_path = take_screenshot(site)
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
+                        send_tg_msg(msg, shot_path)
                         last_status[site] = curr_status
                 else:
                     conn = get_db_connection(); cur = conn.cursor()
@@ -159,7 +151,8 @@ def check_worker():
                     conn.commit(); cur.close(); conn.close()
 
                     if last_status[site] != 200: 
-                        send_tg_msg(f"✅ UP: {site}")
+                        duration = fail_count[site]
+                        send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                     
                     last_status[site], fail_count[site] = 200, 0
 
@@ -169,7 +162,6 @@ def check_worker():
                     elif resp_time < 10 and last_latency_map[site]:
                         send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                         last_latency_map[site] = False
-
             except: pass
         time.sleep(60)
 
@@ -201,7 +193,7 @@ async def index(auth: bool = Depends(check_auth)):
     all_warn_msg = [f"{s} (Offline)" for s in incidents] + [f"{s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"{s} (Домен {latest[s]['domain_days']}д)" for s in dom_warn]
 
     html = f"""
-    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов Pro</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
         .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
@@ -256,14 +248,14 @@ async def index(auth: bool = Depends(check_auth)):
         s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
         g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
     for s in sorted_sites:
-        if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+        if s in g_data: html += f"<div class='kpi-card'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
 
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
     cur.execute("""
-        SELECT site, MIN(timestamp), COUNT(*)*1 as dur, MAX(status),
+        SELECT site, MAX(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
         CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
-        FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp) as grp FROM logs WHERE status!=200) t 
-        GROUP BY site, grp ORDER BY 2 DESC LIMIT 20
+        FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp DESC) as grp FROM logs WHERE status!=200) t 
+        GROUP BY site, grp ORDER BY start_time DESC LIMIT 20
     """)
     for r in cur.fetchall():
         html += f"<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td><td>{r[3]}</td><td>{r[4]}</td></tr>"
@@ -279,10 +271,10 @@ async def index(auth: bool = Depends(check_auth)):
 
     html += f"""</tbody></table></div></div><script>
     function tab(e,n){{ var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn'); for(i=0;i<x.length;i++)x[i].className='tab-content'; for(i=0;i<b.length;i++)b[i].className='tab-btn'; document.getElementById(n).className='tab-content active-content'; e.currentTarget.className+=' active'; }}
-    """
+    </script></body></html>"""
     for s, d in g_data.items():
-        html += f"""new Chart(document.getElementById('c-{s.replace('.','_')}'), {{ type:'line', data:{{ labels:{json.dumps(d['l'])}, datasets:[ {{label:'Uptime %', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}}, {{label:'Ответ сек', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}} ]}}, options:{{ scales:{{ y:{{min:75, max:110}}, y1:{{position:'right', grid:{{display:false}}}} }} }} }});"""
-    html += "</script></body></html>"; cur.close(); conn.close(); return html
+        html += f"""<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{ type:'line', data:{{ labels:{json.dumps(d['l'])}, datasets:[ {{label:'Uptime %', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}}, {{label:'Ответ сек', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}} ]}}, options:{{ scales:{{ y:{{min:75, max:110}}, y1:{{position:'right', grid:{{display:false}}}} }} }} }});</script>"""
+    cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
     import uvicorn
