@@ -142,7 +142,8 @@ def check_worker():
 
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
                         shot_path = take_screenshot(site)
-                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
+                        desc = 'Timeout' if curr_status == 0 else ('Bad Gateway' if curr_status == 502 else 'Service Unavailable')
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status}, {desc})"
                         send_tg_msg(msg, shot_path)
                         last_status[site] = curr_status
                 else:
@@ -248,13 +249,13 @@ async def index(auth: bool = Depends(check_auth)):
         s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
         g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
     for s in sorted_sites:
-        if s in g_data: html += f"<div class='kpi-card'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+        if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
 
     html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
     cur.execute("""
-        SELECT site, MAX(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
+        SELECT site, MIN(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
         CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
-        FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp DESC) as grp FROM logs WHERE status!=200) t 
+        FROM (SELECT *, SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) OVER (PARTITION BY site ORDER BY timestamp) as grp FROM logs WHERE status!=200) t 
         GROUP BY site, grp ORDER BY start_time DESC LIMIT 20
     """)
     for r in cur.fetchall():
