@@ -83,35 +83,34 @@ def send_tg_msg(text, photo_path=None):
 # ИЗМЕНЕНИЕ 1: Асинхронная функция скриншота с корректными флагами
 async def take_screenshot(site):
     path = f"debug_{int(time.time())}.png"
+    print(f"Запуск быстрого скриншота (2 сек): {site}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True, 
-                args=[
-                    "--no-sandbox", 
-                    "--disable-dev-shm-usage", 
-                    "--disable-gpu", 
-                    "--proxy-server='direct://'", # Игнорируем прокси для скорости
-                    "--proxy-bypass-list=*",
-                    "--disable-extensions" # Отключаем расширения
-                ]
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox", "--no-zygote"]
             )
             context = await browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
             page = await context.new_page()
             
-            # Ставим таймаут 30 сек вместо 60 и ждем только загрузки DOM
-            await page.goto(f"https://{site}", timeout=30000, wait_until="domcontentloaded")
-            
-            # Уменьшаем паузу до 2 секунд (обычно этого хватает для отрисовки текста)
+            # 1. Ждем только загрузки DOM (структуры страницы)
+            try:
+                await page.goto(f"https://{site}", timeout=20000, wait_until="domcontentloaded")
+            except:
+                print(f"Таймаут DOM для {site}, пробуем сделать скрин того, что успело загрузиться")
+
+            # 2. Ждем ровно 2 секунды перед снимком
             await asyncio.sleep(2) 
             
-            # Ограничиваем область скриншота только видимой частью (быстрее, чем full_page)
-            await page.screenshot(path=path, type="jpeg", quality=60) # JPEG сжимается и отправляется быстрее PNG
+            # 3. Делаем снимок (используем JPEG для более быстрой отправки в Telegram)
+            await page.screenshot(path=path, type="jpeg", quality=80)
             await browser.close()
+            print(f"Быстрый скриншот готов: {path}")
         return path
     except Exception as e:
         print(f"ОШИБКА PLAYWRIGHT на сайте {site}: {str(e)}")
         return None
+
 
 
 def get_domain_info(site):
