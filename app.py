@@ -13,7 +13,7 @@ import whois
 import asyncio
 from psycopg2.extras import DictCursor
 from playwright.async_api import async_playwright
-from fastapi import FastAPI, Request, Response, Depends, HTTPException
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 # --- КОНФИГУРАЦИЯ ---
@@ -46,15 +46,25 @@ async def favicon():
     if os.path.exists(file_path): return FileResponse(file_path)
     return Response(status_code=204)
 
-def check_auth(request: Request):
+# ИЗМЕНЕНИЕ 1: Сохранение сессии на 30 дней через Cookie
+def check_auth(request: Request, response: Response, session_auth: str = Cookie(None)):
+    if session_auth == "authenticated_sibur":
+        return True
+    
     auth = request.headers.get("Authorization")
-    if not auth: raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic realm='Sibur Monitoring'"})
+    if not auth:
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic realm='Sibur Monitoring'"})
+    
     try:
         scheme, credentials = auth.split()
         decoded = base64.b64decode(credentials).decode("ascii")
         u, p = decoded.split(":")
-        if u == "sibur" and p == "sibur": return True
-    except: pass
+        if u == "sibur" and p == "sibur":
+            # Устанавливаем куку на 30 дней (2592000 секунд)
+            response.set_cookie(key="session_auth", value="authenticated_sibur", max_age=2592000, httponly=True)
+            return True
+    except:
+        pass
     raise HTTPException(status_code=401)
 
 def get_db_connection(): return psycopg2.connect(DATABASE_URL)
@@ -212,8 +222,16 @@ async def index(auth: bool = Depends(check_auth)):
 
     incidents = [s for s,v in latest.items() if v['status']!=200]
     ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <= 20]
-    dom_warn = [s for s,v in latest.items() if 0 <= v['domain_days'] <= 30]
-    all_warn_msg = [f"{s} (Offline)" for s in incidents] + [f"{s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"{s} (Домен {latest[s]['domain_days']}д)" for s in dom_warn]
+    # Задержка более 20с при живом сайте
+    latency_warn = [s for s,v in latest.items() if v['response_time'] > 20 and v['status'] == 200]
+    
+    # ИЗМЕНЕНИЕ 4: Список проблем (Offline, SSL, Задержка) без Доменов
+    all_warn_list = [f"❌ {s} (Offline)" for s in incidents] + \
+                    [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + \
+                    [f"🐢 {s} (Задержка {round(latest[s]['response_time'],1)}с)" for s in latency_warn]
+
+    online_count = sum(1 for s in latest.values() if s['status']==200)
+    total_sites = len(SITES)
 
     html = f"""
     <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -222,8 +240,12 @@ async def index(auth: bool = Depends(check_auth)):
         .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
         .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }}
-        .danger-card {{ border-top-color: #ef4444 !important; background: #fef2f2; }}
+        
+        /* ИЗМЕНЕНИЕ 2 и 3: Розовый фон и красный верх для проблемных KPI */
+        .danger-card {{ border-top-color: #ef4444 !important; background: #fef2f2 !important; }}
+        
         .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }}
+        .error-list {{ margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }}
         .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
         .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
         .tab-btn.active {{ background: #00717a; color: white; }}
@@ -246,13 +268,13 @@ async def index(auth: bool = Depends(check_auth)):
             <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
         </div>
         <div class="kpi-grid">
-            <div class="kpi-card"><span>Доступно</span><strong><br>{sum(1 for s in latest.values() if s['status']==200)} / {len(SITES)}</strong></div>
+            <div class="kpi-card {'danger-card' if online_count < total_sites else ''}"><span>Доступно</span><strong><br>{online_count} / {total_sites}</strong></div>
             <div class="kpi-card"><span>Uptime (24ч / 30д)</span><strong><br>{s24['up']}% / {s30['up']}%</strong></div>
             <div class="kpi-card"><span>Ответ (24ч / 30д)</span><strong><br>{s24['resp']}с / {s30['resp']}с</strong></div>
-            <div class="kpi-card {'danger-card' if incidents else ''}"><span>Инциденты</span><strong><br>{len(incidents)}</strong></div>
+            <div class="kpi-card {'danger-card' if len(incidents) > 0 else ''}"><span>Инциденты</span><strong><br>{len(incidents)}</strong></div>
             <div class="kpi-card {'danger-card' if ssl_warn else ''}"><span>SSL <=20д</span><strong><br>{len(ssl_warn)}</strong></div>
         </div>
-        {f'<div class="error-bar">⚠️ Обратите внимание: {", ".join(all_warn_msg)}</div>' if all_warn_msg else ''}
+        {f'<div class="error-bar">⚠️ Обратите внимание:<ul class="error-list"><li>' + '</li><li>'.join(all_warn_list) + '</li></ul></div>' if all_warn_list else ''}
         <div class="tabs"><button class="tab-btn active" onclick="tab(event, 't1')">Список</button><button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button><button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button><button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button></div>
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
@@ -308,8 +330,7 @@ async def index(auth: bool = Depends(check_auth)):
     for ev in sorted(cal_events, key=lambda x: x['d']):
         html += f"<tr><td>{ev['t']}</td><td>{ev['s']}</td><td class='{'txt-err' if ev['d']<=30 else ''}'>{ev['d']} дн.</td></tr>"
 
-    html += f"""</tbody></table></div></div>
-    <script>
+    html += f"""</tbody></table></div></div><script>
     function tab(e,n){{ var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn'); for(i=0;i<x.length;i++)x[i].className='tab-content'; for(i=0;i<b.length;i++)b[i].className='tab-btn'; document.getElementById(n).className='tab-content active-content'; e.currentTarget.className+=' active'; }}
     
     async function runTest(site, btn) {{
