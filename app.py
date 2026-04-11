@@ -81,17 +81,39 @@ def send_tg_msg(text, photo_path=None):
 
 def take_screenshot(site):
     path = f"debug_{int(time.time())}.png"
+    print(f"Попытка сделать скриншот: {site}") # Лог в Amvera
     try:
         with sync_playwright() as p:
-            # ИЗМЕНЕНИЕ 1: Добавлены флаги --no-sandbox и --disable-dev-shm-usage
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-            page = browser.new_page()
-            # ИЗМЕНЕНИЕ 1: Увеличен таймаут до 60000мс
-            page.goto(f"https://{site}", timeout=60000, wait_until="networkidle")
+            # Расширенный список флагов для работы под root в Docker
+            browser = p.chromium.launch(
+                headless=True, 
+                args=[
+                    "--no-sandbox", 
+                    "--disable-dev-shm-usage", 
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--no-zygote"
+                ]
+            )
+            context = browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
+            page = context.new_page()
+            
+            # Уменьшаем строгость ожидания. "commit" — это момент, когда сайт начал отдавать данные.
+            # Это поможет, если сайт долго подгружает тяжелые скрипты.
+            page.goto(f"https://{site}", timeout=60000, wait_until="commit")
+            
+            # Ждем 5 секунд, чтобы страница успела отрисоваться
+            time.sleep(5)
+            
             page.screenshot(path=path)
             browser.close()
+            print(f"Скриншот успешно создан: {path}") # Лог в Amvera
         return path
-    except: return None
+    except Exception as e:
+        # ЭТО САМОЕ ВАЖНОЕ: теперь в логах Amvera появится текст ошибки
+        print(f"ОШИБКА PLAYWRIGHT на сайте {site}: {str(e)}")
+        return None
+
 
 def get_domain_info(site):
     try:
