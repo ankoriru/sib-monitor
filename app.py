@@ -10,8 +10,9 @@ import threading
 import time
 import os
 import whois
+import asyncio  # Добавлен импорт для управления циклами событий
 from psycopg2.extras import DictCursor
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright  # Переход на асинхронную версию
 from fastapi import FastAPI, Request, Response, Depends, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 
@@ -79,41 +80,30 @@ def send_tg_msg(text, photo_path=None):
             requests.post(base_url + "sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
     except: pass
 
-def take_screenshot(site):
+# ИЗМЕНЕНИЕ 1: Асинхронная функция скриншота с корректными флагами
+async def take_screenshot(site):
     path = f"debug_{int(time.time())}.png"
-    print(f"Попытка сделать скриншот: {site}") # Лог в Amvera
+    print(f"Попытка сделать асинхронный скриншот: {site}")
     try:
-        with sync_playwright() as p:
-            # Расширенный список флагов для работы под root в Docker
-            browser = p.chromium.launch(
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
                 headless=True, 
-                args=[
-                    "--no-sandbox", 
-                    "--disable-dev-shm-usage", 
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                    "--no-zygote"
-                ]
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox", "--no-zygote"]
             )
-            context = browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
-            page = context.new_page()
+            context = await browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
+            page = await context.new_page()
             
-            # Уменьшаем строгость ожидания. "commit" — это момент, когда сайт начал отдавать данные.
-            # Это поможет, если сайт долго подгружает тяжелые скрипты.
-            page.goto(f"https://{site}", timeout=60000, wait_until="commit")
+            # Увеличен таймаут и оптимизировано ожидание для контейнера
+            await page.goto(f"https://{site}", timeout=60000, wait_until="commit")
+            await asyncio.sleep(5) # Пауза на рендеринг
             
-            # Ждем 5 секунд, чтобы страница успела отрисоваться
-            time.sleep(5)
-            
-            page.screenshot(path=path)
-            browser.close()
-            print(f"Скриншот успешно создан: {path}") # Лог в Amvera
+            await page.screenshot(path=path)
+            await browser.close()
+            print(f"Скриншот успешно создан: {path}")
         return path
     except Exception as e:
-        # ЭТО САМОЕ ВАЖНОЕ: теперь в логах Amvera появится текст ошибки
         print(f"ОШИБКА PLAYWRIGHT на сайте {site}: {str(e)}")
         return None
-
 
 def get_domain_info(site):
     try:
@@ -165,7 +155,8 @@ def check_worker():
                         conn.commit(); cur.close(); conn.close()
 
                     if fail_count[site] == alert_threshold and last_status[site] == 200:
-                        shot_path = take_screenshot(site)
+                        # В потоке воркера используем asyncio.run для запуска асинхронного скриншота
+                        shot_path = asyncio.run(take_screenshot(site))
                         desc = 'Timeout' if curr_status == 0 else ('Bad Gateway' if curr_status == 502 else 'Service Unavailable')
                         msg = f"🚨 DOWN: {site} (Код: {curr_status}, {desc})"
                         send_tg_msg(msg, shot_path)
@@ -195,11 +186,11 @@ def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
 
-# ИЗМЕНЕНИЕ 2: Новый роут для теста скриншота
+# ИЗМЕНЕНИЕ 2: Асинхронный роут теста
 @app.get("/test-screen/{site_name}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
     if site_name not in SITES: raise HTTPException(status_code=404)
-    shot = take_screenshot(site_name)
+    shot = await take_screenshot(site_name) # Добавлен await
     if shot:
         send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot)
         return HTMLResponse(f"Успешно! Скриншот {site_name} отправлен в ТГ. <br><a href='/'>Назад</a>")
