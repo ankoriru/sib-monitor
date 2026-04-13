@@ -169,6 +169,8 @@ def get_domain_info(site):
     return -1
 
 def check_worker():
+    import urllib3 
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     last_status = {site: 200 for site in SITES}
     fail_count = {site: 0 for site in SITES}
     last_latency_map = {site: False for site in SITES}
@@ -188,7 +190,7 @@ def check_worker():
                 start = time.time()
                 # Проверка доступности по полной ссылке
                 try:
-                    r = requests.get(check_url, timeout=25, headers=headers, allow_redirects=True)
+                    r = requests.get(check_url, timeout=25, headers=headers, allow_redirects=True, verify=False)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: 
                     curr_status, resp_time = 0, 25.0
