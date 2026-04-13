@@ -174,26 +174,78 @@ def check_worker():
     last_latency_map = {site: False for site in SITES}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
-while True:
+    while True:
         for site in SITES:
             try:
-                # 1. Для сетевого запроса используем строку как есть (с путем)
+                curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
+                
+                # 1. Ссылка для проверки (с путем /cp/)
                 check_url = f"https://{site}"
                 
-                # 2. Для SSL и WHOIS нам нужен чистый домен (без /cp/)
-                domain_only = site.split('/')[0] 
+                # 2. Чистый домен для технических проверок (без пути)
+                domain_only = site.split('/')[0]
                 
                 start = time.time()
+                # Проверка доступности по полной ссылке
                 try:
                     r = requests.get(check_url, timeout=25, headers=headers, allow_redirects=True)
                     curr_status, resp_time = r.status_code, time.time() - start
-                except: curr_status, resp_time = 0, 25.0
+                except: 
+                    curr_status, resp_time = 0, 25.0
 
+                # Проверка SSL (используем domain_only!)
                 try:
                     ctx = ssl.create_default_context()
-                    # Используем domain_only вместо site
                     with socket.create_connection((domain_only, 443), timeout=3) as sock:
                         with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                            cert = ssock.getpeercert()
+                            exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                            ssl_d = (exp - datetime.datetime.utcnow()).days
+                except: 
+                    pass
+
+                # Проверка домена WHOIS (используем domain_only!)
+                dom_d = get_domain_info(domain_only)
+
+                # --- ЛОГИКА АЛЕРТОВ И ЗАПИСИ (используем исходный 'site') ---
+                if curr_status != 200:
+                    fail_count[site] += 1
+                    alert_threshold = 5 if site in PRIORITY_SITES else 10
+                    
+                    if fail_count[site] >= 2:
+                        conn = get_db_connection(); cur = conn.cursor()
+                        if fail_count[site] == 2:
+                            prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
+                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
+                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
+                        conn.commit(); cur.close(); conn.close()
+
+                    if fail_count[site] == alert_threshold and last_status[site] == 200:
+                        shot_path = asyncio.run(take_screenshot(site))
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
+                        send_tg_msg(msg, shot_path)
+                        last_status[site] = curr_status
+                else:
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
+                    conn.commit(); cur.close(); conn.close()
+
+                    if last_status[site] != 200: 
+                        duration = fail_count[site]
+                        send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                    
+                    last_status[site], fail_count[site] = 200, 0
+
+                    if resp_time > 20 and not last_latency_map[site]:
+                        send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = True
+                    elif resp_time < 10 and last_latency_map[site]:
+                        send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = False
+            except Exception as e:
+                print(f"Ошибка воркера на {site}: {e}")
+        time.sleep(60)
+                            
 
 @app.on_event("startup")
 def startup_event():
