@@ -338,8 +338,20 @@ async def index(auth: bool = Depends(check_auth)):
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """
-    sorted_sites = sorted(SITES, key=lambda x: (x != "sibur.ru", x not in PRIORITY_SITES, x))
-    for s in sorted_sites:
+# 1. Сначала определяем веса для категорий
+    def get_site_weight(site_name):
+        if site_name == "sibur.ru":
+            return 0  # Всегда первый
+        if site_name in NEW_MONITORING_SITES:
+            return 2  # Новые сайты (🔰) - после основных звезд
+        if site_name in PRIORITY_SITES:
+            return 1  # Основные приоритетные сайты (⭐️)
+        return 3      # Все остальные
+
+    # 2. Применяем сортировку: сначала по весу, потом по алфавиту
+    sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
+
+for s in sorted_sites:
         v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
         st30 = stats.get(s, {'upt':0, 'down_sec':0})
         is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
