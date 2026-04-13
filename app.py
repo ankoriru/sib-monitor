@@ -339,32 +339,26 @@ async def index(auth: bool = Depends(check_auth)):
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """
 # 1. Сначала определяем веса для категорий
+# 1. Исправленная логика сортировки (Веса)
     def get_site_weight(site_name):
-        if site_name == "sibur.ru":
-            return 0  # Всегда первый
-        if site_name in NEW_MONITORING_SITES:
-            return 2  # Новые сайты (🔰) - после основных звезд
-        if site_name in PRIORITY_SITES:
-            return 1  # Основные приоритетные сайты (⭐️)
-        return 3      # Все остальные
+        if site_name == "sibur.ru": return 0
+        # Новые сайты (🔰) ставим после старых приоритетных (⭐️)
+        if site_name in NEW_MONITORING_SITES: return 2
+        if site_name in PRIORITY_SITES: return 1
+        return 3
 
-    # 2. Применяем сортировку: сначала по весу, потом по алфавиту
     sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
 
-for s in sorted_sites:
+    for s in sorted_sites:
         v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
         st30 = stats.get(s, {'upt':0, 'down_sec':0})
         is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
         
-        # Определяем значок
-        prefix = ""
-        if s in NEW_MONITORING_SITES:
-            prefix = "🔰 "
-        elif s in PRIORITY_SITES:
-            prefix = "⭐️ "
+        # 2. Правильный значок
+        prefix = "🔰 " if s in NEW_MONITORING_SITES else ("⭐️ " if s in PRIORITY_SITES else "")
         
-        # В строке ниже используем {prefix} вместо старого условия
-            html += f"""<tr class="{'row-err' if is_err else ''}">
+        # 3. Формирование строки ТАБЛИЦЫ (внутри цикла)
+        html += f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'],2)}с</td>
@@ -372,6 +366,7 @@ for s in sorted_sites:
             <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
             <td><button class="btn-test" onclick="runTest('{s}', this)"><div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
 
+    # 4. ЗАКРЫТИЕ ТАБЛИЦЫ (строго БЕЗ отступа, вне цикла for)
     html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
     cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '14 days' GROUP BY 1,2 ORDER BY 2")
     g_data = {}
