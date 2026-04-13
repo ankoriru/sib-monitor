@@ -23,12 +23,13 @@ TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
 NEW_MONITORING_SITES = [
-    "icenter.tdms.nipigas.ru",
-    "tdms.progress-epc.ru",
-    "icenter.tdms.newresources.ru",
-    "agpp.tdms.nipigas.ru",
-    "tst-stdo.tdms.sibur.ru",
-    "cp.tdms.sibur.ru"
+    "icenter.tdms.nipigas.ru/cp",
+    "tdms.progress-epc.ru/cp",
+    "icenter.tdms.newresources.ru/cp",
+    "agpp.tdms.nipigas.ru/cp",
+    "agpp.tdms.nipigas.ru/DMS21",
+    "tst-stdo.tdms.sibur.ru/cp",
+    "cp.tdms.sibur.ru/cp"
 ]
 
 SITES = [
