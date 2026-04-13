@@ -42,7 +42,6 @@ app = FastAPI()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-# ИЗМЕНЕНИЕ: Куки на 30 дней
 def check_auth(request: Request, response: Response, session_auth: str = Cookie(None)):
     if session_auth == "authenticated_sibur": return True
     auth = request.headers.get("Authorization")
@@ -106,8 +105,8 @@ def get_domain_info(site):
 
 # --- ВОРКЕРЫ ---
 
-# НОВАЯ ФИЧА: Утренний отчет в 09:00
 def daily_report_worker():
+    """Рассылка в 09:00 по Москве"""
     while True:
         now = datetime.datetime.now(TZ_MOSCOW)
         if now.hour == 9 and now.minute == 0:
@@ -135,7 +134,7 @@ def check_worker():
                     r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
-
+                
                 try:
                     ctx = ssl.create_default_context()
                     with socket.create_connection((site, 443), timeout=3) as sock:
@@ -174,6 +173,8 @@ def check_worker():
             except: pass
         time.sleep(60)
 
+# --- РОУТЫ ---
+
 @app.on_event("startup")
 def startup_event():
     init_db()
@@ -193,6 +194,13 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
 async def index(auth: bool = Depends(check_auth)):
     conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
+
+    # Восстановление KPI расчетов
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'")
+    s30 = cur.fetchone() or {'up':0, 'resp':0}
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
+    s24 = cur.fetchone() or {'up':0, 'resp':0}
+
     cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
     latest = {r['site']: r for r in cur.fetchall()}
     cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
@@ -201,12 +209,11 @@ async def index(auth: bool = Depends(check_auth)):
     incidents = [s for s,v in latest.items() if v['status']!=200]
     ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s,v in latest.items() if v['response_time'] > 20 and v['status'] == 200]
-    
     all_warn_list = [f"❌ {s} (Offline)" for s in incidents] + [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + [f"🐢 {s} (Задержка {round(latest[s]['response_time'],1)}с)" for s in latency_warn]
     online_count = sum(1 for s in latest.values() if s['status']==200); total_sites = len(SITES)
 
     html = f"""
-    <html><head><meta charset="UTF-8"><title>Sibur Monitoring</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <html><head><meta charset="UTF-8"><title>Sibur Monitoring</title>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; }}
         .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
