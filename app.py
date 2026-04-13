@@ -22,6 +22,15 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
+NEW_MONITORING_SITES = [
+    "icenter.tdms.nipigas.ru",
+    "tdms.progress-epc.ru",
+    "icenter.tdms.newresources.ru",
+    "agpp.tdms.nipigas.ru",
+    "tst-stdo.tdms.sibur.ru",
+    "cp.tdms.sibur.ru"
+]
+
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -34,9 +43,11 @@ SITES = [
     "quality-certificates.sibur.ru", "rusvinyl.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
     "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
-]
+] + NEW_MONITORING_SITES # Добавляем новые сайты в общий список
 
-PRIORITY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"]
+PRIORITY_SITES = [
+    "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"
+] + NEW_MONITORING_SITES # Делаем их приоритетными для алертов (5 мин)
 
 app = FastAPI()
 
@@ -309,8 +320,17 @@ async def index(auth: bool = Depends(check_auth)):
         v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
         st30 = stats.get(s, {'upt':0, 'down_sec':0})
         is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
+        
+        # Определяем значок
+        prefix = ""
+        if s in NEW_MONITORING_SITES:
+            prefix = "🔰 "
+        elif s in PRIORITY_SITES:
+            prefix = "⭐️ "
+        
+        # В строке ниже используем {prefix} вместо старого условия
         html += f"""<tr class="{'row-err' if is_err else ''}">
-            <td>{'⭐ ' if s in PRIORITY_SITES else ''}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
+            <td>{prefix}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'],2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
