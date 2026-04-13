@@ -128,7 +128,12 @@ def daily_report_worker():
 
 async def take_screenshot(site):
     path = f"debug_{int(time.time())}.png"
-    print(f"Запуск быстрого скриншота (2 сек): {site}")
+    # 1. Формируем полный URL. 
+    # Так как в SITES теперь лежат строки вида "domain.ru/path/", 
+    # при склейке получится правильный https://domain.ru/path/
+    full_url = f"https://{site}" 
+    
+    print(f"Запуск быстрого скриншота (2 сек): {full_url}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -138,9 +143,11 @@ async def take_screenshot(site):
             context = await browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
             page = await context.new_page()
             try:
-                await page.goto(f"https://{site}", timeout=20000, wait_until="domcontentloaded")
-            except:
-                print(f"Таймаут DOM для {site}, пробуем сделать скрин того, что успело загрузиться")
+                # 2. ИСПОЛЬЗУЕМ full_url ЗДЕСЬ
+                await page.goto(full_url, timeout=20000, wait_until="domcontentloaded")
+            except Exception as e:
+                print(f"Таймаут DOM для {full_url}, делаем что успело загрузиться. Ошибка: {e}")
+
             await asyncio.sleep(2) 
             await page.screenshot(path=path, type="jpeg", quality=80)
             await browser.close()
@@ -167,63 +174,26 @@ def check_worker():
     last_latency_map = {site: False for site in SITES}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
-    while True:
+while True:
         for site in SITES:
             try:
-                curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
+                # 1. Для сетевого запроса используем строку как есть (с путем)
+                check_url = f"https://{site}"
+                
+                # 2. Для SSL и WHOIS нам нужен чистый домен (без /cp/)
+                domain_only = site.split('/')[0] 
+                
                 start = time.time()
                 try:
-                    r = requests.get(f"https://{site}", timeout=25, headers=headers, allow_redirects=True)
+                    r = requests.get(check_url, timeout=25, headers=headers, allow_redirects=True)
                     curr_status, resp_time = r.status_code, time.time() - start
                 except: curr_status, resp_time = 0, 25.0
 
                 try:
                     ctx = ssl.create_default_context()
-                    with socket.create_connection((site, 443), timeout=3) as sock:
-                        with ctx.wrap_socket(sock, server_hostname=site) as ssock:
-                            cert = ssock.getpeercert()
-                            exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                            ssl_d = (exp - datetime.datetime.utcnow()).days
-                except: pass
-                dom_d = get_domain_info(site)
-
-                if curr_status != 200:
-                    fail_count[site] += 1
-                    alert_threshold = 5 if site in PRIORITY_SITES else 10
-                    
-                    if fail_count[site] >= 2:
-                        conn = get_db_connection(); cur = conn.cursor()
-                        if fail_count[site] == 2:
-                            prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
-                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
-                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
-                        conn.commit(); cur.close(); conn.close()
-
-                    if fail_count[site] == alert_threshold and last_status[site] == 200:
-                        shot_path = asyncio.run(take_screenshot(site))
-                        desc = 'Timeout' if curr_status == 0 else ('Bad Gateway' if curr_status == 502 else 'Service Unavailable')
-                        msg = f"🚨 DOWN: {site} (Код: {curr_status}, {desc})"
-                        send_tg_msg(msg, shot_path)
-                        last_status[site] = curr_status
-                else:
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
-                    conn.commit(); cur.close(); conn.close()
-
-                    if last_status[site] != 200: 
-                        duration = fail_count[site]
-                        send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
-                    
-                    last_status[site], fail_count[site] = 200, 0
-
-                    if resp_time > 20 and not last_latency_map[site]:
-                        send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
-                        last_latency_map[site] = True
-                    elif resp_time < 10 and last_latency_map[site]:
-                        send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
-                        last_latency_map[site] = False
-            except: pass
-        time.sleep(60)
+                    # Используем domain_only вместо site
+                    with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                        with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
 
 @app.on_event("startup")
 def startup_event():
@@ -330,7 +300,7 @@ async def index(auth: bool = Depends(check_auth)):
             prefix = "⭐️ "
         
         # В строке ниже используем {prefix} вместо старого условия
-        html += f"""<tr class="{'row-err' if is_err else ''}">
+            html += f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'],2)}с</td>
