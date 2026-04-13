@@ -255,14 +255,20 @@ def startup_event():
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start() 
 
-@app.get("/test-screen/{site_name}")
+# Было: @app.get("/test-screen/{site_name}")
+# Стало (добавлен :path, чтобы принимать слэши):
+@app.get("/test-screen/{site_name:path}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
-    if site_name not in SITES: return JSONResponse({"status": "error", "msg": "Сайт не найден"}, status_code=404)
+    if site_name not in SITES: 
+        return JSONResponse({"status": "error", "msg": "Сайт не найден в списке"}, status_code=404)
+    
     shot = await take_screenshot(site_name)
     if shot:
         send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot)
         return {"status": "success", "msg": f"Скриншот {site_name} отправлен в ТГ"}
-    return JSONResponse({"status": "error", "msg": "Ошибка скриншота"}, status_code=500)
+    
+    # Если скриншот не удался, возвращаем четкую ошибку вместо None
+    return JSONResponse({"status": "error", "msg": "Ошибка Playwright (таймаут или доступ)"}, status_code=500)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):
