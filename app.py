@@ -90,6 +90,30 @@ def send_tg_msg(text, photo_path=None):
             requests.post(base_url + "sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
     except: pass
 
+def daily_report_worker():
+    """Рассылка отчета по SSL в 09:00 МСК"""
+    while True:
+        now = datetime.datetime.now(TZ_MOSCOW)
+        if now.hour == 9 and now.minute == 0:
+            try:
+                conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
+                # Берем последние записи для каждого сайта
+                cur.execute("SELECT DISTINCT ON (site) site, ssl_days FROM logs ORDER BY site, timestamp DESC")
+                rows = cur.fetchall()
+                cur.close(); conn.close()
+                
+                # Фильтруем те, где осталось меньше 20 дней
+                ssl_alerts = [f"🔒 {r[0]} — осталось {r[1]}д." for r in rows if r[1] is not None and 0 <= r[1] <= 20]
+                
+                if ssl_alerts:
+                    msg = "🔔 Утренний отчет по SSL (менее 20 дней):\n\n" + "\n".join(ssl_alerts)
+                    send_tg_msg(msg)
+                
+                time.sleep(61) # Чтобы не отправить повторно в ту же минуту
+            except: pass
+        time.sleep(30)
+
+
 async def take_screenshot(site):
     path = f"debug_{int(time.time())}.png"
     print(f"Запуск быстрого скриншота (2 сек): {site}")
@@ -193,6 +217,7 @@ def check_worker():
 def startup_event():
     init_db()
     threading.Thread(target=check_worker, daemon=True).start()
+    threading.Thread(target=daily_report_worker, daemon=True).start() 
 
 @app.get("/test-screen/{site_name}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
