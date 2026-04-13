@@ -41,7 +41,7 @@ SITES = [
     "laika.sibur.ru", "magazine.sibur.ru", "mendeleev-smena.ru",
     "messages2.sibur.ru", "nauka.sibur.ru", "oknavdome.info",
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
-    "quality-certificates.sibur.ru", "rusvinyl.ru",
+    "rusvinyl.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
     "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ] + NEW_MONITORING_SITES # Добавляем новые сайты в общий список
