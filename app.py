@@ -434,6 +434,10 @@ async def index(auth: bool = Depends(check_auth)):
         t.style.display = 'block';
         setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
     }}
+        // Автообновление каждые 2 минуты (120000 мс)
+    setInterval(() => {{ 
+        location.reload(); 
+    }}, 120000);
     </script>"""
     for s, d in g_data.items():
         html += f"""<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{ type:'line', data:{{ labels:{json.dumps(d['l'])}, datasets:[ {{label:'Uptime %', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}}, {{label:'Ответ сек', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}} ]}}, options:{{ scales:{{ y:{{min:75, max:110}}, y1:{{position:'right', grid:{{display:false}}}} }} }} }});</script>"""
