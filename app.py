@@ -43,7 +43,7 @@ SITES = [
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
     "rusvinyl.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
-    "sintez-kazan.ru", "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
+    "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ] + NEW_MONITORING_SITES # Добавляем новые сайты в общий список
 
 PRIORITY_SITES = [
