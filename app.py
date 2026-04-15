@@ -1,492 +1,448 @@
-import os
-import sqlite3
-import pandas as pd
-import io
-import asyncio
-import threading
-from datetime import datetime, timedelta
+import datetime
+import ssl
+import socket
+import requests
+import psycopg2
+import json
+import base64
 import pytz
-
-from flask import Flask, render_template, request, redirect, session, flash, url_for, send_file
-from aiogram import Bot
-from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+import time
+import os
+import whois
+import asyncio
+from psycopg2.extras import DictCursor
+from playwright.async_api import async_playwright
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = os.getenv('TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+DATABASE_URL = os.getenv("DATABASE_URL")
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
+TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-DB_PATH = '/data/bot_database.db'
-MSK = pytz.timezone('Europe/Moscow')
+NEW_MONITORING_SITES = [
+    "icenter.tdms.nipigas.ru/cp/",
+    "tdms.progress-epc.ru/cp/",
+    "icenter.tdms.newresources.ru/cp/",
+    "agpp.tdms.nipigas.ru/cp/",
+    "agpp.tdms.nipigas.ru/DMS21/",
+    "tst-stdo.tdms.sibur.ru/cp/",
+    "cp.tdms.sibur.ru/cp/"
+]
 
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
+SITES = [
+    "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", 
+    "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
+    "bopp.sibur.ru", "carbo.sibur.ru", "carbonfootprintcalculator.sibur.ru",
+    "career.sibur.ru", "catalog.sibur.ru", "coach.sibur.ru",
+    "ecoball.sibur.ru", "greencity-sibur.ru", "guide.sibur.ru",
+    "laika.sibur.ru", "magazine.sibur.ru", "mendeleev-smena.ru",
+    "messages2.sibur.ru", "nauka.sibur.ru", "oknavdome.info",
+    "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
+    "rusvinyl.ru",
+    "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
+    "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
+] + NEW_MONITORING_SITES # Добавляем новые сайты в общий список
 
-# Инициализация бота
-bot = None
-if TOKEN:
-    bot = Bot(token=TOKEN)
+PRIORITY_SITES = [
+    "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"
+] + NEW_MONITORING_SITES # Делаем их приоритетными для алертов (5 мин)
 
-# --- EVENT LOOP ---
-bot_loop = asyncio.new_event_loop()
+app = FastAPI()
 
-def start_bot_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    file_path = 'favicon.ico'
+    if os.path.exists(file_path): return FileResponse(file_path)
+    return Response(status_code=204)
 
-threading.Thread(target=start_bot_loop, args=(bot_loop,), daemon=True).start()
-
-def send_msg_threadsafe(text):
-    """Безопасная отправка сообщения"""
-    if bot and CHAT_ID:
-        try:
-            asyncio.run_coroutine_threadsafe(bot.send_message(CHAT_ID, text), bot_loop)
-        except Exception as e:
-            print(f"[ERROR] Send failed: {e}")
-
-# --- DATABASE ---
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    with get_db_connection() as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS birthdays 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT, pos TEXT, dep TEXT, bday TEXT)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS events 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, event_name TEXT, reminder_text TEXT, dt TEXT, is_sent INTEGER DEFAULT 0)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS custom_tasks 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, dt TEXT, period TEXT, weekdays TEXT, last_sent TEXT)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS sent_log 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, sent_date TEXT, UNIQUE(type, sent_date))''')
-        
-        # Migrations
-        cursor = conn.execute("PRAGMA table_info(events)")
-        cols = [row[1] for row in cursor.fetchall()]
-        if 'is_sent' not in cols:
-            conn.execute("ALTER TABLE events ADD COLUMN is_sent INTEGER DEFAULT 0")
-        
-        cursor_c = conn.execute("PRAGMA table_info(custom_tasks)")
-        cols_c = [row[1] for row in cursor_c.fetchall()]
-        if 'weekdays' not in cols_c:
-            conn.execute("ALTER TABLE custom_tasks ADD COLUMN weekdays TEXT")
-        if 'last_sent' not in cols_c:
-            conn.execute("ALTER TABLE custom_tasks ADD COLUMN last_sent TEXT")
-        
-        conn.commit()
-
-def is_birthday_sent_today(conn, today_str):
-    """Проверка, было ли уже отправлено поздравление сегодня"""
-    cursor = conn.execute(
-        "SELECT 1 FROM sent_log WHERE type = 'birthday' AND sent_date = ?",
-        (today_str,)
-    )
-    return cursor.fetchone() is not None
-
-def mark_birthday_sent(conn, today_str):
-    """Отметить, что поздравление отправлено сегодня"""
+# ИЗМЕНЕНИЕ 1: Сохранение сессии на 30 дней через Cookie
+def check_auth(request: Request, response: Response, session_auth: str = Cookie(None)):
+    if session_auth == "authenticated_sibur":
+        return True
+    
+    auth = request.headers.get("Authorization")
+    if not auth:
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic realm='Sibur Monitoring'"})
+    
     try:
-        conn.execute(
-            "INSERT OR IGNORE INTO sent_log (type, sent_date) VALUES ('birthday', ?)",
-            (today_str,)
-        )
-        conn.commit()
+        scheme, credentials = auth.split()
+        decoded = base64.b64decode(credentials).decode("ascii")
+        u, p = decoded.split(":")
+        if u == "sibur" and p == "sibur":
+            # Устанавливаем куку на 30 дней (2592000 секунд)
+            response.set_cookie(key="session_auth", value="authenticated_sibur", max_age=2592000, httponly=True)
+            return True
     except:
         pass
+    raise HTTPException(status_code=401)
 
-# --- SCHEDULER ---
-def check_and_send():
-    """Проверка и отправка уведомлений"""
-    now = datetime.now(MSK)
-    now_dm = now.strftime("%d.%m")
-    current_weekday = now.weekday()
-    now_time_hm = now.strftime("%H:%M")
-    
-    today_str = now.strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        # 1. BIRTHDAYS (09:00 MSK) - отправляем один раз в день
-        # Проверяем с 09:00 до 09:59, если ещё не отправляли
-        if now.hour == 9:
-            # Проверяем, не отправляли ли уже сегодня
-            if not is_birthday_sent_today(conn, today_str):
-                celebrants = conn.execute("SELECT * FROM birthdays").fetchall()
-                birthday_people = []
-                
-                for person in celebrants:
-                    bday_str = str(person['bday']).strip() if person['bday'] else ""
-                    if bday_str and bday_str.startswith(now_dm):
-                        birthday_people.append(person)
-                
-                if birthday_people:
-                    msg_lines = ["🎉🫶🏼 Сегодня день рождения наших коллег:"]
-                    for person in birthday_people:
-                        msg_lines.append(f"• {person['full_name']}, {person['pos']}, {person['dep']}")
-                    msg_lines.append("Поздравляем 😊🎊")
-                    send_msg_threadsafe("\n".join(msg_lines))
-                
-                # Отмечаем как отправленное (даже если никого нет, чтобы не проверять каждую минуту)
-                mark_birthday_sent(conn, today_str)
-        
-        # 2. EVENTS
-        events = conn.execute("SELECT * FROM events WHERE is_sent = 0").fetchall()
-        for event in events:
-            try:
-                event_dt_str = event['dt']
-                if not event_dt_str:
-                    continue
-                
-                event_dt = datetime.strptime(event_dt_str, "%d.%m.%Y %H:%M:%S")
-                now_naive = now.replace(tzinfo=None)
-                
-                if event_dt <= now_naive:
-                    send_msg_threadsafe(event['reminder_text'])
-                    conn.execute("UPDATE events SET is_sent = 1 WHERE id = ?", (event['id'],))
-                    conn.commit()
-            except:
-                pass
-        
-        # 3. CUSTOM TASKS
-        custom_tasks = conn.execute("SELECT * FROM custom_tasks").fetchall()
-        for task in custom_tasks:
-            try:
-                task_dt_str = str(task['dt']).strip() if task['dt'] else ""
-                if not task_dt_str:
-                    continue
-                
-                period = task['period']
-                weekdays_str = task['weekdays'] or ""
-                last_sent = task['last_sent']
-                task_time = task_dt_str.split(' ')[1] if ' ' in task_dt_str else ""
-                current_minute = now.strftime("%d.%m.%Y %H:%M")
-                
-                if last_sent == current_minute:
-                    continue
-                
-                should_send = False
-                
-                if period == 'once':
-                    should_send = task_dt_str == current_minute
-                elif period == 'daily':
-                    should_send = task_time == now_time_hm
-                elif period == 'workdays':
-                    should_send = current_weekday < 5 and task_time == now_time_hm
-                elif period == 'weekdays':
-                    selected_days = weekdays_str.split(',') if weekdays_str else []
-                    should_send = str(current_weekday) in selected_days and task_time == now_time_hm
-                elif period == 'weekly':
-                    task_start = datetime.strptime(task_dt_str, "%d.%m.%Y %H:%M")
-                    should_send = task_start.weekday() == current_weekday and task_time == now_time_hm
-                elif period == 'monthly':
-                    task_start = datetime.strptime(task_dt_str, "%d.%m.%Y %H:%M")
-                    should_send = task_start.day == now.day and task_time == now_time_hm
-                elif period == 'yearly':
-                    task_start = datetime.strptime(task_dt_str, "%d.%m.%Y %H:%M")
-                    task_dm = task_start.strftime("%d.%m")
-                    now_dm_check = now.strftime("%d.%m")
-                    should_send = task_dm == now_dm_check and task_time == now_time_hm
-                
-                if should_send:
-                    send_msg_threadsafe(task['text'])
-                    conn.execute("UPDATE custom_tasks SET last_sent = ? WHERE id = ?", (current_minute, task['id']))
-                    conn.commit()
-                    
-                    if period == 'once':
-                        conn.execute("DELETE FROM custom_tasks WHERE id = ?", (task['id'],))
-                        conn.commit()
-            except:
-                pass
-    finally:
-        conn.close()
+def get_db_connection(): return psycopg2.connect(DATABASE_URL)
 
-# --- HELPERS ---
-def normalize_bday_date(val):
-    if pd.isna(val):
-        return ""
-    try:
-        val_str = str(val).strip()
-        if len(val_str) == 5 and val_str[2] == '.':
-            return val_str
-        formats = ["%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m"]
-        for fmt in formats:
-            try:
-                dt_obj = datetime.strptime(val_str, fmt)
-                return dt_obj.strftime("%d.%m")
-            except:
-                continue
-        return val_str
-    except:
-        return str(val).strip()
+def init_db():
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS logs 
+                  (site TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                   status INTEGER, response_time REAL, ssl_days INTEGER, domain_days INTEGER)''')
+    try: cur.execute("ALTER TABLE logs ADD COLUMN domain_days INTEGER DEFAULT -1")
+    except: conn.rollback()
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_site_ts ON logs (site, timestamp DESC)")
+    conn.commit(); cur.close(); conn.close()
 
-def normalize_event_datetime(val):
-    if pd.isna(val):
-        return ""
+def send_tg_msg(text, photo_path=None):
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     try:
-        if isinstance(val, datetime):
-            return val.strftime("%d.%m.%Y %H:%M:%S")
-        val_str = str(val).strip()
-        formats = [
-            "%d.%m.%Y %H:%M:%S",
-            "%d.%m.%Y %H:%M",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%d.%m.%y %H:%M",
-            "%d.%m.%y %H:%M:%S"
-        ]
-        for fmt in formats:
-            try:
-                dt_obj = datetime.strptime(val_str, fmt)
-                return dt_obj.strftime("%d.%m.%Y %H:%M:%S")
-            except:
-                continue
-        return val_str
-    except:
-        return str(val).strip()
-
-def read_data_file(file):
-    filename = file.filename.lower()
-    try:
-        if filename.endswith('.csv'):
-            for encoding in ['utf-8', 'cp1251', 'latin1']:
-                try:
-                    file.seek(0)
-                    df = pd.read_csv(file, encoding=encoding)
-                    break
-                except:
-                    continue
-            else:
-                raise ValueError("Cannot read CSV")
-        elif filename.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(file, engine='openpyxl')
+        if photo_path and os.path.exists(photo_path):
+            with open(photo_path, 'rb') as f:
+                requests.post(base_url + "sendPhoto", data={"chat_id": TELEGRAM_CHAT_ID, "caption": text}, files={"photo": f}, timeout=30)
+            if os.path.exists(photo_path): os.remove(photo_path)
         else:
-            raise ValueError("Unsupported format")
-        df = df.dropna(how='all')
-        return df
-    except Exception as e:
-        raise e
+            requests.post(base_url + "sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+    except: pass
 
-def get_period_display(period, weekdays=None):
-    period_names = {
-        'once': 'Один раз',
-        'daily': 'Каждый день',
-        'workdays': 'Рабочие дни (Пн-Пт)',
-        'weekdays': 'Выбранные дни',
-        'weekly': 'Каждую неделю',
-        'monthly': 'Каждый месяц',
-        'yearly': 'Каждый год'
-    }
-    return period_names.get(period, period)
+def daily_report_worker():
+    """Рассылка отчета по SSL в 09:00 МСК"""
+    while True:
+        now = datetime.datetime.now(TZ_MOSCOW)
+        if now.hour == 9 and now.minute == 0:
+            try:
+                conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
+                # Берем последние записи для каждого сайта
+                cur.execute("SELECT DISTINCT ON (site) site, ssl_days FROM logs ORDER BY site, timestamp DESC")
+                rows = cur.fetchall()
+                cur.close(); conn.close()
+                
+                # Фильтруем те, где осталось меньше 20 дней
+                ssl_alerts = [f"🔒 {r[0]} — осталось {r[1]}д." for r in rows if r[1] is not None and 0 <= r[1] <= 20]
+                
+                if ssl_alerts:
+                    msg = "🔔 Утренний отчет по SSL (менее 20 дней):\n\n" + "\n".join(ssl_alerts)
+                    send_tg_msg(msg)
+                
+                time.sleep(61) # Чтобы не отправить повторно в ту же минуту
+            except: pass
+        time.sleep(30)
 
-# --- ROUTES ---
-@app.route('/test_send/<type>')
-def test_send(type):
-    test_msg = f"🛠 Тест связи ({type}): Бот работает стабильно!"
-    send_msg_threadsafe(test_msg)
-    flash(f"Тестовое сообщение ({type}) отправлено в Telegram!")
-    return redirect(url_for('index'))
 
-@app.route('/')
-def index():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
+async def take_screenshot(site):
+    path = f"debug_{int(time.time())}.png"
+    # 1. Формируем полный URL. 
+    # Так как в SITES теперь лежат строки вида "domain.ru/path/", 
+    # при склейке получится правильный https://domain.ru/path/
+    full_url = f"https://{site}" 
     
-    conn = get_db_connection()
+    print(f"Запуск быстрого скриншота (2 сек): {full_url}")
     try:
-        bdays = conn.execute("SELECT * FROM birthdays ORDER BY full_name").fetchall()
-        events = conn.execute("SELECT * FROM events ORDER BY is_sent ASC, dt ASC").fetchall()
-        customs = conn.execute("SELECT * FROM custom_tasks ORDER BY dt ASC").fetchall()
-    finally:
-        conn.close()
-    
-    return render_template('index.html', bdays=bdays, evs=events, customs=customs, get_period_display=get_period_display)
-
-@app.route('/upload_dr', methods=['POST'])
-def upload_dr():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    file = request.files.get('file')
-    if not file:
-        flash("Файл не выбран!")
-        return redirect(url_for('index'))
-    
-    try:
-        df = read_data_file(file)
-        if len(df.columns) < 4:
-            flash("Ошибка: файл должен содержать минимум 4 столбца")
-            return redirect(url_for('index'))
-        
-        conn = get_db_connection()
-        try:
-            conn.execute("DELETE FROM birthdays")
-            count = 0
-            for _, row in df.iterrows():
-                full_name = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
-                pos = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
-                dep = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
-                bday = normalize_bday_date(row.iloc[3])
-                if full_name:
-                    conn.execute(
-                        "INSERT INTO birthdays (full_name, pos, dep, bday) VALUES (?,?,?,?)",
-                        (full_name, pos, dep, bday)
-                    )
-                    count += 1
-            conn.commit()
-            flash(f"✅ Список дней рождения обновлен! Загружено: {count}")
-        finally:
-            conn.close()
-    except Exception as e:
-        flash(f"❌ Ошибка: {str(e)}")
-    
-    return redirect(url_for('index'))
-
-@app.route('/upload_zs', methods=['POST'])
-def upload_zs():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    file = request.files.get('file')
-    if not file:
-        flash("Файл не выбран!")
-        return redirect(url_for('index'))
-    
-    try:
-        df = read_data_file(file)
-        if len(df.columns) < 3:
-            flash("Ошибка: файл должен содержать минимум 3 столбца")
-            return redirect(url_for('index'))
-        
-        conn = get_db_connection()
-        try:
-            conn.execute("DELETE FROM events")
-            count = 0
-            for _, row in df.iterrows():
-                event_name = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
-                reminder_text = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
-                dt = normalize_event_datetime(row.iloc[2])
-                if event_name and dt:
-                    conn.execute(
-                        "INSERT INTO events (event_name, reminder_text, dt, is_sent) VALUES (?,?,?,0)",
-                        (event_name, reminder_text, dt)
-                    )
-                    count += 1
-            conn.commit()
-            flash(f"✅ Список событий обновлен! Загружено: {count}")
-        finally:
-            conn.close()
-    except Exception as e:
-        flash(f"❌ Ошибка: {str(e)}")
-    
-    return redirect(url_for('index'))
-
-@app.route('/add_custom', methods=['POST'])
-def add_custom():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    try:
-        text = request.form.get('text', '').strip()
-        dt_raw = request.form.get('dt', '')
-        period = request.form.get('period', 'once')
-        days = request.form.getlist('days')
-        
-        if not text:
-            flash("Текст сообщения не может быть пустым!")
-            return redirect(url_for('index'))
-        
-        if not dt_raw:
-            flash("Дата и время не указаны!")
-            return redirect(url_for('index'))
-        
-        dt_final = datetime.strptime(dt_raw, '%Y-%m-%dT%H:%M').strftime('%d.%m.%Y %H:%M')
-        
-        conn = get_db_connection()
-        try:
-            conn.execute(
-                "INSERT INTO custom_tasks (text, dt, period, weekdays, last_sent) VALUES (?,?,?,?,?)",
-                (text, dt_final, period, ",".join(days) if days else "", None)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True, 
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox", "--no-zygote"]
             )
-            conn.commit()
-            flash("✅ Задача добавлена!")
-        finally:
-            conn.close()
+            context = await browser.new_context(viewport={'width': 1280, 'height': 720}, ignore_https_errors=True)
+            page = await context.new_page()
+            try:
+                # 2. ИСПОЛЬЗУЕМ full_url ЗДЕСЬ
+                await page.goto(full_url, timeout=20000, wait_until="domcontentloaded")
+            except Exception as e:
+                print(f"Таймаут DOM для {full_url}, делаем что успело загрузиться. Ошибка: {e}")
+
+            await asyncio.sleep(2) 
+            await page.screenshot(path=path, type="jpeg", quality=80)
+            await browser.close()
+            print(f"Быстрый скриншот готов: {path}")
+        return path
     except Exception as e:
-        flash(f"❌ Ошибка: {str(e)}")
-    
-    return redirect(url_for('index'))
+        print(f"ОШИБКА PLAYWRIGHT на сайте {site}: {str(e)}")
+        return None
 
-@app.route('/delete_custom/<int:id>')
-def delete_custom(id):
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
+def get_domain_info(site):
     try:
-        conn.execute("DELETE FROM custom_tasks WHERE id = ?", (id,))
-        conn.commit()
-        flash("Задача удалена!")
-    finally:
-        conn.close()
-    
-    return redirect(url_for('index'))
+        w = whois.whois(site)
+        exp = w.expiration_date
+        if isinstance(exp, list): exp = exp[0]
+        if exp:
+            days = (exp.replace(tzinfo=None) - datetime.datetime.now()).days
+            return days
+    except: pass
+    return -1
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        password = request.form.get('password', '')
-        if password == ADMIN_PASSWORD:
-            session['logged_in'] = True
-            return redirect(url_for('index'))
-        else:
-            return '''<html><body style="text-align:center;padding-top:100px;">
-                <h2>Вход</h2>
-                <p style="color:red;">Неверный пароль!</p>
-                <form method="post"><input type="password" name="password"><button>Вход</button></form>
-            </body></html>'''
+def check_worker():
+    import urllib3 
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    last_status = {site: 200 for site in SITES}
+    fail_count = {site: 0 for site in SITES}
+    last_latency_map = {site: False for site in SITES}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
-    return '''<html><body style="text-align:center;padding-top:100px;">
-        <h2>🔐 Вход</h2>
-        <form method="post">
-            <input type="password" name="password" placeholder="Введите пароль" style="padding:10px;"><br><br>
-            <button style="padding:10px 20px;">Вход</button>
-        </form>
-    </body></html>'''
+    while True:
+        for site in SITES:
+            try:
+                curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
+                
+                # 1. Ссылка для проверки (с путем /cp/)
+                check_url = f"https://{site}"
+                
+                # 2. Чистый домен для технических проверок (без пути)
+                domain_only = site.split('/')[0]
+                
+                start = time.time()
+                # Проверка доступности по полной ссылке
+                try:
+                    r = requests.get(check_url, timeout=25, headers=headers, allow_redirects=True, verify=False)
+                    curr_status, resp_time = r.status_code, time.time() - start
+                except: 
+                    curr_status, resp_time = 0, 25.0
 
-@app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    return redirect(url_for('login'))
+                # Проверка SSL (используем domain_only!)
+                try:
+                    ctx = ssl.create_default_context()
+                    with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                        with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                            cert = ssock.getpeercert()
+                            exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                            ssl_d = (exp - datetime.datetime.utcnow()).days
+                except: 
+                    pass
 
-@app.route('/download_template/<t_type>')
-def download_template(t_type):
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    output = io.BytesIO()
-    
-    if t_type == 'dr':
-        df = pd.DataFrame(columns=['Фамилия Имя', 'Должность', 'Подразделение', 'День Месяц Рождения'])
-        example = pd.DataFrame([['Иванов Иван', 'Менеджер', 'Отдел продаж', '15.03']], 
-                               columns=['Фамилия Имя', 'Должность', 'Подразделение', 'День Месяц Рождения'])
-        df = pd.concat([df, example], ignore_index=True)
-    else:
-        df = pd.DataFrame(columns=['Событие', 'Напоминание', 'Дата и время'])
-        example = pd.DataFrame([['Встреча с клиентом', 'Совещание в переговорной', '25.12.2024 14:30']], 
-                               columns=['Событие', 'Напоминание', 'Дата и время'])
-        df = pd.concat([df, example], ignore_index=True)
-    
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Лист1')
-    
-    output.seek(0)
-    return send_file(output, as_attachment=True, download_name=f"{t_type}_template.xlsx")
+                # Проверка домена WHOIS (используем domain_only!)
+                dom_d = get_domain_info(domain_only)
 
-# --- INIT ---
-init_db()
-scheduler = BackgroundScheduler(timezone=MSK)
-scheduler.add_job(check_and_send, 'interval', seconds=30, max_instances=1)
-scheduler.start()
+                # --- ЛОГИКА АЛЕРТОВ И ЗАПИСИ (используем исходный 'site') ---
+                if curr_status != 200:
+                    fail_count[site] += 1
+                    alert_threshold = 5 if site in PRIORITY_SITES else 10
+                    
+                    if fail_count[site] >= 2:
+                        conn = get_db_connection(); cur = conn.cursor()
+                        if fail_count[site] == 2:
+                            prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
+                            cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days, timestamp) VALUES (%s,%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d, prev_ts))
+                        cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
+                        conn.commit(); cur.close(); conn.close()
+
+                    if fail_count[site] == alert_threshold and last_status[site] == 200:
+                        shot_path = asyncio.run(take_screenshot(site))
+                        msg = f"🚨 DOWN: {site} (Код: {curr_status})"
+                        send_tg_msg(msg, shot_path)
+                        last_status[site] = curr_status
+                else:
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("INSERT INTO logs (site, status, response_time, ssl_days, domain_days) VALUES (%s,%s,%s,%s,%s)", (site, curr_status, resp_time, ssl_d, dom_d))
+                    conn.commit(); cur.close(); conn.close()
+
+                    if last_status[site] != 200: 
+                        duration = fail_count[site]
+                        send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                    
+                    last_status[site], fail_count[site] = 200, 0
+
+                    if resp_time > 20 and not last_latency_map[site]:
+                        send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = True
+                    elif resp_time < 10 and last_latency_map[site]:
+                        send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                        last_latency_map[site] = False
+            except Exception as e:
+                print(f"Ошибка воркера на {site}: {e}")
+        time.sleep(60)
+                            
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    threading.Thread(target=check_worker, daemon=True).start()
+    threading.Thread(target=daily_report_worker, daemon=True).start() 
+
+# Было: @app.get("/test-screen/{site_name}")
+# Стало (добавлен :path, чтобы принимать слэши):
+@app.get("/test-screen/{site_name:path}")
+async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
+    if site_name not in SITES: 
+        return JSONResponse({"status": "error", "msg": "Сайт не найден в списке"}, status_code=404)
+    
+    shot = await take_screenshot(site_name)
+    if shot:
+        send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot)
+        return {"status": "success", "msg": f"Скриншот {site_name} отправлен в ТГ"}
+    
+    # Если скриншот не удался, возвращаем четкую ошибку вместо None
+    return JSONResponse({"status": "error", "msg": "Ошибка Playwright (таймаут или доступ)"}, status_code=500)
+
+@app.get("/", response_class=HTMLResponse)
+async def index(auth: bool = Depends(check_auth)):
+    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
+    now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
+
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'")
+    s30 = cur.fetchone() or {'up':0, 'resp':0}
+    cur.execute("SELECT ROUND((COUNT(*) FILTER (WHERE status = 200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as up, ROUND(AVG(response_time)::numeric,3) as resp FROM logs WHERE timestamp > NOW() - INTERVAL '24 hours'")
+    s24 = cur.fetchone() or {'up':0, 'resp':0}
+
+    cur.execute("SELECT DISTINCT ON (site) * FROM logs ORDER BY site, timestamp DESC")
+    latest_all = {r['site']: r for r in cur.fetchall()}
+    latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    
+    cur.execute("SELECT site, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/NULLIF(COUNT(*),0))::numeric,2) as upt, COUNT(*) FILTER (WHERE status!=200)*60 as down_sec FROM logs WHERE timestamp > NOW() - INTERVAL '30 days' GROUP BY site")
+    stats = {r['site']: r for r in cur.fetchall()}
+
+    incidents = [s for s,v in latest.items() if v['status']!=200]
+    ssl_warn = [s for s,v in latest.items() if 0 <= v['ssl_days'] <= 20]
+    # Задержка более 20с при живом сайте
+    latency_warn = [s for s,v in latest.items() if v['response_time'] > 20 and v['status'] == 200]
+    
+    # ИЗМЕНЕНИЕ 4: Список проблем (Offline, SSL, Задержка) без Доменов
+    all_warn_list = [f"❌ {s} (Offline)" for s in incidents] + \
+                    [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn] + \
+                    [f"🐢 {s} (Задержка {round(latest[s]['response_time'],1)}с)" for s in latency_warn]
+
+    online_count = sum(1 for s in latest.values() if s['status']==200)
+    total_sites = len(SITES)
+
+    html = f"""
+    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }}
+        .container {{ max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
+        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }}
+        
+        /* ИЗМЕНЕНИЕ 2 и 3: Розовый фон и красный верх для проблемных KPI */
+        .danger-card {{ border-top-color: #ef4444 !important; background: #fef2f2 !important; }}
+        
+        .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }}
+        .error-list {{ margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }}
+        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
+        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }}
+        .tab-btn.active {{ background: #00717a; color: white; }}
+        .tab-content {{ display: none; }} .active-content {{ display: block; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
+        .row-err {{ background-color: #fff1f2 !important; }}
+        .txt-err {{ color: #dc2626; font-weight: bold; }} .txt-ok {{ color: #16a34a; font-weight: bold; }}
+        .refresh-btn {{ background: #00717a; color: white; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; }}
+        .btn-test {{ background: #00717a; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; min-width: 80px; }}
+        .loader {{ border: 2px solid #f3f3f3; border-top: 2px solid #00717a; border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: none; margin-right: 5px; }}
+        @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        .loading .loader {{ display: inline-block; }} .loading span {{ display: none; }}
+        .toast {{ position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
+    </style></head><body>
+    <div id="toast" class="toast"></div>
+    <div class="container">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Обновить: {now_msk}</button>
+        </div>
+        <div class="kpi-grid">
+            <div class="kpi-card {'danger-card' if online_count < total_sites else ''}"><span>Доступно</span><strong><br>{online_count} / {total_sites}</strong></div>
+            <div class="kpi-card"><span>Uptime (24ч / 30д)</span><strong><br>{s24['up']}% / {s30['up']}%</strong></div>
+            <div class="kpi-card"><span>Ответ (24ч / 30д)</span><strong><br>{s24['resp']}с / {s30['resp']}с</strong></div>
+            <div class="kpi-card {'danger-card' if len(incidents) > 0 else ''}"><span>Инциденты</span><strong><br>{len(incidents)}</strong></div>
+            <div class="kpi-card {'danger-card' if ssl_warn else ''}"><span>SSL <=20д</span><strong><br>{len(ssl_warn)}</strong></div>
+        </div>
+        {f'<div class="error-bar">⚠️ Обратите внимание:<ul class="error-list"><li>' + '</li><li>'.join(all_warn_list) + '</li></ul></div>' if all_warn_list else ''}
+        <div class="tabs"><button class="tab-btn active" onclick="tab(event, 't1')">Список</button><button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button><button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button><button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button></div>
+        <div id="t1" class="tab-content active-content">
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
+    """
+# 1. Сначала определяем веса для категорий
+# 1. Исправленная логика сортировки (Веса)
+    def get_site_weight(site_name):
+        if site_name == "sibur.ru": return 0
+        # Новые сайты (🔰) ставим после старых приоритетных (⭐️)
+        if site_name in NEW_MONITORING_SITES: return 2
+        if site_name in PRIORITY_SITES: return 1
+        return 3
+
+    sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
+
+    for s in sorted_sites:
+        v = latest.get(s, {'status':0,'response_time':0,'ssl_days':-1,'domain_days':-1})
+        st30 = stats.get(s, {'upt':0, 'down_sec':0})
+        is_err = v['status']!=200 or (0<=v['ssl_days']<=20) or (0<=v['domain_days']<=30)
+        
+        # 2. Правильный значок
+        prefix = "🔰 " if s in NEW_MONITORING_SITES else ("⭐️ " if s in PRIORITY_SITES else "")
+        
+        # 3. Формирование строки ТАБЛИЦЫ (внутри цикла)
+        html += f"""<tr class="{'row-err' if is_err else ''}">
+            <td>{prefix}<a href="https://{s}" target="_blank" style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
+            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">{'Online' if v['status']==200 else 'Offline'}</span></td>
+            <td>{st30['upt']}%</td><td>{round(v['response_time'],2)}с</td>
+            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
+            <td><button class="btn-test" onclick="runTest('{s}', this)"><div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
+
+    # 4. ЗАКРЫТИЕ ТАБЛИЦЫ (строго БЕЗ отступа, вне цикла for)
+    html += """</tbody></table></div><div id="t2" class="tab-content"><div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
+    cur.execute("SELECT site, DATE(timestamp) as d, ROUND(AVG(response_time)::numeric,2) as r, ROUND((COUNT(*) FILTER (WHERE status=200)*100.0/COUNT(*))::numeric,2) as u FROM logs WHERE timestamp > NOW() - INTERVAL '14 days' GROUP BY 1,2 ORDER BY 2")
+    g_data = {}
+    for r in cur.fetchall():
+        s = r['site']; g_data.setdefault(s, {"l":[], "u":[], "r":[]})
+        g_data[s]["l"].append(r['d'].strftime('%d.%m')); g_data[s]["u"].append(float(r['u'])); g_data[s]["r"].append(float(r['r']))
+    for s in sorted_sites:
+        if s in g_data: html += f"<div class='kpi-card' style='border-top:2px solid #eee'><h5>{s}</h5><canvas id='c-{s.replace('.','_')}'></canvas></div>"
+
+    html += """</div></div><div id="t3" class="tab-content"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead><tbody>"""
+    
+    cur.execute("""
+        WITH status_changes AS (
+            SELECT site, timestamp, status,
+            CASE WHEN status != 200 AND (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200 OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL) THEN 1 ELSE 0 END as is_start
+            FROM logs
+        ),
+        incident_groups AS (
+            SELECT site, timestamp, status, SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+            FROM status_changes WHERE status != 200
+        )
+        SELECT site, MIN(timestamp) as start_time, COUNT(*)*1 as dur, MAX(status),
+        CASE WHEN MAX(status) = 0 THEN 'Timeout' WHEN MAX(status) = 502 THEN 'Bad Gateway' WHEN MAX(status) = 503 THEN 'Service Unavailable' ELSE 'Server Error' END
+        FROM incident_groups 
+        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+    """)
+    for r in cur.fetchall():
+        html += f"<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td><td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td><td>{r[3]}</td><td>{r[4]}</td></tr>"
+
+    html += """</tbody></table></div><div id="t4" class="tab-content"><table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th></tr></thead><tbody>"""
+    cal_events = []
+    for s in SITES:
+        v = latest.get(s, {})
+        if v.get('ssl_days', -1) >= 0: cal_events.append({'t': 'SSL сертификат', 's': s, 'd': v['ssl_days']})
+        if v.get('domain_days', -1) >= 0: cal_events.append({'t': 'Оплата домена', 's': s, 'd': v['domain_days']})
+    for ev in sorted(cal_events, key=lambda x: x['d']):
+        html += f"<tr><td>{ev['t']}</td><td>{ev['s']}</td><td class='{'txt-err' if ev['d']<=30 else ''}'>{ev['d']} дн.</td></tr>"
+
+    html += f"""</tbody></table></div></div><script>
+    function tab(e,n){{ var i,x=document.getElementsByClassName('tab-content'),b=document.getElementsByClassName('tab-btn'); for(i=0;i<x.length;i++)x[i].className='tab-content'; for(i=0;i<b.length;i++)b[i].className='tab-btn'; document.getElementById(n).className='tab-content active-content'; e.currentTarget.className+=' active'; }}
+    
+    async function runTest(site, btn) {{
+        if (btn.classList.contains('loading')) return;
+        btn.classList.add('loading');
+        btn.disabled = true;
+        try {{
+            const response = await fetch('/test-screen/' + site);
+            const data = await response.json();
+            showToast(data.msg);
+        }} catch (e) {{ showToast('Ошибка связи с сервером'); }}
+        finally {{ btn.classList.remove('loading'); btn.disabled = false; }}
+    }}
+
+    function showToast(msg) {{
+        const t = document.getElementById('toast');
+        t.innerText = msg;
+        t.style.display = 'block';
+        setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
+    }}
+        // Автообновление каждые 2 минуты (120000 мс)
+    setInterval(() => {{ 
+        location.reload(); 
+    }}, 120000);
+    </script>"""
+    for s, d in g_data.items():
+        html += f"""<script>new Chart(document.getElementById('c-{s.replace('.','_')}'), {{ type:'line', data:{{ labels:{json.dumps(d['l'])}, datasets:[ {{label:'Uptime %', data:{json.dumps(d['u'])}, borderColor:'#10b981', yAxisID:'y', tension:0.3}}, {{label:'Ответ сек', data:{json.dumps(d['r'])}, borderColor:'#3b82f6', yAxisID:'y1', tension:0.3}} ]}}, options:{{ scales:{{ y:{{min:75, max:110}}, y1:{{position:'right', grid:{{display:false}}}} }} }} }});</script>"""
+    cur.close(); conn.close(); return html
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=80, debug=False)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
