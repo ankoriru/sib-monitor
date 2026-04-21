@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 requests
+aiohttp
 psycopg2-binary
 pytz
 greenlet>=3.0.0
 playwright==1.42.0
 python-whois
+bcrypt
