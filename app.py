@@ -184,6 +184,16 @@ def init_db():
     """)
     logs_exists = cur.fetchone()[0]
 
+    def _safe_index(index_name, table_name, columns):
+        """Создаёт индекс, если его ещё нет; игнорирует DuplicateTable/DuplicateObject"""
+        try:
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {index_name}
+                ON {table_name} ({columns})
+            """)
+        except psycopg2.Error:
+            conn.rollback()
+
     if not logs_exists:
         # Создаём партиционированную таблицу (Этап 1)
         cur.execute("""
@@ -206,17 +216,17 @@ def init_db():
         for yy, mm in [(y, m), (next_y, next_m), (next_next_y, next_next_m)]:
             mm_next = mm + 1 if mm < 12 else 1
             yy_next = yy if mm < 12 else yy + 1
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
-                PARTITION OF logs
-                FOR VALUES FROM ('{yy}-{mm:02d}-01')
-                TO ('{yy_next}-{mm_next:02d}-01')
-            """)
+            try:
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
+                    PARTITION OF logs
+                    FOR VALUES FROM ('{yy}-{mm:02d}-01')
+                    TO ('{yy_next}-{mm_next:02d}-01')
+                """)
+            except psycopg2.Error:
+                conn.rollback()
 
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_site_ts
-            ON logs (site, timestamp DESC)
-        """)
+        _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
     else:
         # Проверяем, что таблица партиционирована
         cur.execute("""
@@ -246,15 +256,16 @@ def init_db():
             for yy, mm in [(y, m), (next_y, next_m)]:
                 mm_next = mm + 1 if mm < 12 else 1
                 yy_next = yy if mm < 12 else yy + 1
-                cur.execute(f"""
-                    CREATE TABLE logs_{yy}_{mm:02d}
-                    PARTITION OF logs
-                    FOR VALUES FROM ('{yy}-{mm:02d}-01')
-                    TO ('{yy_next}-{mm_next:02d}-01')
-                """)
-            cur.execute("""
-                CREATE INDEX idx_logs_site_ts ON logs (site, timestamp DESC)
-            """)
+                try:
+                    cur.execute(f"""
+                        CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
+                        PARTITION OF logs
+                        FOR VALUES FROM ('{yy}-{mm:02d}-01')
+                        TO ('{yy_next}-{mm_next:02d}-01')
+                    """)
+                except psycopg2.Error:
+                    conn.rollback()
+            _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
 
     # Таблица агрегатов (Этап 1)
     cur.execute("""
@@ -271,10 +282,7 @@ def init_db():
             PRIMARY KEY (site, bucket)
         )
     """)
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_checks_agg_bucket
-        ON checks_agg (bucket DESC)
-    """)
+    _safe_index("idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
     # Материализованное представление (Этап 3)
     cur.execute("""
@@ -284,10 +292,7 @@ def init_db():
         FROM logs
         ORDER BY site, timestamp DESC
     """)
-    cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site
-        ON latest_status (site)
-    """)
+    _safe_index("idx_latest_status_site", "latest_status", "site")
 
     conn.commit()
     cur.close()
