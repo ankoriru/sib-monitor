@@ -76,6 +76,10 @@ batch_buffer = []
 BATCH_SIZE = 50
 BATCH_LOCK = threading.Lock()
 
+# КЭШ DASHBOARD (обновляется раз в 30 сек)
+_dashboard_cache = {"html": None, "timestamp": 0, "lock": threading.Lock()}
+CACHE_TTL = 30
+
 # ============================================================================
 # ПУЛ PLAYWRIGHT (Этап 2.3)
 # ============================================================================
@@ -168,6 +172,44 @@ def get_db_connection():
 def should_verify(site: str) -> bool:
     """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
     return site not in SELF_SIGNED_SITES
+
+def backfill_checks_agg():
+    """Предзаполнение checks_agg из существующих logs (при первом запуске)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM checks_agg")
+        if cur.fetchone()[0] == 0:
+            print("Backfill checks_agg из logs...")
+            cur.execute("""
+                INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
+                                        avg_response_time, min_response_time, max_response_time,
+                                        last_ssl_days, last_domain_days)
+                SELECT
+                    site,
+                    date_trunc('hour', timestamp)
+                        + INTERVAL '5 min' * (EXTRACT(MINUTE FROM timestamp)::int / 5),
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE status = 200),
+                    AVG(response_time),
+                    MIN(response_time),
+                    MAX(response_time),
+                    MAX(ssl_days) FILTER (WHERE ssl_days IS NOT NULL),
+                    MAX(domain_days) FILTER (WHERE domain_days IS NOT NULL)
+                FROM logs
+                WHERE timestamp > NOW() - INTERVAL '30 days'
+                GROUP BY site,
+                    date_trunc('hour', timestamp)
+                        + INTERVAL '5 min' * (EXTRACT(MINUTE FROM timestamp)::int / 5)
+                ON CONFLICT (site, bucket) DO NOTHING
+            """)
+            conn.commit()
+            print(f"Backfill завершён: {cur.rowcount} записей")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка backfill checks_agg: {e}")
+
 
 def init_db():
     """Инициализация БД с поддержкой партиционирования (Этап 1)"""
@@ -428,8 +470,52 @@ async def check_all_sites():
 # ============================================================================
 # BATCH-ВСТАВКА (Этап 2.1)
 # ============================================================================
+def _update_checks_agg(cur, batch_data):
+    """UPSERT агрегатов за 5-минутный bucket при batch-вставке"""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {
+        'cnt': 0, 'ok': 0, 'r_sum': 0.0,
+        'r_min': float('inf'), 'r_max': 0.0, 'ssl': None, 'dom': None
+    })
+    for row in batch_data:
+        site, status, resp, ssl_d, dom_d = row[:5]
+        # bucket = округление до 5 минут
+        now = datetime.datetime.now()
+        bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        k = (site, bucket)
+        a = agg[k]
+        a['cnt'] += 1
+        if status == 200:
+            a['ok'] += 1
+        a['r_sum'] += resp
+        a['r_min'] = min(a['r_min'], resp)
+        a['r_max'] = max(a['r_max'], resp)
+        if ssl_d is not None and ssl_d >= 0:
+            a['ssl'] = ssl_d
+        if dom_d is not None and dom_d >= 0:
+            a['dom'] = dom_d
+    for (site, bucket), a in agg.items():
+        cur.execute("""
+            INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
+                                    avg_response_time, min_response_time, max_response_time,
+                                    last_ssl_days, last_domain_days)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (site, bucket) DO UPDATE SET
+                checks_count = checks_agg.checks_count + EXCLUDED.checks_count,
+                status_200_count = checks_agg.status_200_count + EXCLUDED.status_200_count,
+                avg_response_time = (checks_agg.avg_response_time * checks_agg.checks_count
+                                     + EXCLUDED.avg_response_time * EXCLUDED.checks_count)
+                                    / (checks_agg.checks_count + EXCLUDED.checks_count),
+                min_response_time = LEAST(checks_agg.min_response_time, EXCLUDED.min_response_time),
+                max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time),
+                last_ssl_days = COALESCE(EXCLUDED.last_ssl_days, checks_agg.last_ssl_days),
+                last_domain_days = COALESCE(EXCLUDED.last_domain_days, checks_agg.last_domain_days)
+        """, (site, bucket, a['cnt'], a['ok'],
+              a['r_sum'] / a['cnt'], a['r_min'], a['r_max'], a['ssl'], a['dom']))
+
+
 def flush_batch():
-    """Сброс накопленных данных пакетом в БД"""
+    """Сброс накопленных данных пакетом в БД + обновление агрегатов"""
     global batch_buffer
     with BATCH_LOCK:
         if not batch_buffer:
@@ -444,6 +530,7 @@ def flush_batch():
                    VALUES %s""",
                 batch_buffer
             )
+            _update_checks_agg(cur, batch_buffer)
             conn.commit()
             cur.close()
             conn.close()
@@ -666,6 +753,7 @@ def rotation_worker():
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    backfill_checks_agg()  # Предзаполнение агрегатов
     await init_browser_pool()  # Этап 2.3: пул Playwright
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
@@ -702,48 +790,73 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
     )
 
 
+def _get_stats_from_agg(cur, interval: str):
+    """Статистика из checks_agg; fallback на logs если агрегаты пусты"""
+    cur.execute("""
+        SELECT
+            ROUND(SUM(status_200_count) * 100.0
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as up,
+            ROUND(AVG(avg_response_time)::numeric, 3) as resp
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL %s
+    """, (interval,))
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return {'up': row[0], 'resp': row[1]}
+    # Fallback на logs
+    cur.execute("""
+        SELECT
+            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                   / NULLIF(COUNT(*), 0))::numeric, 2) as up,
+            ROUND(AVG(response_time)::numeric, 3) as resp
+        FROM logs WHERE timestamp > NOW() - INTERVAL %s
+    """, (interval,))
+    row = cur.fetchone()
+    return {'up': row[0] or 0, 'resp': row[1] or 0}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):
+    global _dashboard_cache
+    now = time.time()
+    with _dashboard_cache["lock"]:
+        if _dashboard_cache["html"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
+            return _dashboard_cache["html"]
+
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
     now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
 
-    # Общая статистика
-    cur.execute("""
-        SELECT
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                   / NULLIF(COUNT(*), 0))::numeric, 2) as up,
-            ROUND(AVG(response_time)::numeric, 3) as resp
-        FROM logs
-        WHERE timestamp > NOW() - INTERVAL '30 days'
-    """)
-    s30 = cur.fetchone() or {'up': 0, 'resp': 0}
-    cur.execute("""
-        SELECT
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                   / NULLIF(COUNT(*), 0))::numeric, 2) as up,
-            ROUND(AVG(response_time)::numeric, 3) as resp
-        FROM logs
-        WHERE timestamp > NOW() - INTERVAL '24 hours'
-    """)
-    s24 = cur.fetchone() or {'up': 0, 'resp': 0}
+    # --- Оптимизированные запросы: checks_agg вместо scan logs ---
+    s30 = _get_stats_from_agg(cur, '30 days')
+    s24 = _get_stats_from_agg(cur, '24 hours')
 
-    # Этап 3: Материализованное представление для мгновенного ответа
     cur.execute("SELECT * FROM latest_status")
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
 
-    # Статистика uptime за 30 дней
+    # Статистика по сайтам — из checks_agg
     cur.execute("""
         SELECT site,
-            ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                   / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-            COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
-        FROM logs
-        WHERE timestamp > NOW() - INTERVAL '30 days'
+            ROUND(SUM(status_200_count) * 100.0
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+            SUM(checks_count - status_200_count) * 5 as down_sec
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
         GROUP BY site
     """)
-    stats = {r['site']: r for r in cur.fetchall()}
+    stats_rows = cur.fetchall()
+    if stats_rows and stats_rows[0][0] is not None:
+        stats = {r['site']: r for r in stats_rows}
+    else:
+        # Fallback на logs
+        cur.execute("""
+            SELECT site,
+                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
+                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+            GROUP BY site
+        """)
+        stats = {r['site']: r for r in cur.fetchall()}
 
     incidents = [s for s, v in latest.items() if v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
@@ -885,17 +998,14 @@ async def index(auth: bool = Depends(check_auth)):
     <div id="t2" class="tab-content">
     <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
 
-    # Этап 3: Аналитика из агрегатов (checks_agg) вместо сканирования logs
+    # Графики — из checks_agg (уже оптимизировано)
     cur.execute("""
-        SELECT site,
-            bucket::date as d,
+        SELECT site, bucket::date as d,
             ROUND(AVG(avg_response_time)::numeric, 2) as r,
             ROUND(SUM(status_200_count) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
-        FROM checks_agg
-        WHERE bucket > NOW() - INTERVAL '14 days'
-        GROUP BY site, bucket::date
-        ORDER BY bucket::date
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL '14 days'
+        GROUP BY site, bucket::date ORDER BY bucket::date
     """)
     g_data = {}
     for r in cur.fetchall():
@@ -905,15 +1015,12 @@ async def index(auth: bool = Depends(check_auth)):
         g_data[s]["u"].append(float(r['u']) if r['u'] else 0)
         g_data[s]["r"].append(float(r['r']) if r['r'] else 0)
 
-    # Дополняем данными из logs за последние 14 дней (если checks_agg пуст)
     if not g_data:
         cur.execute("""
             SELECT site, DATE(timestamp) as d,
                 ROUND(AVG(response_time)::numeric, 2) as r,
-                ROUND((COUNT(*) FILTER (WHERE status=200) * 100.0
-                       / COUNT(*))::numeric, 2) as u
-            FROM logs
-            WHERE timestamp > NOW() - INTERVAL '14 days'
+                ROUND((COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*))::numeric, 2) as u
+            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
             GROUP BY 1, 2 ORDER BY 2
         """)
         for r in cur.fetchall():
@@ -926,23 +1033,22 @@ async def index(auth: bool = Depends(check_auth)):
     for s in sorted_sites:
         if s in g_data:
             html += f"""<div class='kpi-card' style='border-top:2px solid #eee'>
-                <h5>{s}</h5>
-                <canvas id='c-{s.replace('.', '_')}'></canvas></div>"""
+                <h5>{s}</h5><canvas id='c-{s.replace('.', '_')}'></canvas></div>"""
 
     html += """</div></div>
     <div id="t3" class="tab-content">
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
     <th>Код</th><th>Описание</th></tr></thead><tbody>"""
 
+    # Инциденты — ограничиваем 14 днями для скорости
     cur.execute("""
         WITH status_changes AS (
             SELECT site, timestamp, status,
                 CASE WHEN status != 200 AND
                     (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
-                     OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp)
-                         IS NULL)
+                     OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
                 THEN 1 ELSE 0 END as is_start
-            FROM logs
+            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
         ),
         incident_groups AS (
             SELECT site, timestamp, status,
@@ -1010,7 +1116,6 @@ async def index(auth: bool = Depends(check_auth)):
 
     setInterval(() => {{ location.reload(); }}, 120000);
     </script>"""
-
     for s, d in g_data.items():
         html += f"""<script>new Chart(
             document.getElementById('c-{s.replace('.', '_')}'),
@@ -1034,7 +1139,13 @@ async def index(auth: bool = Depends(check_auth)):
 
     cur.close()
     conn.close()
+
+    # Сохраняем в кэш
+    with _dashboard_cache["lock"]:
+        _dashboard_cache["html"] = html
+        _dashboard_cache["timestamp"] = time.time()
     return html
+
 
 
 if __name__ == "__main__":
