@@ -28,6 +28,16 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
+NEW_MONITORING_SITES = [
+    "icenter.tdms.nipigas.ru/cp/",
+    "tdms.progress-epc.ru/cp/",
+    "icenter.tdms.newresources.ru/cp/",
+    "agpp.tdms.nipigas.ru/cp/",
+    "agpp.tdms.nipigas.ru/DMS21/",
+    "tst-stdo.tdms.sibur.ru/cp/",
+    "cp.tdms.sibur.ru/cp/"
+]
+
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 # Внутренние /cp/ сайты — self-signed по умолчанию
 # Дополнительные через env SELF_SIGNED_SITES (через запятую)
@@ -39,15 +49,7 @@ if os.getenv("SELF_SIGNED_SITES"):
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
 AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
 
-NEW_MONITORING_SITES = [
-    "icenter.tdms.nipigas.ru/cp/",
-    "tdms.progress-epc.ru/cp/",
-    "icenter.tdms.newresources.ru/cp/",
-    "agpp.tdms.nipigas.ru/cp/",
-    "agpp.tdms.nipigas.ru/DMS21/",
-    "tst-stdo.tdms.sibur.ru/cp/",
-    "cp.tdms.sibur.ru/cp/"
-]
+
 
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
