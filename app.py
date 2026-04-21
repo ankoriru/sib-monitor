@@ -662,11 +662,6 @@ def check_worker():
 
                         with BATCH_LOCK:
                             if fail_count[site] >= 2:
-                                if fail_count[site] == 2:
-                                    prev_ts = datetime.datetime.now() - datetime.timedelta(minutes=1)
-                                    batch_buffer.append(
-                                        (site, curr_status, resp_time, ssl_d, dom_d, prev_ts)
-                                    )
                                 batch_buffer.append(
                                     (site, curr_status, resp_time, ssl_d, dom_d)
                                 )
