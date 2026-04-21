@@ -352,7 +352,11 @@ def init_db():
         FROM logs
         ORDER BY site, timestamp DESC
     """)
-    _safe_index("idx_latest_status_site", "latest_status", "site")
+    # Уникальный индекс обязателен для REFRESH CONCURRENTLY
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
+    except psycopg2.Error:
+        conn.rollback()
 
     conn.commit()
     cur.close()
@@ -562,11 +566,15 @@ def flush_batch():
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
 def refresh_materialized_view():
-    """Обновление latest_status материализованного представления"""
+    """Обновление latest_status — CONCURRENTLY если возможно, иначе обычно"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY latest_status")
+        try:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY latest_status")
+        except psycopg2.Error:
+            conn.rollback()
+            cur.execute("REFRESH MATERIALIZED VIEW latest_status")
         conn.commit()
         cur.close()
         conn.close()
