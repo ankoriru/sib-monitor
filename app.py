@@ -29,13 +29,11 @@ TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
-# Сайты в этом списке проверяются с verify=False (самоподписанные сертификаты)
-# Остальные сайты проверяются с verify=True (полная валидация SSL)
-SELF_SIGNED_SITES = set(
-    os.getenv("SELF_SIGNED_SITES", "").split(",")
-    if os.getenv("SELF_SIGNED_SITES")
-    else []
-)
+# Внутренние /cp/ сайты — self-signed по умолчанию
+# Дополнительные через env SELF_SIGNED_SITES (через запятую)
+SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
+if os.getenv("SELF_SIGNED_SITES"):
+    SELF_SIGNED_SITES.update(os.getenv("SELF_SIGNED_SITES").split(","))
 
 # --- SEC-2: BCrypt-хеширование паролей через env ---
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
@@ -460,7 +458,8 @@ async def check_single_site(session, site, semaphore):
             if ssl_verify and connector:
                 await actual_session.close()
 
-        except Exception:
+        except Exception as e:
+            print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
 
         # Проверка SSL (синхронно в отдельном потоке)
