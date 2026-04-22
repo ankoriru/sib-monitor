@@ -49,6 +49,8 @@ if os.getenv("SELF_SIGNED_SITES"):
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
 AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
 
+
+
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -76,8 +78,8 @@ batch_buffer = []
 BATCH_SIZE = 50
 BATCH_LOCK = threading.Lock()
 
-# КЭШ DASHBOARD — храним dict с данными (не HTML-строку)
-_dashboard_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
+# КЭШ DASHBOARD (обновляется раз в 30 сек)
+_dashboard_cache = {"html": None, "timestamp": 0, "lock": threading.Lock()}
 CACHE_TTL = 30
 
 # ============================================================================
@@ -95,8 +97,7 @@ def _screenshot_worker():
 
 
 async def _screenshot_loop():
-    """Event loop воркера: держит браузер открытым и обрабатывает очередь.
-    При ошибке одного скриншота — продолжает работу (не падает)."""
+    """Event loop воркера: держит браузер открытым и обрабатывает очередь"""
     p = await async_playwright().start()
     browser = await p.chromium.launch(
         headless=True,
@@ -112,11 +113,7 @@ async def _screenshot_loop():
             path = await _do_screenshot(browser, site)
             fut.set_result(path)
         except Exception as e:
-            print(f"[SCREEN ERR] {site}: {e}")
-            try:
-                fut.set_exception(e)
-            except Exception:
-                pass  # Future мог уже быть отменён
+            fut.set_exception(e)
 
 
 async def _do_screenshot(browser, site):
@@ -127,17 +124,15 @@ async def _do_screenshot(browser, site):
         viewport={'width': 1280, 'height': 720},
         ignore_https_errors=True
     )
+    page = await context.new_page()
     try:
-        page = await context.new_page()
-        try:
-            await page.goto(full_url, timeout=15000, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        await page.screenshot(path=path, type="jpeg", quality=80)
-        return path
-    finally:
-        await context.close()
+        await page.goto(full_url, timeout=15000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    await asyncio.sleep(1)
+    await page.screenshot(path=path, type="jpeg", quality=80)
+    await context.close()
+    return path
 
 
 def take_screenshot_fast(site):
@@ -452,25 +447,22 @@ async def check_single_site(session, site, semaphore):
         connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
 
         start = time.time()
-        actual_session = None
         try:
+            actual_session = session
             if ssl_verify and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
-            else:
-                actual_session = session
 
             timeout = aiohttp.ClientTimeout(total=25)
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
 
+            if ssl_verify and connector:
+                await actual_session.close()
+
         except Exception as e:
             print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
-        finally:
-            # Закрываем только собственную сессию (не общую из check_all_sites)
-            if ssl_verify and connector and actual_session is not None:
-                await actual_session.close()
 
         # Проверка SSL (синхронно в отдельном потоке)
         try:
@@ -846,65 +838,19 @@ def _get_stats_from_agg(cur, interval: str):
     return {'up': row[0] or 0, 'resp': row[1] or 0}
 
 
-# ============================================================================
-# API для графиков — lazy load фоном после first paint
-# ============================================================================
-@app.get("/api/charts")
-async def api_charts(auth: bool = Depends(check_auth)):
-    """AJAX: данные для графиков (подгружаются после загрузки shell)"""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute("""
-        SELECT site, bucket::date as d,
-            ROUND(AVG(avg_response_time)::numeric, 2) as r,
-            ROUND(SUM(status_200_count) * 100.0
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
-        FROM checks_agg WHERE bucket > NOW() - INTERVAL '14 days'
-        GROUP BY site, bucket::date ORDER BY bucket::date
-    """)
-    data = {}
-    for r in cur.fetchall():
-        s = r['site']
-        data.setdefault(s, {"l": [], "u": [], "r": []})
-        data[s]["l"].append(r['d'].strftime('%d.%m'))
-        data[s]["u"].append(float(r['u']) if r['u'] else 0)
-        data[s]["r"].append(float(r['r']) if r['r'] else 0)
-    # Fallback на logs если агрегаты пусты
-    if not data:
-        cur.execute("""
-            SELECT site, DATE(timestamp) as d,
-                ROUND(AVG(response_time)::numeric, 2) as r,
-                ROUND((COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*))::numeric, 2) as u
-            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
-            GROUP BY 1, 2 ORDER BY 2
-        """)
-        for r in cur.fetchall():
-            s = r['site']
-            data.setdefault(s, {"l": [], "u": [], "r": []})
-            data[s]["l"].append(r['d'].strftime('%d.%m'))
-            data[s]["u"].append(float(r['u']) if r['u'] else 0)
-            data[s]["r"].append(float(r['r']) if r['r'] else 0)
-    cur.close()
-    conn.close()
-    return JSONResponse(data)
-
-
-# ============================================================================
-# DASHBOARD — shell (KPI + таблица + инциденты + календарь)
-# Графики подгружаются фоном через /api/charts
-# ============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):
     global _dashboard_cache
     now = time.time()
     with _dashboard_cache["lock"]:
-        if _dashboard_cache["data"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
-            return _build_html(_dashboard_cache["data"])
+        if _dashboard_cache["html"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
+            return _dashboard_cache["html"]
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
+    now_msk = datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
 
-    # --- SQL: только лёгкие запросы (нет графиков) ---
+    # --- Оптимизированные запросы: checks_agg вместо scan logs ---
     s30 = _get_stats_from_agg(cur, '30 days')
     s24 = _get_stats_from_agg(cur, '24 hours')
 
@@ -925,6 +871,7 @@ async def index(auth: bool = Depends(check_auth)):
     if stats_rows and stats_rows[0][0] is not None:
         stats = {r['site']: r for r in stats_rows}
     else:
+        # Fallback на logs
         cur.execute("""
             SELECT site,
                 ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
@@ -934,57 +881,6 @@ async def index(auth: bool = Depends(check_auth)):
             GROUP BY site
         """)
         stats = {r['site']: r for r in cur.fetchall()}
-
-    # Инциденты — CTE с ограничением 3 днями (быстро, не грузит память)
-    cur.execute("""
-        WITH status_changes AS (
-            SELECT site, timestamp, status,
-                CASE WHEN status != 200 AND
-                    (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
-                     OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
-                THEN 1 ELSE 0 END as is_start
-            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-        ),
-        incident_groups AS (
-            SELECT site, timestamp, status,
-                SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
-            FROM status_changes WHERE status != 200
-        )
-        SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
-            MAX(status) as max_status,
-            CASE WHEN MAX(status) = 0 THEN 'Timeout'
-                 WHEN MAX(status) = 502 THEN 'Bad Gateway'
-                 WHEN MAX(status) = 503 THEN 'Service Unavailable'
-                 ELSE 'Server Error' END as description
-        FROM incident_groups
-        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
-    """)
-    incidents_list = [dict(r) for r in cur.fetchall()]
-
-    cur.close()
-    conn.close()
-
-    # Сохраняем dict в кэш (не HTML-строку — экономия ~2 MB RAM)
-    data = {
-        "s30": s30, "s24": s24,
-        "latest": latest, "stats": stats,
-        "incidents": incidents_list,
-        "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
-    }
-    with _dashboard_cache["lock"]:
-        _dashboard_cache["data"] = data
-        _dashboard_cache["timestamp"] = time.time()
-    return _build_html(data)
-
-
-def _build_html(data: dict) -> str:
-    """Сборка HTML из кэшированного dict (без SQL, <10 мс)"""
-    s30 = data["s30"]
-    s24 = data["s24"]
-    latest = data["latest"]
-    stats = data["stats"]
-    incidents_list = data["incidents"]
-    now_msk = data["now_msk"]
 
     incidents = [s for s, v in latest.items() if v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
@@ -1124,17 +1020,78 @@ def _build_html(data: dict) -> str:
 
     html += """</tbody></table></div>
     <div id="t2" class="tab-content">
-    <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
-        <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
-    </div></div>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">"""
+
+    # Графики — из checks_agg (уже оптимизировано)
+    cur.execute("""
+        SELECT site, bucket::date as d,
+            ROUND(AVG(avg_response_time)::numeric, 2) as r,
+            ROUND(SUM(status_200_count) * 100.0
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL '14 days'
+        GROUP BY site, bucket::date ORDER BY bucket::date
+    """)
+    g_data = {}
+    for r in cur.fetchall():
+        s = r['site']
+        g_data.setdefault(s, {"l": [], "u": [], "r": []})
+        g_data[s]["l"].append(r['d'].strftime('%d.%m'))
+        g_data[s]["u"].append(float(r['u']) if r['u'] else 0)
+        g_data[s]["r"].append(float(r['r']) if r['r'] else 0)
+
+    if not g_data:
+        cur.execute("""
+            SELECT site, DATE(timestamp) as d,
+                ROUND(AVG(response_time)::numeric, 2) as r,
+                ROUND((COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*))::numeric, 2) as u
+            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
+            GROUP BY 1, 2 ORDER BY 2
+        """)
+        for r in cur.fetchall():
+            s = r['site']
+            g_data.setdefault(s, {"l": [], "u": [], "r": []})
+            g_data[s]["l"].append(r['d'].strftime('%d.%m'))
+            g_data[s]["u"].append(float(r['u']) if r['u'] else 0)
+            g_data[s]["r"].append(float(r['r']) if r['r'] else 0)
+
+    for s in sorted_sites:
+        if s in g_data:
+            html += f"""<div class='kpi-card' style='border-top:2px solid #eee'>
+                <h5>{s}</h5><canvas id='c-{s.replace('.', '_')}'></canvas></div>"""
+
+    html += """</div></div>
     <div id="t3" class="tab-content">
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
     <th>Код</th><th>Описание</th></tr></thead><tbody>"""
 
-    for r in incidents_list:
-        html += f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
-            <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
-            <td>{r['max_status']}</td><td>{r['description']}</td></tr>"""
+    # Инциденты — ограничиваем 14 днями для скорости
+    cur.execute("""
+        WITH status_changes AS (
+            SELECT site, timestamp, status,
+                CASE WHEN status != 200 AND
+                    (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
+                     OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
+                THEN 1 ELSE 0 END as is_start
+            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
+        ),
+        incident_groups AS (
+            SELECT site, timestamp, status,
+                SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+            FROM status_changes WHERE status != 200
+        )
+        SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
+            MAX(status),
+            CASE WHEN MAX(status) = 0 THEN 'Timeout'
+                 WHEN MAX(status) = 502 THEN 'Bad Gateway'
+                 WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                 ELSE 'Server Error' END
+        FROM incident_groups
+        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+    """)
+    for r in cur.fetchall():
+        html += f"""<tr><td>{r[1].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+            <td>{r[0]}</td><td class='txt-err'>{r[2]} мин</td>
+            <td>{r[3]}</td><td>{r[4]}</td></tr>"""
 
     html += """</tbody></table></div>
     <div id="t4" class="tab-content">
@@ -1181,47 +1138,38 @@ def _build_html(data: dict) -> str:
         setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
     }}
 
-    // Фоновая загрузка графиков сразу после first paint
-    (async function loadCharts() {{
-        try {{
-            const res = await fetch('/api/charts');
-            const g_data = await res.json();
-            const container = document.getElementById('charts-container');
-            container.innerHTML = '';
-            const sites = Object.keys(g_data).sort();
-            for (const s of sites) {{
-                const d = g_data[s];
-                const div = document.createElement('div');
-                div.className = 'kpi-card';
-                div.style.borderTop = '2px solid #eee';
-                div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\\./g, '_')}}"></canvas>`;
-                container.appendChild(div);
-                new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {{
-                    type: 'line',
-                    data: {{
-                        labels: d.l,
-                        datasets: [
-                            {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
-                            {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
-                        ]
-                    }},
-                    options: {{
-                        scales: {{
-                            y: {{ min: 75, max: 110 }},
-                            y1: {{ position: 'right', grid: {{ display: false }} }}
-                        }}
-                    }}
-                }});
-            }}
-        }} catch (e) {{
-            document.getElementById('charts-container').innerHTML =
-                '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
-        }}
-    }}();
-
     setInterval(() => {{ location.reload(); }}, 120000);
-    </script></body></html>"""
+    </script>"""
+    for s, d in g_data.items():
+        html += f"""<script>new Chart(
+            document.getElementById('c-{s.replace('.', '_')}'),
+            {{ type: 'line',
+               data: {{
+                   labels: {json.dumps(d['l'])},
+                   datasets: [
+                       {{ label: 'Uptime %', data: {json.dumps(d['u'])},
+                          borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
+                       {{ label: 'Ответ сек', data: {json.dumps(d['r'])},
+                          borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
+                   ]
+               }},
+               options: {{
+                   scales: {{
+                       y: {{ min: 75, max: 110 }},
+                       y1: {{ position: 'right', grid: {{ display: false }} }}
+                   }}
+               }}
+            }});</script>"""
+
+    cur.close()
+    conn.close()
+
+    # Сохраняем в кэш
+    with _dashboard_cache["lock"]:
+        _dashboard_cache["html"] = html
+        _dashboard_cache["timestamp"] = time.time()
     return html
+
 
 
 if __name__ == "__main__":
