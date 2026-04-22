@@ -951,11 +951,11 @@ async def index(auth: bool = Depends(check_auth)):
             FROM status_changes WHERE status != 200
         )
         SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
-            MAX(status),
+            MAX(status) as max_status,
             CASE WHEN MAX(status) = 0 THEN 'Timeout'
                  WHEN MAX(status) = 502 THEN 'Bad Gateway'
                  WHEN MAX(status) = 503 THEN 'Service Unavailable'
-                 ELSE 'Server Error' END
+                 ELSE 'Server Error' END as description
         FROM incident_groups
         GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
     """)
@@ -1134,7 +1134,7 @@ def _build_html(data: dict) -> str:
     for r in incidents_list:
         html += f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
-            <td>{r['max_status']}</td><td>{r['case']}</td></tr>"""
+            <td>{r['max_status']}</td><td>{r['description']}</td></tr>"""
 
     html += """</tbody></table></div>
     <div id="t4" class="tab-content">
