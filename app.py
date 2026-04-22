@@ -851,39 +851,49 @@ def _get_stats_from_agg(cur, interval: str):
 # ============================================================================
 @app.get("/api/charts")
 async def api_charts(auth: bool = Depends(check_auth)):
-    """AJAX: данные для графиков (подгружаются после загрузки shell)"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
+
+    allowed_sites = set(SITES)
+
     cur.execute("""
         SELECT site, bucket::date as d,
-            ROUND(AVG(avg_response_time)::numeric, 2) as r,
-            ROUND(SUM(status_200_count) * 100.0
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
-        FROM checks_agg WHERE bucket > NOW() - INTERVAL '14 days'
-        GROUP BY site, bucket::date ORDER BY bucket::date
-    """)
+               ROUND(AVG(avg_response_time)::numeric, 2) as r,
+               ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
+        FROM checks_agg
+        WHERE bucket > NOW() - INTERVAL '14 days'
+          AND site = ANY(%s)
+        GROUP BY site, bucket::date
+        ORDER BY bucket::date
+    """, (list(allowed_sites),))
+
     data = {}
     for r in cur.fetchall():
         s = r['site']
-        data.setdefault(s, {"l": [], "u": [], "r": []})
-        data[s]["l"].append(r['d'].strftime('%d.%m'))
-        data[s]["u"].append(float(r['u']) if r['u'] else 0)
-        data[s]["r"].append(float(r['r']) if r['r'] else 0)
-    # Fallback на logs если агрегаты пусты
+        data.setdefault(s, {'l': [], 'u': [], 'r': []})
+        data[s]['l'].append(r['d'].strftime("%d.%m"))
+        data[s]['u'].append(float(r['u']) if r['u'] is not None else 0)
+        data[s]['r'].append(float(r['r']) if r['r'] is not None else 0)
+
     if not data:
         cur.execute("""
             SELECT site, DATE(timestamp) as d,
-                ROUND(AVG(response_time)::numeric, 2) as r,
-                ROUND((COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*))::numeric, 2) as u
-            FROM logs WHERE timestamp > NOW() - INTERVAL '14 days'
-            GROUP BY 1, 2 ORDER BY 2
-        """)
+                   ROUND(AVG(response_time)::numeric, 2) as r,
+                   ROUND(COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*)::numeric, 2) as u
+            FROM logs
+            WHERE timestamp > NOW() - INTERVAL '14 days'
+              AND site = ANY(%s)
+            GROUP BY 1, 2
+            ORDER BY 2
+        """, (list(allowed_sites),))
+
         for r in cur.fetchall():
             s = r['site']
-            data.setdefault(s, {"l": [], "u": [], "r": []})
-            data[s]["l"].append(r['d'].strftime('%d.%m'))
-            data[s]["u"].append(float(r['u']) if r['u'] else 0)
-            data[s]["r"].append(float(r['r']) if r['r'] else 0)
+            data.setdefault(s, {'l': [], 'u': [], 'r': []})
+            data[s]['l'].append(r['d'].strftime("%d.%m"))
+            data[s]['u'].append(float(r['u']) if r['u'] is not None else 0)
+            data[s]['r'].append(float(r['r']) if r['r'] is not None else 0)
+
     cur.close()
     conn.close()
     return JSONResponse(data)
