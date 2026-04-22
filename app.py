@@ -1114,7 +1114,7 @@ def _build_html(data: dict) -> str:
         return 3
 
     sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
-
+    sorted_sites_json = json.dumps(sorted_sites)
     for s in sorted_sites:
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
@@ -1203,7 +1203,7 @@ def _build_html(data: dict) -> str:
             const g_data = await res.json();
             const container = document.getElementById('charts-container');
             container.innerHTML = '';
-            const sites = Object.keys(g_data).sort();
+            const sites = {sorted_sites_json}.filter(s => g_data[s]);
             for (const s of sites) {{
                 const d = g_data[s];
                 const div = document.createElement('div');
