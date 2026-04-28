@@ -15,7 +15,6 @@ import aiohttp
 import bcrypt
 import queue
 import concurrent.futures
-from string import Template
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -881,16 +880,16 @@ async def startup_event():
 
 
 # ============================================================================
-# HTML SHELL (Template)
+# HTML SHELL
 # ============================================================================
-HTML_TEMPLATE = Template("""
+HTML_SHELL = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Мониторинг сайтов</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
 <style>
     body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; margin: 0; }
     .container { max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
@@ -948,7 +947,7 @@ HTML_TEMPLATE = Template("""
         <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
         <button class="refresh-btn" onclick="softReload()">🔄 Обновить: <span id="now-msk">--.--.---- --:--:--</span></button>
     </div>
-    
+
     <div class="kpi-grid">
         <div class="kpi-card" id="kpi-online"><span>Доступно</span><strong><br>-- / --</strong></div>
         <div class="kpi-card" id="kpi-uptime"><span>Uptime (24ч / 30д)</span><strong><br>--% / --%</strong></div>
@@ -956,36 +955,36 @@ HTML_TEMPLATE = Template("""
         <div class="kpi-card" id="kpi-incidents"><span>Инциденты</span><strong><br>--</strong></div>
         <div class="kpi-card" id="kpi-ssl"><span>SSL &lt;=20д</span><strong><br>--</strong></div>
     </div>
-    
+
     <div id="warn-box" style="display:none;"></div>
-    
+
     <div class="tabs">
         <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
         <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
         <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
         <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
     </div>
-    
+
     <div id="t1" class="tab-content active-content">
         <table>
             <thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead>
             <tbody id="sites-tbody"></tbody>
         </table>
     </div>
-    
+
     <div id="t2" class="tab-content">
         <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
             <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
         </div>
     </div>
-    
+
     <div id="t3" class="tab-content">
         <table>
             <thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead>
             <tbody id="incidents-tbody"></tbody>
         </table>
     </div>
-    
+
     <div id="t4" class="tab-content">
         <table>
             <thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th></tr></thead>
@@ -996,9 +995,9 @@ HTML_TEMPLATE = Template("""
 
 <script>
 const APP_DATA = {
-    sites: $sites_json,
-    priority: $priority_json,
-    new_sites: $new_sites_json
+    sites: __SITES_JSON__,
+    priority: __PRIORITY_JSON__,
+    new_sites: __NEW_SITES_JSON__
 };
 
 function setProgress(p, text) {
@@ -1010,31 +1009,27 @@ function setProgress(p, text) {
     if (text) status.innerText = text;
 }
 
-function getSiteMeta(s) {
-    return {
-        is_new: APP_DATA.new_sites.includes(s),
-        is_priority: APP_DATA.priority.includes(s),
-        weight: s === 'sibur.ru' ? 0 : (APP_DATA.new_sites.includes(s) ? 2 : (APP_DATA.priority.includes(s) ? 1 : 3))
-    };
-}
-
 function renderDashboard(data) {
+    if (!data || !data.sites) {
+        console.error('[renderDashboard] Invalid data', data);
+        return;
+    }
     const kpiOnline = document.getElementById('kpi-online');
-    kpiOnline.innerHTML = '<span>Доступно</span><strong><br>' + data.counts.online + ' / ' + data.counts.total + '</strong>';
-    kpiOnline.classList.toggle('danger-card', data.counts.online < data.counts.total);
-    
-    document.getElementById('kpi-uptime').innerHTML = '<span>Uptime (24ч / 30д)</span><strong><br>' + data.s24.up + '% / ' + data.s30.up + '%</strong>';
-    document.getElementById('kpi-resp').innerHTML = '<span>Ответ (24ч / 30д)</span><strong><br>' + data.s24.resp + 'с / ' + data.s30.resp + 'с</strong>';
-    
-    const kpiInc = document.getElementById('kpi-incidents');
-    kpiInc.innerHTML = '<span>Инциденты</span><strong><br>' + data.counts.incidents + '</strong>';
-    kpiInc.classList.toggle('danger-card', data.counts.incidents > 0);
-    
-    const kpiSsl = document.getElementById('kpi-ssl');
-    kpiSsl.innerHTML = '<span>SSL &lt;=20д</span><strong><br>' + data.counts.ssl_warn + '</strong>';
-    kpiSsl.classList.toggle('danger-card', data.counts.ssl_warn > 0);
+    kpiOnline.innerHTML = '<span>Доступно</span><strong><br>' + (data.counts.online || 0) + ' / ' + (data.counts.total || 0) + '</strong>';
+    kpiOnline.classList.toggle('danger-card', (data.counts.online || 0) < (data.counts.total || 0));
 
-    document.getElementById('now-msk').innerText = data.now_msk;
+    document.getElementById('kpi-uptime').innerHTML = '<span>Uptime (24ч / 30д)</span><strong><br>' + (data.s24 && data.s24.up != null ? data.s24.up : 0) + '% / ' + (data.s30 && data.s30.up != null ? data.s30.up : 0) + '%</strong>';
+    document.getElementById('kpi-resp').innerHTML = '<span>Ответ (24ч / 30д)</span><strong><br>' + (data.s24 && data.s24.resp != null ? data.s24.resp : 0) + 'с / ' + (data.s30 && data.s30.resp != null ? data.s30.resp : 0) + 'с</strong>';
+
+    const kpiInc = document.getElementById('kpi-incidents');
+    kpiInc.innerHTML = '<span>Инциденты</span><strong><br>' + (data.counts.incidents || 0) + '</strong>';
+    kpiInc.classList.toggle('danger-card', (data.counts.incidents || 0) > 0);
+
+    const kpiSsl = document.getElementById('kpi-ssl');
+    kpiSsl.innerHTML = '<span>SSL &lt;=20д</span><strong><br>' + (data.counts.ssl_warn || 0) + '</strong>';
+    kpiSsl.classList.toggle('danger-card', (data.counts.ssl_warn || 0) > 0);
+
+    document.getElementById('now-msk').innerText = data.now_msk || '--';
 
     const warnBox = document.getElementById('warn-box');
     if (data.all_warn_list && data.all_warn_list.length > 0) {
@@ -1047,21 +1042,21 @@ function renderDashboard(data) {
     const tbody = document.getElementById('sites-tbody');
     tbody.innerHTML = '';
     for (const s of data.sites) {
-        const v = data.latest[s] || {status:0, response_time:0, ssl_days:-1, domain_days:-1};
-        const st30 = data.stats[s] || {upt:0, down_sec:0};
-        const isErr = v.status !== 200 || (v.ssl_days >= 0 && v.ssl_days <= 20) || (v.domain_days >= 0 && v.domain_days <= 30);
-        const meta = getSiteMeta(s);
+        const v = (data.latest && data.latest[s]) || {status:0, response_time:0, ssl_days:-1, domain_days:-1};
+        const st30 = (data.stats && data.stats[s]) || {upt:0, down_sec:0};
+        const isErr = v.status !== 200 || (v.ssl_days != null && v.ssl_days >= 0 && v.ssl_days <= 20) || (v.domain_days != null && v.domain_days >= 0 && v.domain_days <= 30);
+        const meta = APP_DATA.new_sites.includes(s) ? {is_new:true} : (APP_DATA.priority.includes(s) ? {is_priority:true} : {});
         const prefix = meta.is_new ? '🔰 ' : (meta.is_priority ? '⭐️ ' : '');
         const row = document.createElement('tr');
         if (isErr) row.className = 'row-err';
         row.innerHTML = 
             '<td>' + prefix + '<a href="https://' + s + '" target="_blank" style="text-decoration:none; color:inherit;"><strong>' + s + '</strong></a></td>' +
             '<td><span class="' + (v.status===200 ? 'txt-ok' : 'txt-err') + '">' + (v.status===200 ? 'Online' : 'Offline') + '</span></td>' +
-            '<td>' + (st30.upt !== undefined ? st30.upt : 0) + '%</td>' +
-            '<td>' + (v.response_time !== undefined ? v.response_time : 0).toFixed(2) + 'с</td>' +
-            '<td class="' + ((v.ssl_days >=0 && v.ssl_days <=20) ? 'txt-err' : '') + '">' + (v.ssl_days !== undefined ? v.ssl_days : -1) + 'д</td>' +
-            '<td class="' + ((v.domain_days >=0 && v.domain_days <=30) ? 'txt-err' : '') + '">' + (v.domain_days !== undefined ? v.domain_days : -1) + 'д</td>' +
-            '<td><button class="btn-test" onclick="runTest(\'' + s + '\', this)"><div class="loader"></div><span>📸 Screen</span></button></td>';
+            '<td>' + (st30.upt != null ? st30.upt : 0) + '%</td>' +
+            '<td>' + (v.response_time != null ? v.response_time : 0).toFixed(2) + 'с</td>' +
+            '<td class="' + ((v.ssl_days != null && v.ssl_days >= 0 && v.ssl_days <= 20) ? 'txt-err' : '') + '">' + (v.ssl_days != null ? v.ssl_days : -1) + 'д</td>' +
+            '<td class="' + ((v.domain_days != null && v.domain_days >= 0 && v.domain_days <= 30) ? 'txt-err' : '') + '">' + (v.domain_days != null ? v.domain_days : -1) + 'д</td>' +
+            '<td><button class="btn-test" onclick="runTest('' + s + '', this)"><div class="loader"></div><span>📸 Screen</span></button></td>';
         tbody.appendChild(row);
     }
 }
@@ -1091,12 +1086,12 @@ function renderCalendar(latest) {
     tbody.innerHTML = '';
     const events = [];
     for (const s of APP_DATA.sites) {
-        const v = latest[s];
+        const v = latest ? latest[s] : null;
         if (!v) continue;
-        if (v.ssl_days !== undefined && v.ssl_days >= 0) events.push({t: 'SSL сертификат', s: s, d: v.ssl_days});
-        if (v.domain_days !== undefined && v.domain_days >= 0) events.push({t: 'Оплата домена', s: s, d: v.domain_days});
+        if (v.ssl_days != null && v.ssl_days >= 0) events.push({t: 'SSL сертификат', s: s, d: v.ssl_days});
+        if (v.domain_days != null && v.domain_days >= 0) events.push({t: 'Оплата домена', s: s, d: v.domain_days});
     }
-    events.sort((a,b) => a.d - b.d);
+    events.sort(function(a,b){ return a.d - b.d; });
     if (events.length === 0) {
         tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:#999;">Нет предстоящих событий</td></tr>';
         return;
@@ -1137,7 +1132,7 @@ function showToast(msg) {
     const t = document.getElementById('toast');
     t.innerText = msg;
     t.style.display = 'block';
-    setTimeout(() => { t.style.display = 'none'; }, 4000);
+    setTimeout(function(){ t.style.display = 'none'; }, 4000);
 }
 
 let chartsLoaded = false;
@@ -1151,15 +1146,15 @@ async function loadCharts() {
         const g_data = await res.json();
         const container = document.getElementById('charts-container');
         container.innerHTML = '';
-        const sites = APP_DATA.sites.filter(s => g_data[s]);
+        const sites = APP_DATA.sites.filter(function(s){ return g_data[s]; });
         for (const s of sites) {
             const d = g_data[s];
             const div = document.createElement('div');
             div.className = 'kpi-card';
             div.style.borderTop = '2px solid #eee';
-            div.innerHTML = '<h5>' + s + '</h5><canvas id="c-' + s.replace(/\\./g, '_') + '"></canvas>';
+            div.innerHTML = '<h5>' + s + '</h5><canvas id="c-' + s.replace(/\./g, '_') + '"></canvas>';
             container.appendChild(div);
-            new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {
+            new Chart(document.getElementById('c-' + s.replace(/\./g, '_')), {
                 type: 'line',
                 data: {
                     labels: d.l,
@@ -1188,45 +1183,53 @@ async function loadCharts() {
 async function softReload() {
     try {
         const dashRes = await fetch('/api/dashboard');
+        if (!dashRes.ok) throw new Error('HTTP ' + dashRes.status);
         const dashData = await dashRes.json();
         renderDashboard(dashData);
         const incRes = await fetch('/api/incidents');
+        if (!incRes.ok) throw new Error('HTTP ' + incRes.status);
         const incData = await incRes.json();
         renderIncidents(incData.incidents);
         renderCalendar(dashData.latest);
-        showToast('Данные обновлены: ' + dashData.now_msk);
+        showToast('Данные обновлены: ' + (dashData.now_msk || ''));
     } catch (e) {
-        showToast('Ошибка обновления');
+        console.error('softReload error:', e);
+        showToast('Ошибка обновления: ' + e.message);
     }
 }
 
 async function init() {
+    console.log('[INIT] Starting...');
     setProgress(0, 'Подключение к серверу...');
     try {
         setProgress(15, 'Загрузка дашборда...');
         const dashRes = await fetch('/api/dashboard');
+        console.log('[INIT] dashboard response', dashRes.status);
         if (!dashRes.ok) throw new Error('HTTP ' + dashRes.status);
         const dashData = await dashRes.json();
-        
+        console.log('[INIT] dashboard data keys', Object.keys(dashData));
+
         setProgress(50, 'Рендеринг списка сайтов...');
         renderDashboard(dashData);
-        
+
         setProgress(65, 'Загрузка инцидентов...');
         const incRes = await fetch('/api/incidents');
+        console.log('[INIT] incidents response', incRes.status);
         if (!incRes.ok) throw new Error('HTTP ' + incRes.status);
         const incData = await incRes.json();
-        
+
         setProgress(85, 'Рендеринг инцидентов и календаря...');
         renderIncidents(incData.incidents);
         renderCalendar(dashData.latest);
-        
+
         setProgress(100, 'Готово!');
-        setTimeout(() => {
+        setTimeout(function(){
             const overlay = document.getElementById('loader-overlay');
             overlay.style.opacity = '0';
-            setTimeout(() => overlay.style.display = 'none', 500);
+            setTimeout(function(){ overlay.style.display = 'none'; }, 500);
         }, 400);
     } catch (e) {
+        console.error('[INIT] Error:', e);
         const status = document.getElementById('status-text');
         status.innerText = 'Ошибка загрузки: ' + e.message;
         status.style.color = '#dc2626';
@@ -1234,12 +1237,12 @@ async function init() {
     }
 }
 
-setInterval(() => { softReload(); }, 120000);
+setInterval(function(){ softReload(); }, 120000);
 init();
 </script>
 </body>
 </html>
-""")
+"""
 
 
 # ============================================================================
@@ -1488,14 +1491,13 @@ async def api_dashboard(auth: bool = Depends(check_auth)):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(auth: bool = Depends(check_auth)):
-    sites_json = json.dumps(SITES)
-    priority_json = json.dumps(PRIORITY_SITES)
-    new_sites_json = json.dumps(NEW_MONITORING_SITES)
-    html = HTML_TEMPLATE.substitute(
-        sites_json=sites_json,
-        priority_json=priority_json,
-        new_sites_json=new_sites_json
-    )
+    sites_json = json.dumps(SITES, ensure_ascii=False)
+    priority_json = json.dumps(PRIORITY_SITES, ensure_ascii=False)
+    new_sites_json = json.dumps(NEW_MONITORING_SITES, ensure_ascii=False)
+    html = HTML_SHELL
+    html = html.replace('__SITES_JSON__', sites_json)
+    html = html.replace('__PRIORITY_JSON__', priority_json)
+    html = html.replace('__NEW_SITES_JSON__', new_sites_json)
     return HTMLResponse(html)
 
 
