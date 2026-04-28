@@ -85,6 +85,7 @@ CACHE_TTL = 30
 # ============================================================================
 _screenshot_queue = queue.Queue()  # (site, result_future)
 _screenshot_thread = None
+_screenshot_thread_lock = threading.Lock()
 
 
 def _screenshot_worker():
@@ -92,6 +93,15 @@ def _screenshot_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_screenshot_loop())
+
+
+def _ensure_screenshot_worker():
+    """Лениво запускает Playwright worker только при первом запросе скриншота."""
+    global _screenshot_thread
+    with _screenshot_thread_lock:
+        if _screenshot_thread is None or not _screenshot_thread.is_alive():
+            _screenshot_thread = threading.Thread(target=_screenshot_worker, daemon=True)
+            _screenshot_thread.start()
 
 
 async def _screenshot_loop():
@@ -120,7 +130,7 @@ async def _screenshot_loop():
 
 
 async def _do_screenshot(browser, site):
-    """Скриншот одного сайта (вызвается в loop воркера)"""
+    """Скриншот одного сайта (вызывается в loop воркера)"""
     full_url = f"https://{site}"
     path = f"debug_{site.replace('/', '_')}_{int(time.time())}.png"
     context = await browser.new_context(
@@ -142,13 +152,13 @@ async def _do_screenshot(browser, site):
 
 def take_screenshot_fast(site):
     """Синхронный вызов: кладёт задачу в очередь и ждёт результат"""
+    _ensure_screenshot_worker()
     fut = concurrent.futures.Future()
     _screenshot_queue.put((site, fut))
     try:
         return fut.result(timeout=30)
     except concurrent.futures.TimeoutError:
         return None
-
 # ============================================================================
 # BCrypt AUTH (SEC-2)
 # ============================================================================
@@ -783,13 +793,10 @@ def rotation_worker():
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    backfill_checks_agg()  # Предзаполнение агрегатов
-    global _screenshot_thread
-    _screenshot_thread = threading.Thread(target=_screenshot_worker, daemon=True)
-    _screenshot_thread.start()
+    threading.Thread(target=backfill_checks_agg, daemon=True).start()
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
-    threading.Thread(target=rotation_worker, daemon=True).start()  # Этап 1: ротация
+    threading.Thread(target=rotation_worker, daemon=True).start()
 
 
 # ============================================================================
