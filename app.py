@@ -1047,7 +1047,7 @@ def _build_html(data: dict) -> str:
     html = f"""
     <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js">
-		document.addEventListener('DOMContentLoaded', async () => {
+		document.addEventListener('DOMContentLoaded', async () => {{
     setPageProgress(10, 'Инициализация');
     await new Promise(r => setTimeout(r, 120));
 
@@ -1058,9 +1058,10 @@ def _build_html(data: dict) -> str:
     await loadCharts(true);
 
     setPageProgress(100, 'Готово');
-    setTimeout(hidePageLoader, 250);
+    setTimeout(hidePageLoader, 250);}
 });
-async function loadIncidents() {
+
+async function loadIncidents() {{
     if (incidentsLoaded || incidentsLoading) return;
     incidentsLoading = true;
 
@@ -1070,13 +1071,13 @@ async function loadIncidents() {
     if (loader) loader.style.display = 'flex';
     if (container) container.innerHTML = '';
 
-    try {
+    try {{
         const res = await fetch('/api/incidents');
         const rows = await res.json();
 
-        if (!rows.length) {
+        if (!rows.length) {{
             container.innerHTML = '<div class="muted">Инциденты не найдены</div>';
-        } else {
+        }} else {{
             let html = `
                 <table>
                     <thead>
@@ -1091,30 +1092,31 @@ async function loadIncidents() {
                     <tbody>
             `;
 
-            for (const r of rows) {
+            for (const r of rows) {{
                 html += `
                     <tr>
-                        <td>${r.start_time}</td>
-                        <td>${r.site}</td>
-                        <td>${r.dur} мин</td>
-                        <td>${r.max_status}</td>
-                        <td>${r.description}</td>
+                        <td>${{r.start_time}}</td>
+                        <td>${{r.site}}</td>
+                        <td>${{r.dur}} мин</td>
+                        <td>${{r.max_status}}</td>
+                        <td>${{r.description}}</td>
                     </tr>
                 `;
-            }
+            }}
 
             html += '</tbody></table>';
             container.innerHTML = html;
-        }
+        }}
 
         incidentsLoaded = true;
-    } catch (e) {
+    }} catch (e) {{
         container.innerHTML = '<div style="padding:20px;color:#b91c1c;">Ошибка загрузки инцидентов</div>';
-    } finally {
+    }} finally {{
         incidentsLoading = false;
         if (loader) loader.style.display = 'none';
-    }
-}
+    }}
+}}
+
 
 		
 let pageProgress = 0;
@@ -1123,22 +1125,22 @@ let chartsLoading = false;
 let incidentsLoaded = false;
 let incidentsLoading = false;
 
-function setPageProgress(percent, text) {
+function setPageProgress(percent, text) {{
     pageProgress = Math.max(pageProgress, percent);
     const bar = document.getElementById('page-progress-bar');
     const textEl = document.getElementById('page-progress-text');
     if (bar) bar.style.width = pageProgress + '%';
     if (textEl) textEl.innerText = text + ' ' + pageProgress + '%';
-}
+}}
 
-function hidePageLoader() {
+function hidePageLoader() {{
     const loader = document.getElementById('page-loader');
     if (!loader) return;
     loader.classList.add('hidden');
-    setTimeout(() => {
+    setTimeout(() => {{
         loader.style.display = 'none';
-    }, 300);
-}
+    }}, 300);
+}}
 
 		
 		</script>
