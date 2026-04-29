@@ -963,7 +963,7 @@ def check_worker():
     while True:
         try:
             print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
-            results = loop.run_until_complete(check_all_sites())
+            results = loop.run_until_complete(asyncio.wait_for(check_all_sites(), timeout=180))
             print(f"[WORKER] check_all_sites returned {len(results)} results")
 
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in results:
