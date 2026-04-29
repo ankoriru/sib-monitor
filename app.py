@@ -954,15 +954,16 @@ def check_worker():
     asyncio.set_event_loop(loop)
 
     while True:
+        t_start = time.time()
         try:
-            t_start = time.time()
             print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
             # Быстрые HTTP-проверки (только status + response_time)
             results = loop.run_until_complete(check_all_sites())
-            print(f"[WORKER] check_all_sites returned {len(results)} results in {round(time.time()-t_start,1)}s")
+            http_time = round(time.time() - t_start, 1)
+            print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
 
-            # Читаем SSL/WHOIS из latest_status (обновляется ssl_whois_worker)
+            # Читаем SSL/WHOIS из latest_status
             conn = get_db_connection()
             cur = conn.cursor(cursor_factory=DictCursor)
             cur.execute("SELECT site, ssl_days, domain_days, ssl_chain_valid FROM latest_status")
@@ -973,12 +974,16 @@ def check_worker():
             for site, curr_status, resp_time in results:
                 try:
                     ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
+                    changed = (curr_status != 200) or (last_status[site] != 200)
+                    if changed:
+                        print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count[site]} last={last_status[site]}")
 
                     if curr_status != 200:
                         fail_count[site] += 1
                         alert_threshold = 5
 
                         if fail_count[site] == 1 and last_status[site] == 200:
+                            print(f"[INCIDENT START] {site}")
                             _db_incident_start(site, curr_status, ssl_chain_valid)
                         elif fail_count[site] > 1:
                             _db_incident_update(site, curr_status, ssl_chain_valid)
@@ -992,7 +997,7 @@ def check_worker():
                                 flush_batch()
 
                         if fail_count[site] >= alert_threshold and last_status[site] == 200:
-                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} status={curr_status}")
+                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
                             shot_path = take_screenshot_fast(site)
                             ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
                             print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
@@ -1006,7 +1011,7 @@ def check_worker():
 
                         if last_status[site] != 200:
                             duration = fail_count[site]
-                            print(f"[ALERT TRIGGER] {site} UP after {duration} min")
+                            print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                             _db_incident_resolve(site)
                             ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                             print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
@@ -1027,13 +1032,17 @@ def check_worker():
             refresh_materialized_view()
             _update_worker_heartbeat()
             failed_now = sum(1 for _, st, *_ in results if st != 200)
-            print(f"[CHECK SUMMARY] checked={len(results)} failed={failed_now} cycle_time={round(time.time()-t_start,1)}s")
+            cycle_time = round(time.time() - t_start, 1)
+            print(f"[CHECK SUMMARY] checked={len(results)} failed={failed_now} cycle_time={cycle_time}s")
 
         except Exception as e:
             print(f"[WORKER ERROR] {type(e).__name__}: {e}")
 
-        finally:
-            time.sleep(60)
+        # Динамический sleep: гарантируем ровно 60 сек между стартами циклов
+        elapsed = time.time() - t_start
+        sleep_time = max(0, 60 - elapsed)
+        print(f"[WORKER] Sleeping {round(sleep_time,1)}s (elapsed={round(elapsed,1)}s)")
+        time.sleep(sleep_time)
 
 
 def ssl_whois_worker():
