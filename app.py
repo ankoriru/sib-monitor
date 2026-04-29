@@ -962,16 +962,21 @@ def check_worker():
 
     while True:
         try:
+            print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
             results = loop.run_until_complete(check_all_sites())
+            print(f"[WORKER] check_all_sites returned {len(results)} results")
 
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in results:
                 try:
+                    print(f"[WORKER] Processing {site} status={curr_status} resp={round(resp_time,2)}s last_status={last_status[site]} fail_count={fail_count[site]}")
                     if curr_status != 200:
                         fail_count[site] += 1
                         alert_threshold = 5 if site in PRIORITY_SITES else 10
+                        print(f"[CHECK FAIL] {site} status={curr_status} fail_count={fail_count[site]}/{alert_threshold} last_status={last_status[site]}")
 
                         # --- Incident tracking ---
                         if fail_count[site] == 1 and last_status[site] == 200:
+                            print(f"[INCIDENT START] {site} first failure, creating incident")
                             _db_incident_start(site, curr_status, ssl_chain_valid)
                         elif fail_count[site] > 1:
                             _db_incident_update(site, curr_status, ssl_chain_valid)
@@ -1026,6 +1031,10 @@ def check_worker():
             flush_batch()
             refresh_materialized_view()
             _update_worker_heartbeat()
+            # Summary каждого цикла
+            total_checked = len(results)
+            failed_now = sum(1 for _, st, *_ in results if st != 200)
+            print(f"[CHECK SUMMARY] checked={total_checked} failed={failed_now} batch_size={len(batch_buffer)}")
 
         except Exception as e:
             print(f"Ошибка воркера: {e}")
@@ -1101,6 +1110,9 @@ async def startup_event():
         print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
     else:
         print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}..., token_len={len(TELEGRAM_TOKEN)}")
+        # Тестовая отправка для проверки связи
+        await asyncio.to_thread(send_tg_msg, "🤖 Мониторинг запущен — тестовое сообщение")
+        print("[STARTUP] Test Telegram message sent")
 
 
 # ============================================================================
