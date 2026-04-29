@@ -546,6 +546,9 @@ def ensure_partitions():
 # ============================================================================
 def send_tg_msg(text, photo_path=None):
     """Отправка в Telegram с retry (3 попытки) + логированием"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[TG SKIP] No token/chat_id configured. Message: {text[:60]}")
+        return False
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     ok = False
     for attempt in range(1, 4):
@@ -559,10 +562,10 @@ def send_tg_msg(text, photo_path=None):
                         timeout=30
                     )
                 if resp.status_code == 200:
-                    print(f"[TG OK] Photo sent (attempt {attempt}): {text[:80]}")
+                    print(f"[TG OK] Photo sent (attempt {attempt}) to {TELEGRAM_CHAT_ID[:5]}...: {text[:80]}")
                     ok = True
                     break
-                print(f"[TG ERR] Photo attempt {attempt}: HTTP {resp.status_code} — {resp.text[:120]}")
+                print(f"[TG ERR] Photo attempt {attempt}: HTTP {resp.status_code} — {resp.text[:200]}")
             else:
                 resp = requests.post(
                     base_url + "sendMessage",
@@ -570,10 +573,10 @@ def send_tg_msg(text, photo_path=None):
                     timeout=10
                 )
                 if resp.status_code == 200:
-                    print(f"[TG OK] Text sent (attempt {attempt}): {text[:80]}")
+                    print(f"[TG OK] Text sent (attempt {attempt}) to {TELEGRAM_CHAT_ID[:5]}...: {text[:80]}")
                     ok = True
                     break
-                print(f"[TG ERR] Text attempt {attempt}: HTTP {resp.status_code} — {resp.text[:120]}")
+                print(f"[TG ERR] Text attempt {attempt}: HTTP {resp.status_code} — {resp.text[:200]}")
         except Exception as e:
             print(f"[TG ERR] attempt {attempt}: {type(e).__name__}: {e}")
         # exponential backoff
@@ -947,6 +950,7 @@ def check_worker():
     """Фоновый воркер проверки сайтов с batch-вставкой, ротацией, incidents и heartbeat"""
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    print("[WORKER START] check_worker started")
 
     last_status = {site: 200 for site in SITES}
     fail_count = {site: 0 for site in SITES}
@@ -1085,12 +1089,18 @@ def rotation_worker():
 @app.on_event("startup")
 async def startup_event():
     # Неблокирующий запуск тяжёлых операций в отдельных потоках
+    print("[STARTUP] Starting init_db, backfill, workers...")
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
+    # Telegram config check
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
+    else:
+        print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}..., token_len={len(TELEGRAM_TOKEN)}")
 
 
 # ============================================================================
@@ -1668,14 +1678,14 @@ def _build_html(data: dict) -> str:
                 data: {{
                     labels: d.l,
                     datasets: [
-                        {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
-                        {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
+                        {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 }},
+                        {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 }}
                     ]
                 }},
                 options: {{
                     scales: {{
-                        y: {{ min: 75, max: 110 }},
-                        y1: {{ position: 'right', grid: {{ display: false }} }}
+                        y: {{ suggestedMin: 95, suggestedMax: 100.5, title: {{ display: true, text: 'Uptime %' }} }},
+                        y1: {{ position: 'right', grid: {{ display: false }}, title: {{ display: true, text: 'Ответ, сек' }} }}
                     }}
                 }}
             }});
