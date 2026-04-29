@@ -1367,11 +1367,13 @@ def _build_html(data: dict) -> str:
         group_valid = [latest[s] for s in group_sites if s in latest]
         if group_valid:
             g_online = sum(1 for v in group_valid if v['status'] == 200)
-            g_avg_resp = sum(v['response_time'] for v in group_valid) / len(group_valid)
-            g_upt = round(sum((stats.get(site, {}) or {}).get('upt', 0) or 0 for site in group_sites) / max(len(group_sites), 1), 1)
+            g_avg_resp = sum(float(v['response_time']) for v in group_valid) / len(group_valid)
+            g_upt = round(
+                sum(float((stats.get(site, {}) or {}).get('upt', 0) or 0) for site in group_sites)
+                / max(len(group_sites), 1), 1)
             group_stats[g] = {
                 'online': g_online, 'total': len(group_sites),
-                'upt': g_upt, 'resp': round(g_avg_resp, 2)
+                'upt': float(g_upt), 'resp': round(float(g_avg_resp), 2)
             }
         else:
             group_stats[g] = {'online': 0, 'total': len(group_sites), 'upt': 0, 'resp': 0}
@@ -1483,9 +1485,9 @@ def _build_html(data: dict) -> str:
             group_valid = [latest[site] for site in group_sites if site in latest]
             if group_valid:
                 g_online = sum(1 for v in group_valid if v['status'] == 200)
-                g_avg_resp = sum(v['response_time'] for v in group_valid) / len(group_valid)
-                g_upt = round(sum(stats.get(site, {}).get('upt', 0) or 0 for site in group_sites) / len(group_sites), 1)
-                g_sub = f'<span class="group-sub">Online: {g_online}/{len(group_valid)} | Uptime: {g_upt}% | ⌀ Ответ: {round(g_avg_resp, 2)}с</span>'
+                g_avg_resp = sum(float(v['response_time']) for v in group_valid) / len(group_valid)
+                g_upt = round(sum(float(stats.get(site, {}).get('upt', 0) or 0) for site in group_sites) / len(group_sites), 1)
+                g_sub = f'<span class="group-sub">Online: {g_online}/{len(group_valid)} | Uptime: {g_upt}% | ⌀ Ответ: {round(float(g_avg_resp), 2)}с</span>'
             else:
                 g_sub = '<span class="group-sub">Нет данных</span>'
             H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}{g_sub}</td></tr>')
