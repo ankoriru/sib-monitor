@@ -66,6 +66,11 @@ PRIORITY_SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"
 ] + NEW_MONITORING_SITES
 
+# --- Группировка сайтов для UI ---
+KEY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"]
+STDO_SITES = NEW_MONITORING_SITES[:]
+EXTERNAL_SITES = [s for s in SITES if s not in KEY_SITES and s not in STDO_SITES]
+
 app = FastAPI()
 
 # ============================================================================
@@ -85,6 +90,14 @@ CACHE_TTL = 30
 _screenshot_queue = queue.Queue()
 _screenshot_thread = None
 _screenshot_thread_lock = threading.Lock()
+
+# WHOIS cache (24h TTL)
+_whois_cache = {}
+WHOIS_CACHE_TTL = 86400
+
+# Screenshot rate limit (30 sec per site)
+_screenshot_rate_limit = {}
+_screenshot_rate_lock = threading.Lock()
 
 
 def _screenshot_worker():
@@ -218,10 +231,29 @@ def _safe_index(cur, conn, index_name, table_name, columns):
         conn.rollback()
 
 
+def _column_exists(cur, table, column):
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = %s AND column_name = %s
+        )
+    """, (table, column))
+    return cur.fetchone()[0]
+
+
 def init_db():
-    """Инициализация БД с поддержкой партиционирования (Этап 1) + incidents"""
+    """Инициализация БД с поддержкой партиционирования + incidents + health + ssl_chain"""
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # Таблица health (heartbeat worker'а)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS health (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     # Проверяем, существует ли уже партиционированная таблица logs
     cur.execute("""
@@ -241,7 +273,8 @@ def init_db():
                 status INTEGER,
                 response_time REAL,
                 ssl_days INTEGER,
-                domain_days INTEGER
+                domain_days INTEGER,
+                ssl_chain_valid BOOLEAN
             ) PARTITION BY RANGE (timestamp)
         """)
 
@@ -265,6 +298,9 @@ def init_db():
 
         _safe_index(cur, conn, "idx_logs_site_ts", "logs", "site, timestamp DESC")
     else:
+        # Миграция: добавляем ssl_chain_valid если нужно
+        if not _column_exists(cur, 'logs', 'ssl_chain_valid'):
+            cur.execute("ALTER TABLE logs ADD COLUMN ssl_chain_valid BOOLEAN")
         # Проверяем, что таблица партиционирована
         cur.execute("""
             SELECT pg_get_partkeydef(c.oid)
@@ -283,7 +319,8 @@ def init_db():
                     status INTEGER,
                     response_time REAL,
                     ssl_days INTEGER,
-                    domain_days INTEGER
+                    domain_days INTEGER,
+                    ssl_chain_valid BOOLEAN
                 ) PARTITION BY RANGE (timestamp)
             """)
             now = datetime.datetime.now()
@@ -303,7 +340,7 @@ def init_db():
                     conn.rollback()
             _safe_index(cur, conn, "idx_logs_site_ts", "logs", "site, timestamp DESC")
 
-    # Таблица агрегатов (Этап 1)
+    # Таблица агрегатов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS checks_agg (
             site TEXT NOT NULL,
@@ -315,25 +352,48 @@ def init_db():
             max_response_time REAL,
             last_ssl_days INTEGER,
             last_domain_days INTEGER,
+            last_ssl_chain_valid BOOLEAN,
             PRIMARY KEY (site, bucket)
         )
     """)
+    if not _column_exists(cur, 'checks_agg', 'last_ssl_chain_valid'):
+        cur.execute("ALTER TABLE checks_agg ADD COLUMN last_ssl_chain_valid BOOLEAN")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
-    # Материализованное представление (Этап 3)
+    # Материализованное представление — пересоздаём если нет ssl_chain_valid
+    need_recreate_mv = False
     cur.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS latest_status AS
-        SELECT DISTINCT ON (site)
-            site, status, response_time, ssl_days, domain_days, timestamp
-        FROM logs
-        ORDER BY site, timestamp DESC
+        SELECT EXISTS (
+            SELECT FROM pg_matviews WHERE matviewname = 'latest_status'
+        )
     """)
-    try:
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
-    except psycopg2.Error:
-        conn.rollback()
+    mv_exists = cur.fetchone()[0]
+    if not mv_exists:
+        need_recreate_mv = True
+    elif not _column_exists(cur, 'latest_status', 'ssl_chain_valid'):
+        cur.execute("DROP MATERIALIZED VIEW IF EXISTS latest_status CASCADE")
+        need_recreate_mv = True
 
-    # Таблица инцидентов — заменяет тяжёлый CTE в dashboard
+    if need_recreate_mv:
+        cur.execute("""
+            CREATE MATERIALIZED VIEW latest_status AS
+            SELECT DISTINCT ON (site)
+                site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp
+            FROM logs
+            ORDER BY site, timestamp DESC
+        """)
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
+        except psycopg2.Error:
+            conn.rollback()
+    else:
+        # Индекс на существующее представление
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
+        except psycopg2.Error:
+            conn.rollback()
+
+    # Таблица инцидентов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             id SERIAL PRIMARY KEY,
@@ -343,9 +403,12 @@ def init_db():
             duration_min INTEGER,
             max_status INTEGER,
             description TEXT,
-            resolved BOOLEAN DEFAULT FALSE
+            resolved BOOLEAN DEFAULT FALSE,
+            ssl_chain_valid BOOLEAN
         )
     """)
+    if not _column_exists(cur, 'incidents', 'ssl_chain_valid'):
+        cur.execute("ALTER TABLE incidents ADD COLUMN ssl_chain_valid BOOLEAN")
     _safe_index(cur, conn, "idx_incidents_site_start", "incidents", "site, start_time DESC")
     try:
         cur.execute("""
@@ -372,7 +435,7 @@ def backfill_checks_agg():
             cur.execute("""
                 INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
                                         avg_response_time, min_response_time, max_response_time,
-                                        last_ssl_days, last_domain_days)
+                                        last_ssl_days, last_domain_days, last_ssl_chain_valid)
                 SELECT
                     site,
                     date_trunc('hour', timestamp)
@@ -383,7 +446,8 @@ def backfill_checks_agg():
                     MIN(response_time),
                     MAX(response_time),
                     MAX(ssl_days) FILTER (WHERE ssl_days IS NOT NULL),
-                    MAX(domain_days) FILTER (WHERE domain_days IS NOT NULL)
+                    MAX(domain_days) FILTER (WHERE domain_days IS NOT NULL),
+                    bool_and(ssl_chain_valid) FILTER (WHERE ssl_chain_valid IS NOT NULL)
                 FROM logs
                 WHERE timestamp > NOW() - INTERVAL '30 days'
                 GROUP BY site,
@@ -436,10 +500,10 @@ def _backfill_incidents():
                     HAVING COUNT(*) >= 2
                 )
                 INSERT INTO incidents (site, start_time, end_time, duration_min,
-                                       max_status, description, resolved)
+                                       max_status, description, resolved, ssl_chain_valid)
                 SELECT site, start_time, end_time,
                        CEIL(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
-                       max_status, description, TRUE
+                       max_status, description, TRUE, NULL
                 FROM incident_summary
                 ORDER BY start_time
             """)
@@ -520,15 +584,27 @@ def get_domain_info(site):
     return -1
 
 
+def get_domain_info_cached(site):
+    """WHOIS с кэшем 24 часа"""
+    now = time.time()
+    if site in _whois_cache:
+        cached_time, value = _whois_cache[site]
+        if now - cached_time < WHOIS_CACHE_TTL:
+            return value
+    result = get_domain_info(site)
+    _whois_cache[site] = (now, result)
+    return result
+
+
 # ============================================================================
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
 async def check_single_site(session, site, semaphore):
-    """Проверка одного сайта через aiohttp с семафором"""
+    """Проверка одного сайта через aiohttp с семафором + SSL chain validation + WHOIS cache"""
     async with semaphore:
         check_url = f"https://{site}"
         domain_only = site.split('/')[0]
-        curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
+        curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid = 0, 25.0, -1, -1, None
 
         ssl_verify = not should_verify(site)
         connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
@@ -553,21 +629,35 @@ async def check_single_site(session, site, semaphore):
             if ssl_verify and connector and actual_session is not None:
                 await actual_session.close()
 
-        # Проверка SSL (синхронно в отдельном потоке)
+        # SSL check + chain validation
         try:
-            ctx = ssl.create_default_context()
-            with socket.create_connection((domain_only, 443), timeout=3) as sock:
-                with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
-                    cert = ssock.getpeercert()
-                    exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                    ssl_d = (exp - datetime.datetime.utcnow()).days
+            if site in SELF_SIGNED_SITES:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                        cert = ssock.getpeercert()
+                        exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                        ssl_d = (exp - datetime.datetime.utcnow()).days
+                        ssl_chain_valid = None  # N/A for self-signed
+            else:
+                ctx = ssl.create_default_context()
+                with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                        cert = ssock.getpeercert()
+                        exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                        ssl_d = (exp - datetime.datetime.utcnow()).days
+                        ssl_chain_valid = True
+        except ssl.SSLCertVerificationError:
+            ssl_d, ssl_chain_valid = -1, False
         except Exception:
-            pass
+            ssl_d, ssl_chain_valid = -1, None
 
-        # WHOIS
-        dom_d = get_domain_info(domain_only)
+        # WHOIS via thread pool + cache
+        dom_d = await asyncio.to_thread(get_domain_info_cached, domain_only)
 
-        return (site, curr_status, resp_time, ssl_d, dom_d)
+        return (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
 
 
 async def check_all_sites():
@@ -587,10 +677,10 @@ def _update_checks_agg(cur, batch_data):
     from collections import defaultdict
     agg = defaultdict(lambda: {
         'cnt': 0, 'ok': 0, 'r_sum': 0.0,
-        'r_min': float('inf'), 'r_max': 0.0, 'ssl': None, 'dom': None
+        'r_min': float('inf'), 'r_max': 0.0, 'ssl': None, 'dom': None, 'ssl_chain': None
     })
     for row in batch_data:
-        site, status, resp, ssl_d, dom_d = row[:5]
+        site, status, resp, ssl_d, dom_d, ssl_chain_valid = row[:6]
         now = datetime.datetime.now()
         bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         k = (site, bucket)
@@ -605,12 +695,14 @@ def _update_checks_agg(cur, batch_data):
             a['ssl'] = ssl_d
         if dom_d is not None and dom_d >= 0:
             a['dom'] = dom_d
+        if ssl_chain_valid is not None:
+            a['ssl_chain'] = ssl_chain_valid
     for (site, bucket), a in agg.items():
         cur.execute("""
             INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
                                     avg_response_time, min_response_time, max_response_time,
-                                    last_ssl_days, last_domain_days)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                    last_ssl_days, last_domain_days, last_ssl_chain_valid)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (site, bucket) DO UPDATE SET
                 checks_count = checks_agg.checks_count + EXCLUDED.checks_count,
                 status_200_count = checks_agg.status_200_count + EXCLUDED.status_200_count,
@@ -620,9 +712,10 @@ def _update_checks_agg(cur, batch_data):
                 min_response_time = LEAST(checks_agg.min_response_time, EXCLUDED.min_response_time),
                 max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time),
                 last_ssl_days = COALESCE(EXCLUDED.last_ssl_days, checks_agg.last_ssl_days),
-                last_domain_days = COALESCE(EXCLUDED.last_domain_days, checks_agg.last_domain_days)
+                last_domain_days = COALESCE(EXCLUDED.last_domain_days, checks_agg.last_domain_days),
+                last_ssl_chain_valid = COALESCE(EXCLUDED.last_ssl_chain_valid, checks_agg.last_ssl_chain_valid)
         """, (site, bucket, a['cnt'], a['ok'],
-              a['r_sum'] / a['cnt'], a['r_min'], a['r_max'], a['ssl'], a['dom']))
+              a['r_sum'] / a['cnt'], a['r_min'], a['r_max'], a['ssl'], a['dom'], a['ssl_chain']))
 
 
 def flush_batch():
@@ -637,7 +730,7 @@ def flush_batch():
             execute_values(
                 cur,
                 """INSERT INTO logs
-                   (site, status, response_time, ssl_days, domain_days)
+                   (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
                    VALUES %s""",
                 batch_buffer
             )
@@ -654,7 +747,7 @@ def flush_batch():
 # ============================================================================
 # ИНЦИДЕНТЫ — запись из worker
 # ============================================================================
-def _db_incident_start(site, status):
+def _db_incident_start(site, status, ssl_chain_valid=None):
     """Фиксирует начало инцидента (первый фейл сайта)"""
     try:
         conn = get_db_connection()
@@ -665,9 +758,9 @@ def _db_incident_start(site, status):
             503: 'Service Unavailable'
         }.get(status, 'Server Error')
         cur.execute("""
-            INSERT INTO incidents (site, start_time, max_status, description)
-            VALUES (%s, NOW(), %s, %s)
-        """, (site, status, description))
+            INSERT INTO incidents (site, start_time, max_status, description, ssl_chain_valid)
+            VALUES (%s, NOW(), %s, %s, %s)
+        """, (site, status, description, ssl_chain_valid))
         conn.commit()
         cur.close()
         conn.close()
@@ -675,7 +768,7 @@ def _db_incident_start(site, status):
         print(f"[INCIDENT START ERR] {site}: {e}")
 
 
-def _db_incident_update(site, status):
+def _db_incident_update(site, status, ssl_chain_valid=None):
     """Обновляет max_status текущего неразрешённого инцидента"""
     try:
         conn = get_db_connection()
@@ -688,9 +781,10 @@ def _db_incident_update(site, status):
         cur.execute("""
             UPDATE incidents
             SET max_status = GREATEST(COALESCE(max_status, 0), %s),
-                description = %s
+                description = %s,
+                ssl_chain_valid = COALESCE(%s, ssl_chain_valid)
             WHERE site = %s AND resolved = FALSE
-        """, (status, description, site))
+        """, (status, description, ssl_chain_valid, site))
         conn.commit()
         cur.close()
         conn.close()
@@ -750,7 +844,7 @@ def rotate_logs(retention_days: int = 30):
         cur.execute("""
             INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
                                    avg_response_time, min_response_time, max_response_time,
-                                   last_ssl_days, last_domain_days)
+                                   last_ssl_days, last_domain_days, last_ssl_chain_valid)
             SELECT
                 site,
                 date_trunc('hour', timestamp)
@@ -761,7 +855,8 @@ def rotate_logs(retention_days: int = 30):
                 MIN(response_time),
                 MAX(response_time),
                 MAX(ssl_days) FILTER (WHERE ssl_days IS NOT NULL),
-                MAX(domain_days) FILTER (WHERE domain_days IS NOT NULL)
+                MAX(domain_days) FILTER (WHERE domain_days IS NOT NULL),
+                bool_and(ssl_chain_valid) FILTER (WHERE ssl_chain_valid IS NOT NULL)
             FROM logs
             WHERE timestamp < %s
               AND timestamp >= %s - INTERVAL '1 day'
@@ -775,7 +870,8 @@ def rotate_logs(retention_days: int = 30):
                                      + EXCLUDED.avg_response_time * EXCLUDED.checks_count)
                                     / (checks_agg.checks_count + EXCLUDED.checks_count),
                 min_response_time = LEAST(checks_agg.min_response_time, EXCLUDED.min_response_time),
-                max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time)
+                max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time),
+                last_ssl_chain_valid = COALESCE(EXCLUDED.last_ssl_chain_valid, checks_agg.last_ssl_chain_valid)
         """, (cutoff_date, cutoff_date))
 
         cur.execute("""
@@ -800,8 +896,34 @@ def rotate_logs(retention_days: int = 30):
 # ============================================================================
 # CHECK WORKER (обновлённый)
 # ============================================================================
+def _invalidate_dashboard_cache():
+    """Сбрасывает кэш dashboard для мгновенного обновления при DOWN/UP"""
+    global _dashboard_cache
+    with _dashboard_cache["lock"]:
+        _dashboard_cache["timestamp"] = 0
+
+
+def _update_worker_heartbeat():
+    """Записывает метку времени последнего цикла проверок"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO health (key, value, updated)
+            VALUES ('last_worker_tick', NOW()::text, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated = NOW()
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[HEARTBEAT ERR] {e}")
+
+
 def check_worker():
-    """Фоновый воркер проверки сайтов с batch-вставкой, ротацией и incidents"""
+    """Фоновый воркер проверки сайтов с batch-вставкой, ротацией, incidents и heartbeat"""
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -817,7 +939,7 @@ def check_worker():
         try:
             results = loop.run_until_complete(check_all_sites())
 
-            for site, curr_status, resp_time, ssl_d, dom_d in results:
+            for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in results:
                 try:
                     if curr_status != 200:
                         fail_count[site] += 1
@@ -825,14 +947,14 @@ def check_worker():
 
                         # --- Incident tracking ---
                         if fail_count[site] == 1 and last_status[site] == 200:
-                            _db_incident_start(site, curr_status)
+                            _db_incident_start(site, curr_status, ssl_chain_valid)
                         elif fail_count[site] > 1:
-                            _db_incident_update(site, curr_status)
+                            _db_incident_update(site, curr_status, ssl_chain_valid)
 
                         with BATCH_LOCK:
                             if fail_count[site] >= 2:
                                 batch_buffer.append(
-                                    (site, curr_status, resp_time, ssl_d, dom_d)
+                                    (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
                                 )
                             if len(batch_buffer) >= BATCH_SIZE:
                                 flush_batch()
@@ -842,9 +964,10 @@ def check_worker():
                             msg = f"🚨 DOWN: {site} (Код: {curr_status})"
                             send_tg_msg(msg, shot_path)
                             last_status[site] = curr_status
+                            _invalidate_dashboard_cache()
                     else:
                         with BATCH_LOCK:
-                            batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d))
+                            batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                             if len(batch_buffer) >= BATCH_SIZE:
                                 flush_batch()
 
@@ -852,6 +975,7 @@ def check_worker():
                             duration = fail_count[site]
                             _db_incident_resolve(site)
                             send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                            _invalidate_dashboard_cache()
 
                         last_status[site], fail_count[site] = 200, 0
 
@@ -868,6 +992,7 @@ def check_worker():
 
             flush_batch()
             refresh_materialized_view()
+            _update_worker_heartbeat()
 
         except Exception as e:
             print(f"Ошибка воркера: {e}")
@@ -950,12 +1075,29 @@ async def favicon():
     return Response(status_code=204)
 
 
+def check_screenshot_rate(site: str) -> bool:
+    """Rate limit: 1 скриншот на сайт раз в 30 секунд"""
+    now = time.time()
+    with _screenshot_rate_lock:
+        last = _screenshot_rate_limit.get(site, 0)
+        if now - last < 30:
+            return False
+        _screenshot_rate_limit[site] = now
+        return True
+
+
 @app.get("/test-screen/{site_name:path}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
     if site_name not in SITES:
         return JSONResponse(
             {"status": "error", "msg": "Сайт не найден в списке"},
             status_code=404
+        )
+
+    if not check_screenshot_rate(site_name):
+        return JSONResponse(
+            {"status": "error", "msg": "Rate limit: повторите через 30 сек"},
+            status_code=429
         )
 
     shot = await asyncio.to_thread(take_screenshot_fast, site_name)
@@ -967,6 +1109,35 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
         {"status": "error", "msg": "Ошибка Playwright (таймаут или доступ)"},
         status_code=500
     )
+
+
+@app.get("/health")
+async def health():
+    """Health-check: проверяет heartbeat worker'а"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value, updated FROM health WHERE key = 'last_worker_tick'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            last_tick = datetime.datetime.fromisoformat(str(row[0]))
+            if (datetime.datetime.now() - last_tick).total_seconds() > 120:
+                return JSONResponse(
+                    {"status": "degraded", "reason": "worker stale"},
+                    status_code=503
+                )
+            return {"status": "ok", "last_worker_tick": str(row[1])}
+        return JSONResponse(
+            {"status": "starting", "reason": "no heartbeat yet"},
+            status_code=503
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "reason": str(e)},
+            status_code=500
+        )
 
 
 def _get_stats_from_agg(cur, interval: str):
@@ -1100,7 +1271,8 @@ async def index(auth: bool = Depends(check_auth)):
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
                  WHEN max_status = 503 THEN 'Service Unavailable'
-                 ELSE 'Server Error' END as description
+                 ELSE 'Server Error' END as description,
+            ssl_chain_valid
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
         ORDER BY start_time DESC LIMIT 20
@@ -1128,7 +1300,8 @@ async def index(auth: bool = Depends(check_auth)):
                 CASE WHEN MAX(status) = 0 THEN 'Timeout'
                      WHEN MAX(status) = 502 THEN 'Bad Gateway'
                      WHEN MAX(status) = 503 THEN 'Service Unavailable'
-                     ELSE 'Server Error' END as description
+                     ELSE 'Server Error' END as description,
+                NULL::boolean as ssl_chain_valid
             FROM incident_groups
             GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
         """)
@@ -1173,17 +1346,19 @@ def _build_html(data: dict) -> str:
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
     total_sites = len(SITES)
 
-    def get_site_weight(site_name):
-        if site_name == "sibur.ru":
+    def get_site_group(site_name):
+        if site_name in KEY_SITES:
             return 0
-        if site_name in NEW_MONITORING_SITES:
-            return 2
-        if site_name in PRIORITY_SITES:
+        if site_name in STDO_SITES:
             return 1
-        return 3
+        return 2
 
-    sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
+    group_names = {0: "⭐ Ключевые", 1: "🛡️ СТДО", 2: "🌐 Внешние сайты"}
+    sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), x))
     sorted_sites_json = json.dumps(sorted_sites)
+    key_sites_json = json.dumps(KEY_SITES)
+    stdo_sites_json = json.dumps(STDO_SITES)
+    external_sites_json = json.dumps(EXTERNAL_SITES)
 
     # Используем list для O(n) сборки вместо O(n^2) string concatenation
     H = []
@@ -1238,6 +1413,7 @@ def _build_html(data: dict) -> str:
                   background: #333; color: white; padding: 12px 24px;
                   border-radius: 8px; display: none; z-index: 1000;
                   box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
+        .group-header {{ background: #e2e8f0; font-weight: bold; color: #475569; padding: 8px 12px; }}
     </style></head><body>
     <div id="toast" class="toast"></div>
     <div class="container">
@@ -1277,14 +1453,20 @@ def _build_html(data: dict) -> str:
         </div>
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
-            <th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
+            <th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """)
 
+    current_group = -1
     for s in sorted_sites:
-        v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1})
+        g = get_site_group(s)
+        if g != current_group:
+            H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}</td></tr>')
+            current_group = g
+        v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
-        is_err = v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or (0 <= v['domain_days'] <= 30)
-        prefix = "🔰 " if s in NEW_MONITORING_SITES else ("⭐️ " if s in PRIORITY_SITES else "")
+        is_err = (v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or
+                  (0 <= v['domain_days'] <= 30) or v.get('ssl_chain_valid') == False)
+        prefix = "🛡️ " if s in STDO_SITES else ("⭐ " if s in KEY_SITES else "")
 
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
@@ -1293,6 +1475,8 @@ def _build_html(data: dict) -> str:
                 {'Online' if v['status']==200 else 'Offline'}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+            <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
+                {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
             <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
             <td><button class="btn-test" onclick="runTest('{s}', this)">
                 <div class="loader"></div><span>📸 Screen</span></button></td></tr>""")
@@ -1304,12 +1488,14 @@ def _build_html(data: dict) -> str:
     </div></div>
     <div id="t3" class="tab-content">
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
-    <th>Код</th><th>Описание</th></tr></thead><tbody>""")
+    <th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody>""")
 
     for r in incidents_list:
         H.append(f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
-            <td>{r['max_status']}</td><td>{r['description']}</td></tr>""")
+            <td>{r['max_status']}</td><td>{r['description']}</td>
+            <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
+                {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td></tr>""")
 
     H.append("""</tbody></table></div>
     <div id="t4" class="tab-content">
@@ -1330,6 +1516,11 @@ def _build_html(data: dict) -> str:
     H.append(f"""</tbody></table></div></div><script>
     let chartsLoaded = false;
     let chartsLoading = false;
+    let showingAll = false;
+
+    const keySites = {key_sites_json};
+    const stdoSites = {stdo_sites_json};
+    const externalSites = {external_sites_json};
 
     function tab(e, n){{
         var i, x = document.getElementsByClassName('tab-content'),
@@ -1360,6 +1551,40 @@ def _build_html(data: dict) -> str:
         setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
     }}
 
+    function renderChartSection(title, sitesList, g_data, container) {{
+        const filtered = sitesList.filter(s => g_data[s]);
+        if (filtered.length === 0) return;
+        const h3 = document.createElement('h3');
+        h3.innerText = title;
+        h3.style.marginTop = '20px';
+        h3.style.color = '#475569';
+        container.appendChild(h3);
+        for (const s of filtered) {{
+            const d = g_data[s];
+            const div = document.createElement('div');
+            div.className = 'kpi-card';
+            div.style.borderTop = '2px solid #eee';
+            div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\\./g, '_')}}"></canvas>`;
+            container.appendChild(div);
+            new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {{
+                type: 'line',
+                data: {{
+                    labels: d.l,
+                    datasets: [
+                        {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
+                        {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
+                    ]
+                }},
+                options: {{
+                    scales: {{
+                        y: {{ min: 75, max: 110 }},
+                        y1: {{ position: 'right', grid: {{ display: false }} }}
+                    }}
+                }}
+            }});
+        }}
+    }}
+
     async function loadCharts() {{
         if (chartsLoaded || chartsLoading) return;
         chartsLoading = true;
@@ -1368,31 +1593,25 @@ def _build_html(data: dict) -> str:
             const g_data = await res.json();
             const container = document.getElementById('charts-container');
             container.innerHTML = '';
-            const sites = {sorted_sites_json}.filter(s => g_data[s]);
-            for (const s of sites) {{
-                const d = g_data[s];
-                const div = document.createElement('div');
-                div.className = 'kpi-card';
-                div.style.borderTop = '2px solid #eee';
-                div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\\./g, '_')}}"></canvas>`;
-                container.appendChild(div);
-                new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {{
-                    type: 'line',
-                    data: {{
-                        labels: d.l,
-                        datasets: [
-                            {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
-                            {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
-                        ]
-                    }},
-                    options: {{
-                        scales: {{
-                            y: {{ min: 75, max: 110 }},
-                            y1: {{ position: 'right', grid: {{ display: false }} }}
-                        }}
-                    }}
-                }});
+
+            renderChartSection('⭐ Ключевые', keySites, g_data, container);
+            renderChartSection('🛡️ СТДО', stdoSites, g_data, container);
+
+            if (showingAll) {{
+                renderChartSection('🌐 Внешние сайты', externalSites, g_data, container);
+            }} else {{
+                const btnDiv = document.createElement('div');
+                btnDiv.style.textAlign = 'center';
+                btnDiv.style.padding = '20px';
+                const btn = document.createElement('button');
+                btn.innerText = '🌐 Показать все внешние сайты';
+                btn.className = 'tab-btn';
+                btn.style.cursor = 'pointer';
+                btn.onclick = () => {{ showingAll = true; chartsLoaded = false; loadCharts(); }};
+                btnDiv.appendChild(btn);
+                container.appendChild(btnDiv);
             }}
+
             chartsLoaded = true;
         }} catch (e) {{
             document.getElementById('charts-container').innerHTML =
