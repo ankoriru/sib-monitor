@@ -1176,8 +1176,8 @@ def _get_stats_from_agg(cur, interval: str):
         SELECT
             ROUND(SUM(status_200_count) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as up,
-            ROUND(SUM(avg_response_time * checks_count)
-                  / NULLIF(SUM(checks_count), 0)::numeric, 3) as resp
+            ROUND((SUM(avg_response_time * checks_count)
+                  / NULLIF(SUM(checks_count), 0))::numeric, 3) as resp
         FROM checks_agg WHERE bucket > NOW() - INTERVAL %s
     """, (interval,))
     row = cur.fetchone()
@@ -1207,8 +1207,8 @@ async def api_charts(auth: bool = Depends(check_auth)):
 
     cur.execute("""
         SELECT site, bucket::date as d,
-               ROUND(SUM(avg_response_time * checks_count)
-                     / NULLIF(SUM(checks_count), 0)::numeric, 2) as r,
+               ROUND((SUM(avg_response_time * checks_count)
+                     / NULLIF(SUM(checks_count), 0))::numeric, 2) as r,
                ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
         FROM checks_agg
         WHERE bucket > NOW() - INTERVAL '14 days'
@@ -1303,8 +1303,8 @@ async def index(auth: bool = Depends(check_auth)):
                  ELSE 2 END as grp,
             ROUND(SUM(status_200_count) * 100.0 
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            ROUND(SUM(avg_response_time * checks_count) 
-                  / NULLIF(SUM(checks_count), 0)::numeric, 3) as resp
+            ROUND((SUM(avg_response_time * checks_count) 
+                  / NULLIF(SUM(checks_count), 0))::numeric, 3) as resp
         FROM checks_agg 
         WHERE bucket > NOW() - INTERVAL '30 days'
         GROUP BY grp
