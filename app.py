@@ -1353,12 +1353,29 @@ def _build_html(data: dict) -> str:
             return 1
         return 2
 
-    group_names = {0: "⭐ Ключевые", 1: "🛡️ СТДО", 2: "🌐 Внешние сайты"}
+    group_names = {0: "Ключевые", 1: "СТДО", 2: "Внешние сайты"}
     sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), x))
     sorted_sites_json = json.dumps(sorted_sites)
     key_sites_json = json.dumps(KEY_SITES)
     stdo_sites_json = json.dumps(STDO_SITES)
     external_sites_json = json.dumps(EXTERNAL_SITES)
+
+    # Промежуточные итоги по группам для графиков
+    group_stats = {}
+    for g in [0, 1, 2]:
+        group_sites = [s for s in sorted_sites if get_site_group(s) == g]
+        group_valid = [latest[s] for s in group_sites if s in latest]
+        if group_valid:
+            g_online = sum(1 for v in group_valid if v['status'] == 200)
+            g_avg_resp = sum(v['response_time'] for v in group_valid) / len(group_valid)
+            g_upt = round(sum((stats.get(site, {}) or {}).get('upt', 0) or 0 for site in group_sites) / max(len(group_sites), 1), 1)
+            group_stats[g] = {
+                'online': g_online, 'total': len(group_sites),
+                'upt': g_upt, 'resp': round(g_avg_resp, 2)
+            }
+        else:
+            group_stats[g] = {'online': 0, 'total': len(group_sites), 'upt': 0, 'resp': 0}
+    group_stats_json = json.dumps(group_stats)
 
     # Используем list для O(n) сборки вместо O(n^2) string concatenation
     H = []
@@ -1414,6 +1431,7 @@ def _build_html(data: dict) -> str:
                   border-radius: 8px; display: none; z-index: 1000;
                   box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
         .group-header {{ background: #e2e8f0; font-weight: bold; color: #475569; padding: 8px 12px; }}
+        .group-sub {{ font-weight: normal; font-size: 12px; color: #64748b; margin-left: 12px; }}
     </style></head><body>
     <div id="toast" class="toast"></div>
     <div class="container">
@@ -1460,7 +1478,17 @@ def _build_html(data: dict) -> str:
     for s in sorted_sites:
         g = get_site_group(s)
         if g != current_group:
-            H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}</td></tr>')
+            # Расчёт итогов по группе
+            group_sites = [site for site in sorted_sites if get_site_group(site) == g]
+            group_valid = [latest[site] for site in group_sites if site in latest]
+            if group_valid:
+                g_online = sum(1 for v in group_valid if v['status'] == 200)
+                g_avg_resp = sum(v['response_time'] for v in group_valid) / len(group_valid)
+                g_upt = round(sum(stats.get(site, {}).get('upt', 0) or 0 for site in group_sites) / len(group_sites), 1)
+                g_sub = f'<span class="group-sub">Online: {g_online}/{len(group_valid)} | Uptime: {g_upt}% | ⌀ Ответ: {round(g_avg_resp, 2)}с</span>'
+            else:
+                g_sub = '<span class="group-sub">Нет данных</span>'
+            H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}{g_sub}</td></tr>')
             current_group = g
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
@@ -1521,6 +1549,7 @@ def _build_html(data: dict) -> str:
     const keySites = {key_sites_json};
     const stdoSites = {stdo_sites_json};
     const externalSites = {external_sites_json};
+    const groupStats = {group_stats_json};
 
     function tab(e, n){{
         var i, x = document.getElementsByClassName('tab-content'),
@@ -1551,13 +1580,15 @@ def _build_html(data: dict) -> str:
         setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
     }}
 
-    function renderChartSection(title, sitesList, g_data, container) {{
+    function renderChartSection(titleKey, titleIdx, sitesList, g_data, container) {{
         const filtered = sitesList.filter(s => g_data[s]);
         if (filtered.length === 0) return;
+        const st = groupStats[titleIdx] || {{online:0, total:0, upt:0, resp:0}};
         const h3 = document.createElement('h3');
-        h3.innerText = title;
+        h3.style.gridColumn = '1 / -1';
         h3.style.marginTop = '20px';
         h3.style.color = '#475569';
+        h3.innerHTML = `${{titleKey}} <span style="float:right;font-weight:normal;font-size:13px;">Online: ${{st.online}}/${{st.total}} | Uptime: ${{st.upt}}% | ⌀ Ответ: ${{st.resp}}с</span>`;
         container.appendChild(h3);
         for (const s of filtered) {{
             const d = g_data[s];
@@ -1594,17 +1625,18 @@ def _build_html(data: dict) -> str:
             const container = document.getElementById('charts-container');
             container.innerHTML = '';
 
-            renderChartSection('⭐ Ключевые', keySites, g_data, container);
-            renderChartSection('🛡️ СТДО', stdoSites, g_data, container);
+            renderChartSection('Ключевые', 0, keySites, g_data, container);
+            renderChartSection('СТДО', 1, stdoSites, g_data, container);
 
             if (showingAll) {{
-                renderChartSection('🌐 Внешние сайты', externalSites, g_data, container);
+                renderChartSection('Внешние сайты', 2, externalSites, g_data, container);
             }} else {{
                 const btnDiv = document.createElement('div');
                 btnDiv.style.textAlign = 'center';
                 btnDiv.style.padding = '20px';
+                btnDiv.style.gridColumn = '1 / -1';
                 const btn = document.createElement('button');
-                btn.innerText = '🌐 Показать все внешние сайты';
+                btn.innerText = 'Показать все внешние сайты';
                 btn.className = 'tab-btn';
                 btn.style.cursor = 'pointer';
                 btn.onclick = () => {{ showingAll = true; chartsLoaded = false; loadCharts(); }};
