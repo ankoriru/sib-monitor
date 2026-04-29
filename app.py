@@ -392,11 +392,63 @@ def backfill_checks_agg():
                 ON CONFLICT (site, bucket) DO NOTHING
             """)
             conn.commit()
-            print(f"Backfill завершён: {cur.rowcount} записей")
+            print(f"Backfill checks_agg завершён: {cur.rowcount} записей")
         cur.close()
         conn.close()
     except Exception as e:
         print(f"Ошибка backfill checks_agg: {e}")
+
+
+def _backfill_incidents():
+    """Предзаполнение incidents из существующих logs (разово при первом создании таблицы)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM incidents")
+        if cur.fetchone()[0] == 0:
+            print("Backfill incidents из logs...")
+            cur.execute("""
+                WITH status_changes AS (
+                    SELECT site, timestamp, status,
+                        CASE WHEN status != 200 AND
+                            (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
+                             OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
+                        THEN 1 ELSE 0 END as is_start
+                    FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                ),
+                incident_groups AS (
+                    SELECT site, timestamp, status,
+                        SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+                    FROM status_changes WHERE status != 200
+                ),
+                incident_summary AS (
+                    SELECT site,
+                        MIN(timestamp) as start_time,
+                        MAX(timestamp) as end_time,
+                        COUNT(*) as dur,
+                        MAX(status) as max_status,
+                        CASE WHEN MAX(status) = 0 THEN 'Timeout'
+                             WHEN MAX(status) = 502 THEN 'Bad Gateway'
+                             WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                             ELSE 'Server Error' END as description
+                    FROM incident_groups
+                    GROUP BY site, grp_id
+                    HAVING COUNT(*) >= 2
+                )
+                INSERT INTO incidents (site, start_time, end_time, duration_min,
+                                       max_status, description, resolved)
+                SELECT site, start_time, end_time,
+                       CEIL(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
+                       max_status, description, TRUE
+                FROM incident_summary
+                ORDER BY start_time
+            """)
+            conn.commit()
+            print(f"Backfill incidents завершён: {cur.rowcount} записей")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка backfill incidents: {e}")
 
 
 def ensure_partitions():
@@ -881,6 +933,7 @@ async def startup_event():
     # Неблокирующий запуск тяжёлых операций в отдельных потоках
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(backfill_checks_agg)
+    await asyncio.to_thread(_backfill_incidents)
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
@@ -1039,7 +1092,7 @@ async def index(auth: bool = Depends(check_auth)):
         """)
         stats = {r['site']: r for r in cur.fetchall()}
 
-    # Инциденты — читаем из предварительно заполненной таблицы (O(1) вместо CTE scan)
+    # Инциденты — читаем из таблицы incidents (быстро), fallback на CTE из logs (разово)
     cur.execute("""
         SELECT site, start_time,
             COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
@@ -1053,6 +1106,33 @@ async def index(auth: bool = Depends(check_auth)):
         ORDER BY start_time DESC LIMIT 20
     """)
     incidents_list = [dict(r) for r in cur.fetchall()]
+
+    # Fallback: если таблица incidents пустая — один раз используем CTE из logs
+    if not incidents_list:
+        cur.execute("""
+            WITH status_changes AS (
+                SELECT site, timestamp, status,
+                    CASE WHEN status != 200 AND
+                        (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
+                         OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
+                    THEN 1 ELSE 0 END as is_start
+                FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+            ),
+            incident_groups AS (
+                SELECT site, timestamp, status,
+                    SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+                FROM status_changes WHERE status != 200
+            )
+            SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
+                MAX(status) as max_status,
+                CASE WHEN MAX(status) = 0 THEN 'Timeout'
+                     WHEN MAX(status) = 502 THEN 'Bad Gateway'
+                     WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                     ELSE 'Server Error' END as description
+            FROM incident_groups
+            GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+        """)
+        incidents_list = [dict(r) for r in cur.fetchall()]
 
     cur.close()
     conn.close()
