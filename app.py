@@ -15,6 +15,7 @@ import aiohttp
 import bcrypt
 import queue
 import concurrent.futures
+from io import StringIO
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -39,8 +40,6 @@ NEW_MONITORING_SITES = [
 ]
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
-# Внутренние /cp/ сайты — self-signed по умолчанию
-# Дополнительные через env SELF_SIGNED_SITES (через запятую)
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
 if os.getenv("SELF_SIGNED_SITES"):
     SELF_SIGNED_SITES.update(os.getenv("SELF_SIGNED_SITES").split(","))
@@ -83,7 +82,7 @@ CACHE_TTL = 30
 # ============================================================================
 # PLAYWRIGHT SCREENSHOT QUEUE — thread-safe воркер
 # ============================================================================
-_screenshot_queue = queue.Queue()  # (site, result_future)
+_screenshot_queue = queue.Queue()
 _screenshot_thread = None
 _screenshot_thread_lock = threading.Lock()
 
@@ -105,8 +104,7 @@ def _ensure_screenshot_worker():
 
 
 async def _screenshot_loop():
-    """Event loop воркера: держит браузер открытым и обрабатывает очередь.
-    При ошибке одного скриншота — продолжает работу (не падает)."""
+    """Event loop воркера: держит браузер открытым и обрабатывает очередь."""
     p = await async_playwright().start()
     browser = await p.chromium.launch(
         headless=True,
@@ -126,7 +124,7 @@ async def _screenshot_loop():
             try:
                 fut.set_exception(e)
             except Exception:
-                pass  # Future мог уже быть отменён
+                pass
 
 
 async def _do_screenshot(browser, site):
@@ -159,6 +157,8 @@ def take_screenshot_fast(site):
         return fut.result(timeout=30)
     except concurrent.futures.TimeoutError:
         return None
+
+
 # ============================================================================
 # BCrypt AUTH (SEC-2)
 # ============================================================================
@@ -179,10 +179,8 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
         decoded = base64.b64decode(credentials).decode("ascii")
         u, p = decoded.split(":", 1)
 
-        # Проверка через BCrypt (константное время сравнения)
         if u == AUTH_USERNAME and AUTH_PASSWORD_HASH:
             if bcrypt.checkpw(p.encode('utf-8'), AUTH_PASSWORD_HASH.encode('utf-8')):
-                # SEC-3: secure=True + samesite для cookie
                 response.set_cookie(
                     key="session_auth",
                     value="authenticated_sibur",
@@ -196,15 +194,172 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
         pass
     raise HTTPException(status_code=401)
 
+
 # ============================================================================
 # УТИЛИТЫ
 # ============================================================================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
+
 def should_verify(site: str) -> bool:
     """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
     return site not in SELF_SIGNED_SITES
+
+
+def _safe_index(cur, conn, index_name, table_name, columns):
+    """Создаёт индекс, если его ещё нет; игнорирует DuplicateTable/DuplicateObject"""
+    try:
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS {index_name}
+            ON {table_name} ({columns})
+        """)
+    except psycopg2.Error:
+        conn.rollback()
+
+
+def init_db():
+    """Инициализация БД с поддержкой партиционирования (Этап 1) + incidents"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Проверяем, существует ли уже партиционированная таблица logs
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM pg_tables
+            WHERE tablename = 'logs'
+            AND schemaname = 'public'
+        )
+    """)
+    logs_exists = cur.fetchone()[0]
+
+    if not logs_exists:
+        cur.execute("""
+            CREATE TABLE logs (
+                site TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status INTEGER,
+                response_time REAL,
+                ssl_days INTEGER,
+                domain_days INTEGER
+            ) PARTITION BY RANGE (timestamp)
+        """)
+
+        now = datetime.datetime.now()
+        y, m = now.year, now.month
+        next_y, next_m = (y, m + 1) if m < 12 else (y + 1, 1)
+        next_next_y, next_next_m = (y, m + 2) if m < 11 else (y + 1, (m + 1) % 12 + 1)
+
+        for yy, mm in [(y, m), (next_y, next_m), (next_next_y, next_next_m)]:
+            mm_next = mm + 1 if mm < 12 else 1
+            yy_next = yy if mm < 12 else yy + 1
+            try:
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
+                    PARTITION OF logs
+                    FOR VALUES FROM ('{yy}-{mm:02d}-01')
+                    TO ('{yy_next}-{mm_next:02d}-01')
+                """)
+            except psycopg2.Error:
+                conn.rollback()
+
+        _safe_index(cur, conn, "idx_logs_site_ts", "logs", "site, timestamp DESC")
+    else:
+        # Проверяем, что таблица партиционирована
+        cur.execute("""
+            SELECT pg_get_partkeydef(c.oid)
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = 'logs' AND n.nspname = 'public'
+        """)
+        result = cur.fetchone()
+        if result and result[0] is None:
+            print("Миграция: переименование старой таблицы в logs_old")
+            cur.execute("ALTER TABLE logs RENAME TO logs_old")
+            cur.execute("""
+                CREATE TABLE logs (
+                    site TEXT NOT NULL,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    status INTEGER,
+                    response_time REAL,
+                    ssl_days INTEGER,
+                    domain_days INTEGER
+                ) PARTITION BY RANGE (timestamp)
+            """)
+            now = datetime.datetime.now()
+            y, m = now.year, now.month
+            next_y, next_m = (y, m + 1) if m < 12 else (y + 1, 1)
+            for yy, mm in [(y, m), (next_y, next_m)]:
+                mm_next = mm + 1 if mm < 12 else 1
+                yy_next = yy if mm < 12 else yy + 1
+                try:
+                    cur.execute(f"""
+                        CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
+                        PARTITION OF logs
+                        FOR VALUES FROM ('{yy}-{mm:02d}-01')
+                        TO ('{yy_next}-{mm_next:02d}-01')
+                    """)
+                except psycopg2.Error:
+                    conn.rollback()
+            _safe_index(cur, conn, "idx_logs_site_ts", "logs", "site, timestamp DESC")
+
+    # Таблица агрегатов (Этап 1)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS checks_agg (
+            site TEXT NOT NULL,
+            bucket TIMESTAMP NOT NULL,
+            checks_count INTEGER DEFAULT 1,
+            status_200_count INTEGER DEFAULT 0,
+            avg_response_time REAL,
+            min_response_time REAL,
+            max_response_time REAL,
+            last_ssl_days INTEGER,
+            last_domain_days INTEGER,
+            PRIMARY KEY (site, bucket)
+        )
+    """)
+    _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
+
+    # Материализованное представление (Этап 3)
+    cur.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS latest_status AS
+        SELECT DISTINCT ON (site)
+            site, status, response_time, ssl_days, domain_days, timestamp
+        FROM logs
+        ORDER BY site, timestamp DESC
+    """)
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
+    except psycopg2.Error:
+        conn.rollback()
+
+    # Таблица инцидентов — заменяет тяжёлый CTE в dashboard
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS incidents (
+            id SERIAL PRIMARY KEY,
+            site TEXT NOT NULL,
+            start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            end_time TIMESTAMP,
+            duration_min INTEGER,
+            max_status INTEGER,
+            description TEXT,
+            resolved BOOLEAN DEFAULT FALSE
+        )
+    """)
+    _safe_index(cur, conn, "idx_incidents_site_start", "incidents", "site, start_time DESC")
+    try:
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_incidents_unresolved
+            ON incidents (resolved)
+            WHERE resolved = FALSE
+        """)
+    except psycopg2.Error:
+        conn.rollback()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
 
 def backfill_checks_agg():
     """Предзаполнение checks_agg из существующих logs (при первом запуске)"""
@@ -244,146 +399,12 @@ def backfill_checks_agg():
         print(f"Ошибка backfill checks_agg: {e}")
 
 
-def init_db():
-    """Инициализация БД с поддержкой партиционирования (Этап 1)"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    # Проверяем, существует ли уже партиционированная таблица logs
-    cur.execute("""
-        SELECT EXISTS (
-            SELECT FROM pg_tables
-            WHERE tablename = 'logs'
-            AND schemaname = 'public'
-        )
-    """)
-    logs_exists = cur.fetchone()[0]
-
-    def _safe_index(index_name, table_name, columns):
-        """Создаёт индекс, если его ещё нет; игнорирует DuplicateTable/DuplicateObject"""
-        try:
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON {table_name} ({columns})
-            """)
-        except psycopg2.Error:
-            conn.rollback()
-
-    if not logs_exists:
-        # Создаём партиционированную таблицу (Этап 1)
-        cur.execute("""
-            CREATE TABLE logs (
-                site TEXT NOT NULL,
-                timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                status INTEGER,
-                response_time REAL,
-                ssl_days INTEGER,
-                domain_days INTEGER
-            ) PARTITION BY RANGE (timestamp)
-        """)
-
-        # Создаём партиции за текущий и следующий месяц
-        now = datetime.datetime.now()
-        y, m = now.year, now.month
-        next_y, next_m = (y, m + 1) if m < 12 else (y + 1, 1)
-        next_next_y, next_next_m = (y, m + 2) if m < 11 else (y + 1, (m + 1) % 12 + 1)
-
-        for yy, mm in [(y, m), (next_y, next_m), (next_next_y, next_next_m)]:
-            mm_next = mm + 1 if mm < 12 else 1
-            yy_next = yy if mm < 12 else yy + 1
-            try:
-                cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
-                    PARTITION OF logs
-                    FOR VALUES FROM ('{yy}-{mm:02d}-01')
-                    TO ('{yy_next}-{mm_next:02d}-01')
-                """)
-            except psycopg2.Error:
-                conn.rollback()
-
-        _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
-    else:
-        # Проверяем, что таблица партиционирована
-        cur.execute("""
-            SELECT pg_get_partkeydef(c.oid)
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = 'logs' AND n.nspname = 'public'
-        """)
-        result = cur.fetchone()
-        if result and result[0] is None:
-            # Таблица существует но не партиционирована - мигрируем
-            print("Миграция: переименование старой таблицы в logs_old")
-            cur.execute("ALTER TABLE logs RENAME TO logs_old")
-            cur.execute("""
-                CREATE TABLE logs (
-                    site TEXT NOT NULL,
-                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    status INTEGER,
-                    response_time REAL,
-                    ssl_days INTEGER,
-                    domain_days INTEGER
-                ) PARTITION BY RANGE (timestamp)
-            """)
-            now = datetime.datetime.now()
-            y, m = now.year, now.month
-            next_y, next_m = (y, m + 1) if m < 12 else (y + 1, 1)
-            for yy, mm in [(y, m), (next_y, next_m)]:
-                mm_next = mm + 1 if mm < 12 else 1
-                yy_next = yy if mm < 12 else yy + 1
-                try:
-                    cur.execute(f"""
-                        CREATE TABLE IF NOT EXISTS logs_{yy}_{mm:02d}
-                        PARTITION OF logs
-                        FOR VALUES FROM ('{yy}-{mm:02d}-01')
-                        TO ('{yy_next}-{mm_next:02d}-01')
-                    """)
-                except psycopg2.Error:
-                    conn.rollback()
-            _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
-
-    # Таблица агрегатов (Этап 1)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS checks_agg (
-            site TEXT NOT NULL,
-            bucket TIMESTAMP NOT NULL,
-            checks_count INTEGER DEFAULT 1,
-            status_200_count INTEGER DEFAULT 0,
-            avg_response_time REAL,
-            min_response_time REAL,
-            max_response_time REAL,
-            last_ssl_days INTEGER,
-            last_domain_days INTEGER,
-            PRIMARY KEY (site, bucket)
-        )
-    """)
-    _safe_index("idx_checks_agg_bucket", "checks_agg", "bucket DESC")
-
-    # Материализованное представление (Этап 3)
-    cur.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS latest_status AS
-        SELECT DISTINCT ON (site)
-            site, status, response_time, ssl_days, domain_days, timestamp
-        FROM logs
-        ORDER BY site, timestamp DESC
-    """)
-    # Уникальный индекс обязателен для REFRESH CONCURRENTLY
-    try:
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
-    except psycopg2.Error:
-        conn.rollback()
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 def ensure_partitions():
     """Автоматическое создание партиций на следующий месяц (Этап 1)"""
     conn = get_db_connection()
     cur = conn.cursor()
     now = datetime.datetime.now()
-    for offset in range(3):  # Текущий + 2 месяца вперёд
+    for offset in range(3):
         yy, mm = now.year, now.month + offset
         while mm > 12:
             mm -= 12
@@ -457,7 +478,6 @@ async def check_single_site(session, site, semaphore):
         domain_only = site.split('/')[0]
         curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
 
-        # SEC-1: verify=False только для сайтов из whitelist
         ssl_verify = not should_verify(site)
         connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
 
@@ -478,7 +498,6 @@ async def check_single_site(session, site, semaphore):
             print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
         finally:
-            # Закрываем только собственную сессию (не общую из check_all_sites)
             if ssl_verify and connector and actual_session is not None:
                 await actual_session.close()
 
@@ -501,7 +520,7 @@ async def check_single_site(session, site, semaphore):
 
 async def check_all_sites():
     """Параллельная проверка всех сайтов через asyncio.gather"""
-    semaphore = asyncio.Semaphore(10)  # Не более 10 параллельных проверок
+    semaphore = asyncio.Semaphore(10)
     async with aiohttp.ClientSession() as session:
         tasks = [check_single_site(session, site, semaphore) for site in SITES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -520,7 +539,6 @@ def _update_checks_agg(cur, batch_data):
     })
     for row in batch_data:
         site, status, resp, ssl_d, dom_d = row[:5]
-        # bucket = округление до 5 минут
         now = datetime.datetime.now()
         bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         k = (site, bucket)
@@ -582,6 +600,72 @@ def flush_batch():
 
 
 # ============================================================================
+# ИНЦИДЕНТЫ — запись из worker
+# ============================================================================
+def _db_incident_start(site, status):
+    """Фиксирует начало инцидента (первый фейл сайта)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        description = {
+            0: 'Timeout',
+            502: 'Bad Gateway',
+            503: 'Service Unavailable'
+        }.get(status, 'Server Error')
+        cur.execute("""
+            INSERT INTO incidents (site, start_time, max_status, description)
+            VALUES (%s, NOW(), %s, %s)
+        """, (site, status, description))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[INCIDENT START ERR] {site}: {e}")
+
+
+def _db_incident_update(site, status):
+    """Обновляет max_status текущего неразрешённого инцидента"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        description = {
+            0: 'Timeout',
+            502: 'Bad Gateway',
+            503: 'Service Unavailable'
+        }.get(status, 'Server Error')
+        cur.execute("""
+            UPDATE incidents
+            SET max_status = GREATEST(COALESCE(max_status, 0), %s),
+                description = %s
+            WHERE site = %s AND resolved = FALSE
+        """, (status, description, site))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[INCIDENT UPDATE ERR] {site}: {e}")
+
+
+def _db_incident_resolve(site):
+    """Закрывает открытый инцидент (сайт восстановился)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE incidents
+            SET end_time = NOW(),
+                duration_min = CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                resolved = TRUE
+            WHERE site = %s AND resolved = FALSE
+        """, (site,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[INCIDENT RESOLVE ERR] {site}: {e}")
+
+
+# ============================================================================
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
 def refresh_materialized_view():
@@ -611,7 +695,6 @@ def rotate_logs(retention_days: int = 30):
         cur = conn.cursor()
         cutoff_date = datetime.datetime.now() - datetime.timedelta(days=retention_days)
 
-        # 1. Агрегируем данные перед удалением
         cur.execute("""
             INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
                                    avg_response_time, min_response_time, max_response_time,
@@ -643,7 +726,6 @@ def rotate_logs(retention_days: int = 30):
                 max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time)
         """, (cutoff_date, cutoff_date))
 
-        # 2. Удаляем старые партиции
         cur.execute("""
             SELECT tablename FROM pg_tables
             WHERE tablename LIKE 'logs________'
@@ -667,7 +749,7 @@ def rotate_logs(retention_days: int = 30):
 # CHECK WORKER (обновлённый)
 # ============================================================================
 def check_worker():
-    """Фоновый воркер проверки сайтов с batch-вставкой и ротацией"""
+    """Фоновый воркер проверки сайтов с batch-вставкой, ротацией и incidents"""
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -675,24 +757,31 @@ def check_worker():
     fail_count = {site: 0 for site in SITES}
     last_latency_map = {site: False for site in SITES}
 
+    # Один event loop на весь воркер вместо asyncio.run() в цикле
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     while True:
         try:
-            # Параллельная проверка всех сайтов (Этап 2.2)
-            results = asyncio.run(check_all_sites())
+            results = loop.run_until_complete(check_all_sites())
 
             for site, curr_status, resp_time, ssl_d, dom_d in results:
                 try:
-                    # --- ЛОГИКА АЛЕРТОВ И ЗАПИСИ ---
                     if curr_status != 200:
                         fail_count[site] += 1
                         alert_threshold = 5 if site in PRIORITY_SITES else 10
+
+                        # --- Incident tracking ---
+                        if fail_count[site] == 1 and last_status[site] == 200:
+                            _db_incident_start(site, curr_status)
+                        elif fail_count[site] > 1:
+                            _db_incident_update(site, curr_status)
 
                         with BATCH_LOCK:
                             if fail_count[site] >= 2:
                                 batch_buffer.append(
                                     (site, curr_status, resp_time, ssl_d, dom_d)
                                 )
-
                             if len(batch_buffer) >= BATCH_SIZE:
                                 flush_batch()
 
@@ -709,6 +798,7 @@ def check_worker():
 
                         if last_status[site] != 200:
                             duration = fail_count[site]
+                            _db_incident_resolve(site)
                             send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
 
                         last_status[site], fail_count[site] = 200, 0
@@ -724,10 +814,7 @@ def check_worker():
                 except Exception as e:
                     print(f"Ошибка обработки результата для {site}: {e}")
 
-            # Финальный flush оставшихся данных
             flush_batch()
-
-            # Обновление мат. представления (Этап 3)
             refresh_materialized_view()
 
         except Exception as e:
@@ -747,7 +834,6 @@ def daily_report_worker():
             try:
                 conn = get_db_connection()
                 cur = conn.cursor(cursor_factory=DictCursor)
-                # Используем материализованное представление (Этап 3)
                 cur.execute("SELECT site, ssl_days FROM latest_status")
                 rows = cur.fetchall()
                 cur.close()
@@ -792,8 +878,9 @@ def rotation_worker():
 # ============================================================================
 @app.on_event("startup")
 async def startup_event():
-    init_db()
-    threading.Thread(target=backfill_checks_agg, daemon=True).start()
+    # Неблокирующий запуск тяжёлых операций в отдельных потоках
+    await asyncio.to_thread(init_db)
+    await asyncio.to_thread(backfill_checks_agg)
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
@@ -952,36 +1039,24 @@ async def index(auth: bool = Depends(check_auth)):
         """)
         stats = {r['site']: r for r in cur.fetchall()}
 
-    # Инциденты — CTE с ограничением 3 днями (быстро, не грузит память)
+    # Инциденты — читаем из предварительно заполненной таблицы (O(1) вместо CTE scan)
     cur.execute("""
-        WITH status_changes AS (
-            SELECT site, timestamp, status,
-                CASE WHEN status != 200 AND
-                    (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
-                     OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
-                THEN 1 ELSE 0 END as is_start
-            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-        ),
-        incident_groups AS (
-            SELECT site, timestamp, status,
-                SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
-            FROM status_changes WHERE status != 200
-        )
-        SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
-            MAX(status) as max_status,
-            CASE WHEN MAX(status) = 0 THEN 'Timeout'
-                 WHEN MAX(status) = 502 THEN 'Bad Gateway'
-                 WHEN MAX(status) = 503 THEN 'Service Unavailable'
+        SELECT site, start_time,
+            COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+            max_status,
+            CASE WHEN max_status = 0 THEN 'Timeout'
+                 WHEN max_status = 502 THEN 'Bad Gateway'
+                 WHEN max_status = 503 THEN 'Service Unavailable'
                  ELSE 'Server Error' END as description
-        FROM incident_groups
-        GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+        FROM incidents
+        WHERE start_time > NOW() - INTERVAL '30 days'
+        ORDER BY start_time DESC LIMIT 20
     """)
     incidents_list = [dict(r) for r in cur.fetchall()]
 
     cur.close()
     conn.close()
 
-    # Сохраняем dict в кэш (не HTML-строку — экономия ~2 MB RAM)
     data = {
         "s30": s30, "s24": s24,
         "latest": latest, "stats": stats,
@@ -995,7 +1070,7 @@ async def index(auth: bool = Depends(check_auth)):
 
 
 def _build_html(data: dict) -> str:
-    """Сборка HTML из кэшированного dict (без SQL, <10 мс)"""
+    """Сборка HTML из кэшированного dict (без SQL, <10 мс) — оптимизировано через list"""
     s30 = data["s30"]
     s24 = data["s24"]
     latest = data["latest"]
@@ -1018,8 +1093,22 @@ def _build_html(data: dict) -> str:
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
     total_sites = len(SITES)
 
-    html = f"""
-    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
+    def get_site_weight(site_name):
+        if site_name == "sibur.ru":
+            return 0
+        if site_name in NEW_MONITORING_SITES:
+            return 2
+        if site_name in PRIORITY_SITES:
+            return 1
+        return 3
+
+    sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
+    sorted_sites_json = json.dumps(sorted_sites)
+
+    # Используем list для O(n) сборки вместо O(n^2) string concatenation
+    H = []
+
+    H.append(f"""<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc;
@@ -1109,26 +1198,15 @@ def _build_html(data: dict) -> str:
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
             <th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
-    """
+    """)
 
-    def get_site_weight(site_name):
-        if site_name == "sibur.ru":
-            return 0
-        if site_name in NEW_MONITORING_SITES:
-            return 2
-        if site_name in PRIORITY_SITES:
-            return 1
-        return 3
-
-    sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
-    sorted_sites_json = json.dumps(sorted_sites)
     for s in sorted_sites:
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
         is_err = v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or (0 <= v['domain_days'] <= 30)
         prefix = "🔰 " if s in NEW_MONITORING_SITES else ("⭐️ " if s in PRIORITY_SITES else "")
 
-        html += f"""<tr class="{'row-err' if is_err else ''}">
+        H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
@@ -1137,26 +1215,26 @@ def _build_html(data: dict) -> str:
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
             <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
             <td><button class="btn-test" onclick="runTest('{s}', this)">
-                <div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
+                <div class="loader"></div><span>📸 Screen</span></button></td></tr>""")
 
-    html += """</tbody></table></div>
+    H.append("""</tbody></table></div>
     <div id="t2" class="tab-content">
     <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
         <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
     </div></div>
     <div id="t3" class="tab-content">
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
-    <th>Код</th><th>Описание</th></tr></thead><tbody>"""
+    <th>Код</th><th>Описание</th></tr></thead><tbody>""")
 
     for r in incidents_list:
-        html += f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+        H.append(f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
-            <td>{r['max_status']}</td><td>{r['description']}</td></tr>"""
+            <td>{r['max_status']}</td><td>{r['description']}</td></tr>""")
 
-    html += """</tbody></table></div>
+    H.append("""</tbody></table></div>
     <div id="t4" class="tab-content">
     <table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
-    </tr></thead><tbody>"""
+    </tr></thead><tbody>""")
 
     cal_events = []
     for s in SITES:
@@ -1166,10 +1244,10 @@ def _build_html(data: dict) -> str:
         if v.get('domain_days', -1) >= 0:
             cal_events.append({'t': 'Оплата домена', 's': s, 'd': v['domain_days']})
     for ev in sorted(cal_events, key=lambda x: x['d']):
-        html += f"""<tr><td>{ev['t']}</td><td>{ev['s']}</td>
-            <td class="{'txt-err' if ev['d']<=30 else ''}">{ev['d']} дн.</td></tr>"""
+        H.append(f"""<tr><td>{ev['t']}</td><td>{ev['s']}</td>
+            <td class="{'txt-err' if ev['d']<=30 else ''}">{ev['d']} дн.</td></tr>""")
 
-    html += f"""</tbody></table></div></div><script>
+    H.append(f"""</tbody></table></div></div><script>
     let chartsLoaded = false;
     let chartsLoading = false;
 
@@ -1216,9 +1294,9 @@ def _build_html(data: dict) -> str:
                 const div = document.createElement('div');
                 div.className = 'kpi-card';
                 div.style.borderTop = '2px solid #eee';
-                div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\./g, '_')}}"></canvas>`;
+                div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\\./g, '_')}}"></canvas>`;
                 container.appendChild(div);
-                new Chart(document.getElementById('c-' + s.replace(/\./g, '_')), {{
+                new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {{
                     type: 'line',
                     data: {{
                         labels: d.l,
@@ -1245,8 +1323,9 @@ def _build_html(data: dict) -> str:
     }}
 
     setInterval(() => {{ location.reload(); }}, 120000);
-    </script></body></html>"""
-    return html
+    </script></body></html>""")
+
+    return "".join(H)
 
 
 if __name__ == "__main__":
