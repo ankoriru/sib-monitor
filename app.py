@@ -91,10 +91,6 @@ _screenshot_queue = queue.Queue()
 _screenshot_thread = None
 _screenshot_thread_lock = threading.Lock()
 
-# WHOIS cache (24h TTL)
-_whois_cache = {}
-WHOIS_CACHE_TTL = 86400
-
 # Screenshot rate limit (30 sec per site)
 _screenshot_rate_limit = {}
 _screenshot_rate_lock = threading.Lock()
@@ -644,12 +640,10 @@ def get_domain_info(site):
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
 async def check_single_site(session, site, semaphore):
-    """Проверка одного сайта: HTTP через aiohttp (async), SSL+WHOIS через to_thread (не блокирует семафор)"""
+    """Быстрая HTTP-проверка сайта. SSL+WHOIS обновляются отдельным циклом."""
     check_url = f"https://{site}"
-    domain_only = site.split('/')[0]
     curr_status, resp_time = 0, 25.0
 
-    # --- Шаг 1: HTTP проверка (async, под семафором) ---
     ssl_verify = not should_verify(site)
     connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
     start = time.time()
@@ -661,46 +655,22 @@ async def check_single_site(session, site, semaphore):
             else:
                 actual_session = session
 
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=8)
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
         except Exception as e:
-            print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
         finally:
             if ssl_verify and connector and actual_session is not None:
                 await actual_session.close()
 
-    # --- Шаг 2: SSL + WHOIS (в отдельном потоке, НЕ блокирует семафор и event loop) ---
-    ssl_d, ssl_chain_valid = -1, None
-    try:
-        ssl_d, ssl_chain_valid = await asyncio.wait_for(
-            asyncio.to_thread(_check_ssl_sync, domain_only, site),
-            timeout=5
-        )
-    except asyncio.TimeoutError:
-        print(f"[SSL TIMEOUT] {site}")
-    except Exception as e:
-        print(f"[SSL ERR] {site}: {e}")
-
-    dom_d = -1
-    try:
-        dom_d = await asyncio.wait_for(
-            asyncio.to_thread(_check_whois_sync, domain_only),
-            timeout=5
-        )
-    except asyncio.TimeoutError:
-        print(f"[WHOIS TIMEOUT] {site}")
-    except Exception as e:
-        print(f"[WHOIS ERR] {site}: {e}")
-
-    return (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
+    return (site, curr_status, resp_time)
 
 
 async def check_all_sites():
-    """Параллельная проверка всех сайтов через asyncio.gather"""
-    semaphore = asyncio.Semaphore(10)
+    """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
+    semaphore = asyncio.Semaphore(15)
     async with aiohttp.ClientSession() as session:
         tasks = [check_single_site(session, site, semaphore) for site in SITES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -960,8 +930,18 @@ def _update_worker_heartbeat():
         print(f"[HEARTBEAT ERR] {e}")
 
 
+def _get_ssl_whois_data(site, latest_data):
+    """Читает SSL/WHOIS из latest_status (обновляется отдельным воркером)"""
+    row = latest_data.get(site, {})
+    return (
+        row.get('ssl_days', -1),
+        row.get('domain_days', -1),
+        row.get('ssl_chain_valid', None)
+    )
+
+
 def check_worker():
-    """Фоновый воркер проверки сайтов с batch-вставкой, ротацией, incidents и heartbeat"""
+    """Фоновый воркер: быстрые HTTP-проверки каждую минуту. SSL+WHOIS — отдельный воркер."""
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     print("[WORKER START] check_worker started")
@@ -970,27 +950,35 @@ def check_worker():
     fail_count = {site: 0 for site in SITES}
     last_latency_map = {site: False for site in SITES}
 
-    # Один event loop на весь воркер вместо asyncio.run() в цикле
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     while True:
         try:
+            t_start = time.time()
             print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
-            results = loop.run_until_complete(check_all_sites())
-            print(f"[WORKER] check_all_sites returned {len(results)} results")
 
-            for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in results:
+            # Быстрые HTTP-проверки (только status + response_time)
+            results = loop.run_until_complete(check_all_sites())
+            print(f"[WORKER] check_all_sites returned {len(results)} results in {round(time.time()-t_start,1)}s")
+
+            # Читаем SSL/WHOIS из latest_status (обновляется ssl_whois_worker)
+            conn = get_db_connection()
+            cur = conn.cursor(cursor_factory=DictCursor)
+            cur.execute("SELECT site, ssl_days, domain_days, ssl_chain_valid FROM latest_status")
+            latest_data = {r['site']: r for r in cur.fetchall()}
+            cur.close()
+            conn.close()
+
+            for site, curr_status, resp_time in results:
                 try:
-                    print(f"[WORKER] Processing {site} status={curr_status} resp={round(resp_time,2)}s last_status={last_status[site]} fail_count={fail_count[site]}")
+                    ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
+
                     if curr_status != 200:
                         fail_count[site] += 1
                         alert_threshold = 5
-                        print(f"[CHECK FAIL] {site} status={curr_status} fail_count={fail_count[site]}/{alert_threshold} last_status={last_status[site]}")
 
-                        # --- Incident tracking ---
                         if fail_count[site] == 1 and last_status[site] == 200:
-                            print(f"[INCIDENT START] {site} first failure, creating incident")
                             _db_incident_start(site, curr_status, ssl_chain_valid)
                         elif fail_count[site] > 1:
                             _db_incident_update(site, curr_status, ssl_chain_valid)
@@ -1004,10 +992,9 @@ def check_worker():
                                 flush_batch()
 
                         if fail_count[site] >= alert_threshold and last_status[site] == 200:
-                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
+                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} status={curr_status}")
                             shot_path = take_screenshot_fast(site)
-                            msg = f"🚨 DOWN: {site} (Код: {curr_status})"
-                            ok = send_tg_msg(msg, shot_path)
+                            ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
                             print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
                             last_status[site] = curr_status
                             _invalidate_dashboard_cache()
@@ -1019,7 +1006,7 @@ def check_worker():
 
                         if last_status[site] != 200:
                             duration = fail_count[site]
-                            print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
+                            print(f"[ALERT TRIGGER] {site} UP after {duration} min")
                             _db_incident_resolve(site)
                             ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                             print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
@@ -1028,34 +1015,76 @@ def check_worker():
                         last_status[site], fail_count[site] = 200, 0
 
                         if resp_time > 20 and not last_latency_map[site]:
-                            print(f"[ALERT TRIGGER] {site} LATENCY {round(resp_time, 2)}s")
                             ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
-                            print(f"[ALERT RESULT] {site} LATENCY send_tg_msg={'OK' if ok else 'FAIL'}")
                             last_latency_map[site] = True
                         elif resp_time < 10 and last_latency_map[site]:
-                            print(f"[ALERT TRIGGER] {site} LATENCY RECOVERED {round(resp_time, 2)}s")
-                            ok = send_tg_msg(
-                                f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."
-                            )
-                            print(f"[ALERT RESULT] {site} LATENCY REC send_tg_msg={'OK' if ok else 'FAIL'}")
+                            ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                             last_latency_map[site] = False
                 except Exception as e:
-                    print(f"Ошибка обработки результата для {site}: {e}")
+                    print(f"[ERR] {site}: {e}")
 
             flush_batch()
             refresh_materialized_view()
             _update_worker_heartbeat()
-            # Summary каждого цикла
-            total_checked = len(results)
             failed_now = sum(1 for _, st, *_ in results if st != 200)
-            print(f"[CHECK SUMMARY] checked={total_checked} failed={failed_now} batch_size={len(batch_buffer)}")
+            print(f"[CHECK SUMMARY] checked={len(results)} failed={failed_now} cycle_time={round(time.time()-t_start,1)}s")
 
         except Exception as e:
             print(f"[WORKER ERROR] {type(e).__name__}: {e}")
 
         finally:
-            # Гарантируем ровно 60 секунд между циклами даже при ошибке
             time.sleep(60)
+
+
+def ssl_whois_worker():
+    """Отдельный воркер: SSL + WHOIS проверки раз в 4 часа (медленные операции)"""
+    print("[SSL WORKER START] ssl_whois_worker started")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    while True:
+        try:
+            t_start = time.time()
+            print(f"[SSL WORKER] Starting SSL+WHOIS checks at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
+
+            for site in SITES:
+                domain_only = site.split('/')[0]
+                try:
+                    ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site)
+                except Exception:
+                    ssl_d, ssl_chain_valid = -1, None
+
+                try:
+                    dom_d = _check_whois_sync(domain_only)
+                except Exception:
+                    dom_d = -1
+
+                # Обновляем latest_status через direct DB update
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE logs
+                        SET ssl_days = %s, domain_days = %s, ssl_chain_valid = %s
+                        WHERE site = %s
+                          AND timestamp = (SELECT MAX(timestamp) FROM logs WHERE site = %s)
+                    """, (ssl_d, dom_d, ssl_chain_valid, site, site))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+
+                time.sleep(0.5)  # Небольшая пауза между сайтами
+
+            refresh_materialized_view()
+            elapsed = round(time.time() - t_start, 1)
+            print(f"[SSL WORKER] Completed in {elapsed}s, sleeping 4 hours")
+
+        except Exception as e:
+            print(f"[SSL WORKER ERROR] {e}")
+
+        time.sleep(4 * 3600)
 
 
 # ============================================================================
@@ -1119,6 +1148,7 @@ async def startup_event():
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
     threading.Thread(target=check_worker, daemon=True).start()
+    threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
     # Telegram config check
