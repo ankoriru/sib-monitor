@@ -39,6 +39,8 @@ NEW_MONITORING_SITES = [
 ]
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
+# Внутренние /cp/ сайты — self-signed по умолчанию
+# Дополнительные через env SELF_SIGNED_SITES (через запятую)
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
 if os.getenv("SELF_SIGNED_SITES"):
     SELF_SIGNED_SITES.update(os.getenv("SELF_SIGNED_SITES").split(","))
@@ -74,28 +76,27 @@ batch_buffer = []
 BATCH_SIZE = 50
 BATCH_LOCK = threading.Lock()
 
-# КЭШ DASHBOARD
+# КЭШ DASHBOARD — храним dict с данными (не HTML-строку)
 _dashboard_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
 CACHE_TTL = 30
 
-# КЭШ ИНЦИДЕНТОВ
-_incidents_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
-
 # ============================================================================
-# PLAYWRIGHT SCREENSHOT QUEUE
+# PLAYWRIGHT SCREENSHOT QUEUE — thread-safe воркер
 # ============================================================================
-_screenshot_queue = queue.Queue()
+_screenshot_queue = queue.Queue()  # (site, result_future)
 _screenshot_thread = None
 _screenshot_thread_lock = threading.Lock()
 
 
 def _screenshot_worker():
+    """Отдельный поток с event loop для Playwright (избегает loop conflict)"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_screenshot_loop())
 
 
 def _ensure_screenshot_worker():
+    """Лениво запускает Playwright worker только при первом запросе скриншота."""
     global _screenshot_thread
     with _screenshot_thread_lock:
         if _screenshot_thread is None or not _screenshot_thread.is_alive():
@@ -104,6 +105,8 @@ def _ensure_screenshot_worker():
 
 
 async def _screenshot_loop():
+    """Event loop воркера: держит браузер открытым и обрабатывает очередь.
+    При ошибке одного скриншота — продолжает работу (не падает)."""
     p = await async_playwright().start()
     browser = await p.chromium.launch(
         headless=True,
@@ -123,10 +126,11 @@ async def _screenshot_loop():
             try:
                 fut.set_exception(e)
             except Exception:
-                pass
+                pass  # Future мог уже быть отменён
 
 
 async def _do_screenshot(browser, site):
+    """Скриншот одного сайта (вызывается в loop воркера)"""
     full_url = f"https://{site}"
     path = f"debug_{site.replace('/', '_')}_{int(time.time())}.png"
     context = await browser.new_context(
@@ -147,6 +151,7 @@ async def _do_screenshot(browser, site):
 
 
 def take_screenshot_fast(site):
+    """Синхронный вызов: кладёт задачу в очередь и ждёт результат"""
     _ensure_screenshot_worker()
     fut = concurrent.futures.Future()
     _screenshot_queue.put((site, fut))
@@ -154,12 +159,11 @@ def take_screenshot_fast(site):
         return fut.result(timeout=30)
     except concurrent.futures.TimeoutError:
         return None
-
-
 # ============================================================================
 # BCrypt AUTH (SEC-2)
 # ============================================================================
 def check_auth(request: Request, response: Response, session_auth: str = Cookie(None)):
+    """Аутентификация через BCrypt-хеш пароля из env + cookie-сессия"""
     if session_auth == "authenticated_sibur":
         return True
 
@@ -175,8 +179,10 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
         decoded = base64.b64decode(credentials).decode("ascii")
         u, p = decoded.split(":", 1)
 
+        # Проверка через BCrypt (константное время сравнения)
         if u == AUTH_USERNAME and AUTH_PASSWORD_HASH:
             if bcrypt.checkpw(p.encode('utf-8'), AUTH_PASSWORD_HASH.encode('utf-8')):
+                # SEC-3: secure=True + samesite для cookie
                 response.set_cookie(
                     key="session_auth",
                     value="authenticated_sibur",
@@ -190,19 +196,18 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
         pass
     raise HTTPException(status_code=401)
 
-
 # ============================================================================
 # УТИЛИТЫ
 # ============================================================================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
-
 def should_verify(site: str) -> bool:
+    """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
     return site not in SELF_SIGNED_SITES
 
-
 def backfill_checks_agg():
+    """Предзаполнение checks_agg из существующих logs (при первом запуске)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -240,9 +245,11 @@ def backfill_checks_agg():
 
 
 def init_db():
+    """Инициализация БД с поддержкой партиционирования (Этап 1)"""
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Проверяем, существует ли уже партиционированная таблица logs
     cur.execute("""
         SELECT EXISTS (
             SELECT FROM pg_tables
@@ -253,6 +260,7 @@ def init_db():
     logs_exists = cur.fetchone()[0]
 
     def _safe_index(index_name, table_name, columns):
+        """Создаёт индекс, если его ещё нет; игнорирует DuplicateTable/DuplicateObject"""
         try:
             cur.execute(f"""
                 CREATE INDEX IF NOT EXISTS {index_name}
@@ -262,6 +270,7 @@ def init_db():
             conn.rollback()
 
     if not logs_exists:
+        # Создаём партиционированную таблицу (Этап 1)
         cur.execute("""
             CREATE TABLE logs (
                 site TEXT NOT NULL,
@@ -273,6 +282,7 @@ def init_db():
             ) PARTITION BY RANGE (timestamp)
         """)
 
+        # Создаём партиции за текущий и следующий месяц
         now = datetime.datetime.now()
         y, m = now.year, now.month
         next_y, next_m = (y, m + 1) if m < 12 else (y + 1, 1)
@@ -293,6 +303,7 @@ def init_db():
 
         _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
     else:
+        # Проверяем, что таблица партиционирована
         cur.execute("""
             SELECT pg_get_partkeydef(c.oid)
             FROM pg_class c
@@ -301,6 +312,7 @@ def init_db():
         """)
         result = cur.fetchone()
         if result and result[0] is None:
+            # Таблица существует но не партиционирована - мигрируем
             print("Миграция: переименование старой таблицы в logs_old")
             cur.execute("ALTER TABLE logs RENAME TO logs_old")
             cur.execute("""
@@ -330,6 +342,7 @@ def init_db():
                     conn.rollback()
             _safe_index("idx_logs_site_ts", "logs", "site, timestamp DESC")
 
+    # Таблица агрегатов (Этап 1)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS checks_agg (
             site TEXT NOT NULL,
@@ -346,6 +359,7 @@ def init_db():
     """)
     _safe_index("idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
+    # Материализованное представление (Этап 3)
     cur.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS latest_status AS
         SELECT DISTINCT ON (site)
@@ -353,6 +367,7 @@ def init_db():
         FROM logs
         ORDER BY site, timestamp DESC
     """)
+    # Уникальный индекс обязателен для REFRESH CONCURRENTLY
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
     except psycopg2.Error:
@@ -364,10 +379,11 @@ def init_db():
 
 
 def ensure_partitions():
+    """Автоматическое создание партиций на следующий месяц (Этап 1)"""
     conn = get_db_connection()
     cur = conn.cursor()
     now = datetime.datetime.now()
-    for offset in range(3):
+    for offset in range(3):  # Текущий + 2 месяца вперёд
         yy, mm = now.year, now.month + offset
         while mm > 12:
             mm -= 12
@@ -435,11 +451,13 @@ def get_domain_info(site):
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
 async def check_single_site(session, site, semaphore):
+    """Проверка одного сайта через aiohttp с семафором"""
     async with semaphore:
         check_url = f"https://{site}"
         domain_only = site.split('/')[0]
         curr_status, resp_time, ssl_d, dom_d = 0, 25.0, -1, -1
 
+        # SEC-1: verify=False только для сайтов из whitelist
         ssl_verify = not should_verify(site)
         connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
 
@@ -460,9 +478,11 @@ async def check_single_site(session, site, semaphore):
             print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
         finally:
+            # Закрываем только собственную сессию (не общую из check_all_sites)
             if ssl_verify and connector and actual_session is not None:
                 await actual_session.close()
 
+        # Проверка SSL (синхронно в отдельном потоке)
         try:
             ctx = ssl.create_default_context()
             with socket.create_connection((domain_only, 443), timeout=3) as sock:
@@ -473,13 +493,15 @@ async def check_single_site(session, site, semaphore):
         except Exception:
             pass
 
+        # WHOIS
         dom_d = get_domain_info(domain_only)
 
         return (site, curr_status, resp_time, ssl_d, dom_d)
 
 
 async def check_all_sites():
-    semaphore = asyncio.Semaphore(10)
+    """Параллельная проверка всех сайтов через asyncio.gather"""
+    semaphore = asyncio.Semaphore(10)  # Не более 10 параллельных проверок
     async with aiohttp.ClientSession() as session:
         tasks = [check_single_site(session, site, semaphore) for site in SITES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -490,6 +512,7 @@ async def check_all_sites():
 # BATCH-ВСТАВКА (Этап 2.1)
 # ============================================================================
 def _update_checks_agg(cur, batch_data):
+    """UPSERT агрегатов за 5-минутный bucket при batch-вставке"""
     from collections import defaultdict
     agg = defaultdict(lambda: {
         'cnt': 0, 'ok': 0, 'r_sum': 0.0,
@@ -497,6 +520,7 @@ def _update_checks_agg(cur, batch_data):
     })
     for row in batch_data:
         site, status, resp, ssl_d, dom_d = row[:5]
+        # bucket = округление до 5 минут
         now = datetime.datetime.now()
         bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         k = (site, bucket)
@@ -532,6 +556,7 @@ def _update_checks_agg(cur, batch_data):
 
 
 def flush_batch():
+    """Сброс накопленных данных пакетом в БД + обновление агрегатов"""
     global batch_buffer
     with BATCH_LOCK:
         if not batch_buffer:
@@ -560,6 +585,7 @@ def flush_batch():
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
 def refresh_materialized_view():
+    """Обновление latest_status — CONCURRENTLY если возможно, иначе обычно"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -579,11 +605,13 @@ def refresh_materialized_view():
 # RETENTION POLICY / РОТАЦИЯ (Этап 1)
 # ============================================================================
 def rotate_logs(retention_days: int = 30):
+    """Агрегация старых данных и удаление устаревших партиций"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cutoff_date = datetime.datetime.now() - datetime.timedelta(days=retention_days)
 
+        # 1. Агрегируем данные перед удалением
         cur.execute("""
             INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
                                    avg_response_time, min_response_time, max_response_time,
@@ -615,6 +643,7 @@ def rotate_logs(retention_days: int = 30):
                 max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time)
         """, (cutoff_date, cutoff_date))
 
+        # 2. Удаляем старые партиции
         cur.execute("""
             SELECT tablename FROM pg_tables
             WHERE tablename LIKE 'logs________'
@@ -635,9 +664,10 @@ def rotate_logs(retention_days: int = 30):
 
 
 # ============================================================================
-# CHECK WORKER
+# CHECK WORKER (обновлённый)
 # ============================================================================
 def check_worker():
+    """Фоновый воркер проверки сайтов с batch-вставкой и ротацией"""
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -647,10 +677,12 @@ def check_worker():
 
     while True:
         try:
+            # Параллельная проверка всех сайтов (Этап 2.2)
             results = asyncio.run(check_all_sites())
 
             for site, curr_status, resp_time, ssl_d, dom_d in results:
                 try:
+                    # --- ЛОГИКА АЛЕРТОВ И ЗАПИСИ ---
                     if curr_status != 200:
                         fail_count[site] += 1
                         alert_threshold = 5 if site in PRIORITY_SITES else 10
@@ -692,7 +724,10 @@ def check_worker():
                 except Exception as e:
                     print(f"Ошибка обработки результата для {site}: {e}")
 
+            # Финальный flush оставшихся данных
             flush_batch()
+
+            # Обновление мат. представления (Этап 3)
             refresh_materialized_view()
 
         except Exception as e:
@@ -705,12 +740,14 @@ def check_worker():
 # DAILY REPORT WORKER
 # ============================================================================
 def daily_report_worker():
+    """Рассылка отчёта по SSL в 09:00 МСК"""
     while True:
         now = datetime.datetime.now(TZ_MOSCOW)
         if now.hour == 9 and now.minute == 0:
             try:
                 conn = get_db_connection()
                 cur = conn.cursor(cursor_factory=DictCursor)
+                # Используем материализованное представление (Этап 3)
                 cur.execute("SELECT site, ssl_days FROM latest_status")
                 rows = cur.fetchall()
                 cur.close()
@@ -736,6 +773,7 @@ def daily_report_worker():
 # ROTATION WORKER (Этап 1)
 # ============================================================================
 def rotation_worker():
+    """Ежедневная ротация логов в 03:00 МСК + создание партиций"""
     while True:
         now = datetime.datetime.now(TZ_MOSCOW)
         if now.hour == 3 and now.minute == 0:
@@ -750,123 +788,6 @@ def rotation_worker():
 
 
 # ============================================================================
-# WARMUP CACHE
-# ============================================================================
-def _warmup_dashboard_cache():
-    time.sleep(5)
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=DictCursor)
-
-        def _get_stats(cur, interval: str):
-            cur.execute("""
-                SELECT
-                    ROUND(SUM(status_200_count) * 100.0
-                          / NULLIF(SUM(checks_count), 0)::numeric, 2) as up,
-                    ROUND(AVG(avg_response_time)::numeric, 3) as resp
-                FROM checks_agg WHERE bucket > NOW() - INTERVAL %s
-            """, (interval,))
-            row = cur.fetchone()
-            if row and row[0] is not None:
-                return {'up': row[0], 'resp': row[1]}
-            cur.execute("""
-                SELECT
-                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                           / NULLIF(COUNT(*), 0))::numeric, 2) as up,
-                    ROUND(AVG(response_time)::numeric, 3) as resp
-                FROM logs WHERE timestamp > NOW() - INTERVAL %s
-            """, (interval,))
-            row = cur.fetchone()
-            return {'up': row[0] or 0, 'resp': row[1] or 0}
-
-        s30 = _get_stats(cur, '30 days')
-        s24 = _get_stats(cur, '24 hours')
-
-        cur.execute("SELECT * FROM latest_status")
-        latest_all = {r['site']: dict(r) for r in cur.fetchall()}
-        latest = {s: latest_all[s] for s in SITES if s in latest_all}
-
-        cur.execute("""
-            SELECT site,
-                ROUND(SUM(status_200_count) * 100.0
-                      / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-                SUM(checks_count - status_200_count) * 5 as down_sec
-            FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
-            GROUP BY site
-        """)
-        stats_rows = cur.fetchall()
-        if stats_rows and stats_rows[0][0] is not None:
-            stats = {r['site']: dict(r) for r in stats_rows}
-        else:
-            cur.execute("""
-                SELECT site,
-                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                           / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                    COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
-                FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-                GROUP BY site
-            """)
-            stats = {r['site']: dict(r) for r in cur.fetchall()}
-
-        cur.close()
-        conn.close()
-
-        def get_site_weight(site_name):
-            if site_name == "sibur.ru":
-                return 0
-            if site_name in NEW_MONITORING_SITES:
-                return 2
-            if site_name in PRIORITY_SITES:
-                return 1
-            return 3
-
-        sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
-        site_meta = {}
-        for s in sorted_sites:
-            site_meta[s] = {
-                "is_new": s in NEW_MONITORING_SITES,
-                "is_priority": s in PRIORITY_SITES,
-                "weight": get_site_weight(s)
-            }
-
-        incidents = [s for s, v in latest.items() if v['status'] != 200]
-        ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
-        latency_warn = [s for s, v in latest.items()
-                        if v['response_time'] > 20 and v['status'] == 200]
-
-        all_warn_list = (
-            [f"❌ {s} (Offline)" for s in incidents]
-            + [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
-            + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)" for s in latency_warn]
-        )
-
-        online_count = sum(1 for s in latest.values() if s['status'] == 200)
-
-        data = {
-            "s30": s30, "s24": s24,
-            "latest": latest,
-            "stats": stats,
-            "sites": sorted_sites,
-            "site_meta": site_meta,
-            "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S"),
-            "all_warn_list": all_warn_list,
-            "counts": {
-                "online": online_count,
-                "total": len(SITES),
-                "incidents": len(incidents),
-                "ssl_warn": len(ssl_warn),
-                "latency_warn": len(latency_warn)
-            }
-        }
-        with _dashboard_cache["lock"]:
-            _dashboard_cache["data"] = data
-            _dashboard_cache["timestamp"] = time.time()
-        print(f"[WARMUP] Dashboard cache warmed up at {data['now_msk']}")
-    except Exception as e:
-        print(f"[WARMUP] Error: {e}")
-
-
-# ============================================================================
 # STARTUP
 # ============================================================================
 @app.on_event("startup")
@@ -876,328 +797,6 @@ async def startup_event():
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
-    threading.Thread(target=_warmup_dashboard_cache, daemon=True).start()
-
-
-# ============================================================================
-# HTML SHELL (без троббера)
-# ============================================================================
-HTML_SHELL = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Мониторинг сайтов</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
-<style>
-    body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; margin: 0; }
-    .container { max-width: 1400px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }
-    .kpi-card { background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }
-    .danger-card { border-top-color: #ef4444 !important; background: #fef2f2 !important; }
-    .error-bar { background: #fff1f2; border: 1px solid #fee2e2; color: #b91c1c; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }
-    .error-list { margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }
-    .tabs { display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
-    .tab-btn { padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }
-    .tab-btn.active { background: #00717a; color: white; }
-    .tab-content { display: none; }
-    .active-content { display: block; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }
-    .row-err { background-color: #fff1f2 !important; }
-    .txt-err { color: #dc2626; font-weight: bold; }
-    .txt-ok { color: #16a34a; font-weight: bold; }
-    .refresh-btn { background: #00717a; color: white; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; }
-    .btn-test { background: #00717a; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; min-width: 80px; }
-    .loader { border: 2px solid #f3f3f3; border-top: 2px solid #00717a; border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: none; margin-right: 5px; }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .loading .loader { display: inline-block; }
-    .loading span { display: none; }
-    .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
-    .loading-cell { color: #94a3b8; font-style: italic; }
-</style>
-</head>
-<body>
-<div id="toast" class="toast"></div>
-
-<div class="container" id="main-container">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-        <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
-        <button class="refresh-btn" onclick="softReload()">🔄 Обновить: <span id="now-msk">--.--.---- --:--:--</span></button>
-    </div>
-
-    <div class="kpi-grid">
-        <div class="kpi-card" id="kpi-online"><span>Доступно</span><strong><br>Загрузка...</strong></div>
-        <div class="kpi-card" id="kpi-uptime"><span>Uptime (24ч / 30д)</span><strong><br>Загрузка...</strong></div>
-        <div class="kpi-card" id="kpi-resp"><span>Ответ (24ч / 30д)</span><strong><br>Загрузка...</strong></div>
-        <div class="kpi-card" id="kpi-incidents"><span>Инциденты</span><strong><br>Загрузка...</strong></div>
-        <div class="kpi-card" id="kpi-ssl"><span>SSL &lt;=20д</span><strong><br>Загрузка...</strong></div>
-    </div>
-
-    <div id="warn-box" style="display:none;"></div>
-
-    <div class="tabs">
-        <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
-        <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
-        <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
-        <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
-    </div>
-
-    <div id="t1" class="tab-content active-content">
-        <table>
-            <thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead>
-            <tbody id="sites-tbody"><tr><td colspan="7" class="loading-cell" style="text-align:center;padding:40px;">Загрузка данных...</td></tr></tbody>
-        </table>
-    </div>
-
-    <div id="t2" class="tab-content">
-        <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
-            <div style="text-align:center; padding:40px; color:#999;">Перейдите во вкладку для загрузки графиков</div>
-        </div>
-    </div>
-
-    <div id="t3" class="tab-content">
-        <table>
-            <thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th></tr></thead>
-            <tbody id="incidents-tbody"><tr><td colspan="5" class="loading-cell" style="text-align:center;padding:40px;">Загрузка данных...</td></tr></tbody>
-        </table>
-    </div>
-
-    <div id="t4" class="tab-content">
-        <table>
-            <thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th></tr></thead>
-            <tbody id="calendar-tbody"><tr><td colspan="3" class="loading-cell" style="text-align:center;padding:40px;">Загрузка данных...</td></tr></tbody>
-        </table>
-    </div>
-</div>
-
-<script>
-const APP_DATA = {
-    sites: __SITES_JSON__,
-    priority: __PRIORITY_JSON__,
-    new_sites: __NEW_SITES_JSON__
-};
-
-function renderDashboard(data) {
-    if (!data || !data.sites) {
-        console.error('[renderDashboard] Invalid data', data);
-        return;
-    }
-    const kpiOnline = document.getElementById('kpi-online');
-    kpiOnline.innerHTML = '<span>Доступно</span><strong><br>' + (data.counts.online || 0) + ' / ' + (data.counts.total || 0) + '</strong>';
-    kpiOnline.classList.toggle('danger-card', (data.counts.online || 0) < (data.counts.total || 0));
-
-    document.getElementById('kpi-uptime').innerHTML = '<span>Uptime (24ч / 30д)</span><strong><br>' + (data.s24 && data.s24.up != null ? data.s24.up : 0) + '% / ' + (data.s30 && data.s30.up != null ? data.s30.up : 0) + '%</strong>';
-    document.getElementById('kpi-resp').innerHTML = '<span>Ответ (24ч / 30д)</span><strong><br>' + (data.s24 && data.s24.resp != null ? data.s24.resp : 0) + 'с / ' + (data.s30 && data.s30.resp != null ? data.s30.resp : 0) + 'с</strong>';
-
-    const kpiInc = document.getElementById('kpi-incidents');
-    kpiInc.innerHTML = '<span>Инциденты</span><strong><br>' + (data.counts.incidents || 0) + '</strong>';
-    kpiInc.classList.toggle('danger-card', (data.counts.incidents || 0) > 0);
-
-    const kpiSsl = document.getElementById('kpi-ssl');
-    kpiSsl.innerHTML = '<span>SSL &lt;=20д</span><strong><br>' + (data.counts.ssl_warn || 0) + '</strong>';
-    kpiSsl.classList.toggle('danger-card', (data.counts.ssl_warn || 0) > 0);
-
-    document.getElementById('now-msk').innerText = data.now_msk || '--';
-
-    const warnBox = document.getElementById('warn-box');
-    if (data.all_warn_list && data.all_warn_list.length > 0) {
-        warnBox.innerHTML = '<div class="error-bar">⚠️ Обратите внимание:<ul class="error-list"><li>' + data.all_warn_list.join('</li><li>') + '</li></ul></div>';
-        warnBox.style.display = 'block';
-    } else {
-        warnBox.style.display = 'none';
-    }
-
-    const tbody = document.getElementById('sites-tbody');
-    tbody.innerHTML = '';
-    for (const s of data.sites) {
-        const v = (data.latest && data.latest[s]) || {status:0, response_time:0, ssl_days:-1, domain_days:-1};
-        const st30 = (data.stats && data.stats[s]) || {upt:0, down_sec:0};
-        const isErr = v.status !== 200 || (v.ssl_days != null && v.ssl_days >= 0 && v.ssl_days <= 20) || (v.domain_days != null && v.domain_days >= 0 && v.domain_days <= 30);
-        const meta = APP_DATA.new_sites.includes(s) ? {is_new:true} : (APP_DATA.priority.includes(s) ? {is_priority:true} : {});
-        const prefix = meta.is_new ? '🔰 ' : (meta.is_priority ? '⭐️ ' : '');
-        const row = document.createElement('tr');
-        if (isErr) row.className = 'row-err';
-        row.innerHTML = 
-            '<td>' + prefix + '<a href="https://' + s + '" target="_blank" style="text-decoration:none; color:inherit;"><strong>' + s + '</strong></a></td>' +
-            '<td><span class="' + (v.status===200 ? 'txt-ok' : 'txt-err') + '">' + (v.status===200 ? 'Online' : 'Offline') + '</span></td>' +
-            '<td>' + (st30.upt != null ? st30.upt : 0) + '%</td>' +
-            '<td>' + (v.response_time != null ? v.response_time : 0).toFixed(2) + 'с</td>' +
-            '<td class="' + ((v.ssl_days != null && v.ssl_days >= 0 && v.ssl_days <= 20) ? 'txt-err' : '') + '">' + (v.ssl_days != null ? v.ssl_days : -1) + 'д</td>' +
-            '<td class="' + ((v.domain_days != null && v.domain_days >= 0 && v.domain_days <= 30) ? 'txt-err' : '') + '">' + (v.domain_days != null ? v.domain_days : -1) + 'д</td>' +
-            '<td><button class="btn-test" onclick="runTest('' + s + '', this)"><div class="loader"></div><span>📸 Screen</span></button></td>';
-        tbody.appendChild(row);
-    }
-}
-
-function renderIncidents(incidents) {
-    const tbody = document.getElementById('incidents-tbody');
-    tbody.innerHTML = '';
-    if (!incidents || incidents.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#999;">Нет инцидентов за последние 30 дней</td></tr>';
-        return;
-    }
-    for (const r of incidents) {
-        const tr = document.createElement('tr');
-        const dt = new Date(r.start_time).toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit', timeZone: 'Europe/Moscow'});
-        tr.innerHTML = 
-            '<td>' + dt + '</td>' +
-            '<td>' + r.site + '</td>' +
-            '<td class="txt-err">' + r.dur + ' мин</td>' +
-            '<td>' + r.max_status + '</td>' +
-            '<td>' + r.description + '</td>';
-        tbody.appendChild(tr);
-    }
-}
-
-function renderCalendar(latest) {
-    const tbody = document.getElementById('calendar-tbody');
-    tbody.innerHTML = '';
-    const events = [];
-    for (const s of APP_DATA.sites) {
-        const v = latest ? latest[s] : null;
-        if (!v) continue;
-        if (v.ssl_days != null && v.ssl_days >= 0) events.push({t: 'SSL сертификат', s: s, d: v.ssl_days});
-        if (v.domain_days != null && v.domain_days >= 0) events.push({t: 'Оплата домена', s: s, d: v.domain_days});
-    }
-    events.sort(function(a,b){ return a.d - b.d; });
-    if (events.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:#999;">Нет предстоящих событий</td></tr>';
-        return;
-    }
-    for (const ev of events) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = 
-            '<td>' + ev.t + '</td>' +
-            '<td>' + ev.s + '</td>' +
-            '<td class="' + (ev.d <= 30 ? 'txt-err' : '') + '">' + ev.d + ' дн.</td>';
-        tbody.appendChild(tr);
-    }
-}
-
-function tab(e, n) {
-    var i, x = document.getElementsByClassName('tab-content'),
-        b = document.getElementsByClassName('tab-btn');
-    for(i = 0; i < x.length; i++) x[i].className = 'tab-content';
-    for(i = 0; i < b.length; i++) b[i].className = 'tab-btn';
-    document.getElementById(n).className = 'tab-content active-content';
-    e.currentTarget.className += ' active';
-    if (n === 't2') loadCharts();
-}
-
-async function runTest(site, btn) {
-    if (btn.classList.contains('loading')) return;
-    btn.classList.add('loading');
-    btn.disabled = true;
-    try {
-        const response = await fetch('/test-screen/' + site);
-        const data = await response.json();
-        showToast(data.msg);
-    } catch (e) { showToast('Ошибка связи с сервером'); }
-    finally { btn.classList.remove('loading'); btn.disabled = false; }
-}
-
-function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.innerText = msg;
-    t.style.display = 'block';
-    setTimeout(function(){ t.style.display = 'none'; }, 4000);
-}
-
-let chartsLoaded = false;
-let chartsLoading = false;
-
-async function loadCharts() {
-    if (chartsLoaded || chartsLoading) return;
-    chartsLoading = true;
-    try {
-        const res = await fetch('/api/charts');
-        const g_data = await res.json();
-        const container = document.getElementById('charts-container');
-        container.innerHTML = '';
-        const sites = APP_DATA.sites.filter(function(s){ return g_data[s]; });
-        for (const s of sites) {
-            const d = g_data[s];
-            const div = document.createElement('div');
-            div.className = 'kpi-card';
-            div.style.borderTop = '2px solid #eee';
-            div.innerHTML = '<h5>' + s + '</h5><canvas id="c-' + s.replace(/\./g, '_') + '"></canvas>';
-            container.appendChild(div);
-            new Chart(document.getElementById('c-' + s.replace(/\./g, '_')), {
-                type: 'line',
-                data: {
-                    labels: d.l,
-                    datasets: [
-                        { label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 },
-                        { label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }
-                    ]
-                },
-                options: {
-                    scales: {
-                        y: { min: 75, max: 110 },
-                        y1: { position: 'right', grid: { display: false } }
-                    }
-                }
-            });
-        }
-        chartsLoaded = true;
-    } catch (e) {
-        document.getElementById('charts-container').innerHTML =
-            '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
-    } finally {
-        chartsLoading = false;
-    }
-}
-
-async function softReload() {
-    try {
-        const dashRes = await fetch('/api/dashboard');
-        if (!dashRes.ok) throw new Error('HTTP ' + dashRes.status);
-        const dashData = await dashRes.json();
-        renderDashboard(dashData);
-        const incRes = await fetch('/api/incidents');
-        if (!incRes.ok) throw new Error('HTTP ' + incRes.status);
-        const incData = await incRes.json();
-        renderIncidents(incData.incidents);
-        renderCalendar(dashData.latest);
-        showToast('Данные обновлены: ' + (dashData.now_msk || ''));
-    } catch (e) {
-        console.error('softReload error:', e);
-        showToast('Ошибка обновления: ' + e.message);
-    }
-}
-
-async function init() {
-    console.log('[INIT] Starting...');
-    try {
-        const dashRes = await fetch('/api/dashboard');
-        console.log('[INIT] dashboard response', dashRes.status);
-        if (!dashRes.ok) throw new Error('HTTP ' + dashRes.status);
-        const dashData = await dashRes.json();
-        console.log('[INIT] dashboard data keys', Object.keys(dashData));
-        renderDashboard(dashData);
-
-        const incRes = await fetch('/api/incidents');
-        console.log('[INIT] incidents response', incRes.status);
-        if (!incRes.ok) throw new Error('HTTP ' + incRes.status);
-        const incData = await incRes.json();
-        renderIncidents(incData.incidents);
-        renderCalendar(dashData.latest);
-    } catch (e) {
-        console.error('[INIT] Error:', e);
-        document.getElementById('sites-tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:#dc2626;padding:40px;">Ошибка загрузки данных: ' + e.message + '</td></tr>';
-        document.getElementById('incidents-tbody').innerHTML = '<tr><td colspan="5" style="text-align:center;color:#dc2626;padding:40px;">Ошибка загрузки данных</td></tr>';
-        document.getElementById('calendar-tbody').innerHTML = '<tr><td colspan="3" style="text-align:center;color:#dc2626;padding:40px;">Ошибка загрузки данных</td></tr>';
-    }
-}
-
-setInterval(function(){ softReload(); }, 120000);
-init();
-</script>
-</body>
-</html>
-"""
 
 
 # ============================================================================
@@ -1231,6 +830,7 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
 
 
 def _get_stats_from_agg(cur, interval: str):
+    """Статистика из checks_agg; fallback на logs если агрегаты пусты"""
     cur.execute("""
         SELECT
             ROUND(SUM(status_200_count) * 100.0
@@ -1241,6 +841,7 @@ def _get_stats_from_agg(cur, interval: str):
     row = cur.fetchone()
     if row and row[0] is not None:
         return {'up': row[0], 'resp': row[1]}
+    # Fallback на logs
     cur.execute("""
         SELECT
             ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
@@ -1252,6 +853,9 @@ def _get_stats_from_agg(cur, interval: str):
     return {'up': row[0] or 0, 'resp': row[1] or 0}
 
 
+# ============================================================================
+# API для графиков — lazy load фоном после first paint
+# ============================================================================
 @app.get("/api/charts")
 async def api_charts(auth: bool = Depends(check_auth)):
     conn = get_db_connection()
@@ -1302,16 +906,53 @@ async def api_charts(auth: bool = Depends(check_auth)):
     return JSONResponse(data)
 
 
-@app.get("/api/incidents")
-async def api_incidents(auth: bool = Depends(check_auth)):
-    global _incidents_cache
+# ============================================================================
+# DASHBOARD — shell (KPI + таблица + инциденты + календарь)
+# Графики подгружаются фоном через /api/charts
+# ============================================================================
+@app.get("/", response_class=HTMLResponse)
+async def index(auth: bool = Depends(check_auth)):
+    global _dashboard_cache
     now = time.time()
-    with _incidents_cache["lock"]:
-        if _incidents_cache["data"] and now - _incidents_cache["timestamp"] < 60:
-            return JSONResponse(_incidents_cache["data"])
+    with _dashboard_cache["lock"]:
+        if _dashboard_cache["data"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
+            return _build_html(_dashboard_cache["data"])
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
+
+    # --- SQL: только лёгкие запросы (нет графиков) ---
+    s30 = _get_stats_from_agg(cur, '30 days')
+    s24 = _get_stats_from_agg(cur, '24 hours')
+
+    cur.execute("SELECT * FROM latest_status")
+    latest_all = {r['site']: r for r in cur.fetchall()}
+    latest = {s: latest_all[s] for s in SITES if s in latest_all}
+
+    # Статистика по сайтам — из checks_agg
+    cur.execute("""
+        SELECT site,
+            ROUND(SUM(status_200_count) * 100.0
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+            SUM(checks_count - status_200_count) * 5 as down_sec
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
+        GROUP BY site
+    """)
+    stats_rows = cur.fetchall()
+    if stats_rows and stats_rows[0][0] is not None:
+        stats = {r['site']: r for r in stats_rows}
+    else:
+        cur.execute("""
+            SELECT site,
+                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
+                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+            GROUP BY site
+        """)
+        stats = {r['site']: r for r in cur.fetchall()}
+
+    # Инциденты — CTE с ограничением 3 днями (быстро, не грузит память)
     cur.execute("""
         WITH status_changes AS (
             SELECT site, timestamp, status,
@@ -1335,58 +976,32 @@ async def api_incidents(auth: bool = Depends(check_auth)):
         FROM incident_groups
         GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
     """)
-    data = {"incidents": [dict(r) for r in cur.fetchall()]}
+    incidents_list = [dict(r) for r in cur.fetchall()]
+
     cur.close()
     conn.close()
 
-    with _incidents_cache["lock"]:
-        _incidents_cache["data"] = data
-        _incidents_cache["timestamp"] = time.time()
-    return JSONResponse(data)
-
-
-@app.get("/api/dashboard")
-async def api_dashboard(auth: bool = Depends(check_auth)):
-    global _dashboard_cache
-    now = time.time()
+    # Сохраняем dict в кэш (не HTML-строку — экономия ~2 MB RAM)
+    data = {
+        "s30": s30, "s24": s24,
+        "latest": latest, "stats": stats,
+        "incidents": incidents_list,
+        "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
+    }
     with _dashboard_cache["lock"]:
-        if _dashboard_cache["data"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
-            return JSONResponse(_dashboard_cache["data"])
+        _dashboard_cache["data"] = data
+        _dashboard_cache["timestamp"] = time.time()
+    return _build_html(data)
 
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=DictCursor)
 
-    s30 = _get_stats_from_agg(cur, '30 days')
-    s24 = _get_stats_from_agg(cur, '24 hours')
-
-    cur.execute("SELECT * FROM latest_status")
-    latest_all = {r['site']: dict(r) for r in cur.fetchall()}
-    latest = {s: latest_all[s] for s in SITES if s in latest_all}
-
-    cur.execute("""
-        SELECT site,
-            ROUND(SUM(status_200_count) * 100.0
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            SUM(checks_count - status_200_count) * 5 as down_sec
-        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
-        GROUP BY site
-    """)
-    stats_rows = cur.fetchall()
-    if stats_rows and stats_rows[0][0] is not None:
-        stats = {r['site']: dict(r) for r in stats_rows}
-    else:
-        cur.execute("""
-            SELECT site,
-                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
-            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-            GROUP BY site
-        """)
-        stats = {r['site']: dict(r) for r in cur.fetchall()}
-
-    cur.close()
-    conn.close()
+def _build_html(data: dict) -> str:
+    """Сборка HTML из кэшированного dict (без SQL, <10 мс)"""
+    s30 = data["s30"]
+    s24 = data["s24"]
+    latest = data["latest"]
+    stats = data["stats"]
+    incidents_list = data["incidents"]
+    now_msk = data["now_msk"]
 
     incidents = [s for s, v in latest.items() if v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
@@ -1396,10 +1011,105 @@ async def api_dashboard(auth: bool = Depends(check_auth)):
     all_warn_list = (
         [f"❌ {s} (Offline)" for s in incidents]
         + [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
-        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)" for s in latency_warn]
+        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)"
+           for s in latency_warn]
     )
 
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
+    total_sites = len(SITES)
+
+    html = f"""
+    <html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc;
+                padding: 20px; color: #1e293b; }}
+        .container {{ max-width: 1400px; margin: auto; background: white;
+                      padding: 25px; border-radius: 12px;
+                      box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr);
+                     gap: 10px; margin-bottom: 20px; }}
+        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px;
+                     border: 1px solid #e2e8f0; border-top: 4px solid #00717a;
+                     text-align: center; }}
+        .danger-card {{ border-top-color: #ef4444 !important;
+                        background: #fef2f2 !important; }}
+        .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2;
+                      color: #b91c1c; padding: 15px; border-radius: 8px;
+                      margin-bottom: 20px; font-weight: bold; }}
+        .error-list {{ margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }}
+        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px;
+                 border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
+        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0;
+                    border-radius: 6px; cursor: pointer; font-weight: bold; }}
+        .tab-btn.active {{ background: #00717a; color: white; }}
+        .tab-content {{ display: none; }}
+        .active-content {{ display: block; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ padding: 12px; text-align: left;
+                  border-bottom: 1px solid #f1f5f9; }}
+        .row-err {{ background-color: #fff1f2 !important; }}
+        .txt-err {{ color: #dc2626; font-weight: bold; }}
+        .txt-ok {{ color: #16a34a; font-weight: bold; }}
+        .refresh-btn {{ background: #00717a; color: white; border: none;
+                        padding: 8px 15px; border-radius: 6px; cursor: pointer; }}
+        .btn-test {{ background: #00717a; color: white; border: none;
+                     padding: 5px 10px; border-radius: 4px; cursor: pointer;
+                     text-decoration: none; font-size: 11px;
+                     display: inline-flex; align-items: center;
+                     justify-content: center; min-width: 80px; }}
+        .loader {{ border: 2px solid #f3f3f3; border-top: 2px solid #00717a;
+                   border-radius: 50%; width: 12px; height: 12px;
+                   animation: spin 1s linear infinite; display: none; margin-right: 5px; }}
+        @keyframes spin {{ 0% {{ transform: rotate(0deg); }}
+                           100% {{ transform: rotate(360deg); }} }}
+        .loading .loader {{ display: inline-block; }}
+        .loading span {{ display: none; }}
+        .toast {{ position: fixed; bottom: 20px; right: 20px;
+                  background: #333; color: white; padding: 12px 24px;
+                  border-radius: 8px; display: none; z-index: 1000;
+                  box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
+    </style></head><body>
+    <div id="toast" class="toast"></div>
+    <div class="container">
+        <div style="display:flex; justify-content:space-between;
+                     align-items:center; margin-bottom:20px;">
+            <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
+            <button class="refresh-btn" onclick="location.reload()">
+                🔄 Обновить: {now_msk}
+            </button>
+        </div>
+        <div class="kpi-grid">
+            <div class="kpi-card {'danger-card' if online_count < total_sites else ''}">
+                <span>Доступно</span><strong><br>{online_count} / {total_sites}</strong>
+            </div>
+            <div class="kpi-card">
+                <span>Uptime (24ч / 30д)</span>
+                <strong><br>{s24['up']}% / {s30['up']}%</strong>
+            </div>
+            <div class="kpi-card">
+                <span>Ответ (24ч / 30д)</span>
+                <strong><br>{s24['resp']}с / {s30['resp']}с</strong>
+            </div>
+            <div class="kpi-card {'danger-card' if len(incidents) > 0 else ''}">
+                <span>Инциденты</span><strong><br>{len(incidents)}</strong>
+            </div>
+            <div class="kpi-card {'danger-card' if ssl_warn else ''}">
+                <span>SSL &lt;=20д</span><strong><br>{len(ssl_warn)}</strong>
+            </div>
+        </div>
+        {f'<div class="error-bar">⚠️ Обратите внимание:<ul class="error-list"><li>'
+         + '</li><li>'.join(all_warn_list) + '</li></ul></div>' if all_warn_list else ''}
+        <div class="tabs">
+            <button class="tab-btn active" onclick="tab(event, 't1')">Список</button>
+            <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
+            <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
+            <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
+        </div>
+        <div id="t1" class="tab-content active-content">
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
+            <th>Ответ</th><th>SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
+    """
 
     def get_site_weight(site_name):
         if site_name == "sibur.ru":
@@ -1411,49 +1121,132 @@ async def api_dashboard(auth: bool = Depends(check_auth)):
         return 3
 
     sorted_sites = sorted(SITES, key=lambda x: (get_site_weight(x), x))
-    site_meta = {}
+    sorted_sites_json = json.dumps(sorted_sites)
     for s in sorted_sites:
-        site_meta[s] = {
-            "is_new": s in NEW_MONITORING_SITES,
-            "is_priority": s in PRIORITY_SITES,
-            "weight": get_site_weight(s)
-        }
+        v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1})
+        st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
+        is_err = v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or (0 <= v['domain_days'] <= 30)
+        prefix = "🔰 " if s in NEW_MONITORING_SITES else ("⭐️ " if s in PRIORITY_SITES else "")
 
-    data = {
-        "s30": s30,
-        "s24": s24,
-        "latest": latest,
-        "stats": stats,
-        "sites": sorted_sites,
-        "site_meta": site_meta,
-        "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S"),
-        "all_warn_list": all_warn_list,
-        "counts": {
-            "online": online_count,
-            "total": len(SITES),
-            "incidents": len(incidents),
-            "ssl_warn": len(ssl_warn),
-            "latency_warn": len(latency_warn)
-        }
-    }
+        html += f"""<tr class="{'row-err' if is_err else ''}">
+            <td>{prefix}<a href="https://{s}" target="_blank"
+                style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
+            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
+                {'Online' if v['status']==200 else 'Offline'}</span></td>
+            <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
+            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
+            <td><button class="btn-test" onclick="runTest('{s}', this)">
+                <div class="loader"></div><span>📸 Screen</span></button></td></tr>"""
 
-    with _dashboard_cache["lock"]:
-        _dashboard_cache["data"] = data
-        _dashboard_cache["timestamp"] = time.time()
+    html += """</tbody></table></div>
+    <div id="t2" class="tab-content">
+    <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
+        <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
+    </div></div>
+    <div id="t3" class="tab-content">
+    <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
+    <th>Код</th><th>Описание</th></tr></thead><tbody>"""
 
-    return JSONResponse(data)
+    for r in incidents_list:
+        html += f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+            <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
+            <td>{r['max_status']}</td><td>{r['description']}</td></tr>"""
 
+    html += """</tbody></table></div>
+    <div id="t4" class="tab-content">
+    <table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
+    </tr></thead><tbody>"""
 
-@app.get("/", response_class=HTMLResponse)
-async def index(auth: bool = Depends(check_auth)):
-    sites_json = json.dumps(SITES, ensure_ascii=False)
-    priority_json = json.dumps(PRIORITY_SITES, ensure_ascii=False)
-    new_sites_json = json.dumps(NEW_MONITORING_SITES, ensure_ascii=False)
-    html = HTML_SHELL
-    html = html.replace('__SITES_JSON__', sites_json)
-    html = html.replace('__PRIORITY_JSON__', priority_json)
-    html = html.replace('__NEW_SITES_JSON__', new_sites_json)
-    return HTMLResponse(html)
+    cal_events = []
+    for s in SITES:
+        v = latest.get(s, {})
+        if v.get('ssl_days', -1) >= 0:
+            cal_events.append({'t': 'SSL сертификат', 's': s, 'd': v['ssl_days']})
+        if v.get('domain_days', -1) >= 0:
+            cal_events.append({'t': 'Оплата домена', 's': s, 'd': v['domain_days']})
+    for ev in sorted(cal_events, key=lambda x: x['d']):
+        html += f"""<tr><td>{ev['t']}</td><td>{ev['s']}</td>
+            <td class="{'txt-err' if ev['d']<=30 else ''}">{ev['d']} дн.</td></tr>"""
+
+    html += f"""</tbody></table></div></div><script>
+    let chartsLoaded = false;
+    let chartsLoading = false;
+
+    function tab(e, n){{
+        var i, x = document.getElementsByClassName('tab-content'),
+            b = document.getElementsByClassName('tab-btn');
+        for(i = 0; i < x.length; i++) x[i].className = 'tab-content';
+        for(i = 0; i < b.length; i++) b[i].className = 'tab-btn';
+        document.getElementById(n).className = 'tab-content active-content';
+        e.currentTarget.className += ' active';
+        if (n === 't2') loadCharts();
+    }}
+
+    async function runTest(site, btn) {{
+        if (btn.classList.contains('loading')) return;
+        btn.classList.add('loading');
+        btn.disabled = true;
+        try {{
+            const response = await fetch('/test-screen/' + site);
+            const data = await response.json();
+            showToast(data.msg);
+        }} catch (e) {{ showToast('Ошибка связи с сервером'); }}
+        finally {{ btn.classList.remove('loading'); btn.disabled = false; }}
+    }}
+
+    function showToast(msg) {{
+        const t = document.getElementById('toast');
+        t.innerText = msg;
+        t.style.display = 'block';
+        setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
+    }}
+
+    async function loadCharts() {{
+        if (chartsLoaded || chartsLoading) return;
+        chartsLoading = true;
+        try {{
+            const res = await fetch('/api/charts');
+            const g_data = await res.json();
+            const container = document.getElementById('charts-container');
+            container.innerHTML = '';
+            const sites = {sorted_sites_json}.filter(s => g_data[s]);
+            for (const s of sites) {{
+                const d = g_data[s];
+                const div = document.createElement('div');
+                div.className = 'kpi-card';
+                div.style.borderTop = '2px solid #eee';
+                div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\./g, '_')}}"></canvas>`;
+                container.appendChild(div);
+                new Chart(document.getElementById('c-' + s.replace(/\./g, '_')), {{
+                    type: 'line',
+                    data: {{
+                        labels: d.l,
+                        datasets: [
+                            {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', yAxisID: 'y', tension: 0.3 }},
+                            {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', yAxisID: 'y1', tension: 0.3 }}
+                        ]
+                    }},
+                    options: {{
+                        scales: {{
+                            y: {{ min: 75, max: 110 }},
+                            y1: {{ position: 'right', grid: {{ display: false }} }}
+                        }}
+                    }}
+                }});
+            }}
+            chartsLoaded = true;
+        }} catch (e) {{
+            document.getElementById('charts-container').innerHTML =
+                '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
+        }} finally {{
+            chartsLoading = false;
+        }}
+    }}
+
+    setInterval(() => {{ location.reload(); }}, 120000);
+    </script></body></html>"""
+    return html
 
 
 if __name__ == "__main__":
