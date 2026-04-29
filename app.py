@@ -545,26 +545,47 @@ def ensure_partitions():
 # TELEGRAM
 # ============================================================================
 def send_tg_msg(text, photo_path=None):
+    """Отправка в Telegram с retry (3 попытки) + логированием"""
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
-    try:
-        if photo_path and os.path.exists(photo_path):
-            with open(photo_path, 'rb') as f:
-                requests.post(
-                    base_url + "sendPhoto",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": text},
-                    files={"photo": f},
-                    timeout=30
+    ok = False
+    for attempt in range(1, 4):
+        try:
+            if photo_path and os.path.exists(photo_path):
+                with open(photo_path, 'rb') as f:
+                    resp = requests.post(
+                        base_url + "sendPhoto",
+                        data={"chat_id": TELEGRAM_CHAT_ID, "caption": text},
+                        files={"photo": f},
+                        timeout=30
+                    )
+                if resp.status_code == 200:
+                    print(f"[TG OK] Photo sent (attempt {attempt}): {text[:80]}")
+                    ok = True
+                    break
+                print(f"[TG ERR] Photo attempt {attempt}: HTTP {resp.status_code} — {resp.text[:120]}")
+            else:
+                resp = requests.post(
+                    base_url + "sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                    timeout=10
                 )
-            if os.path.exists(photo_path):
-                os.remove(photo_path)
-        else:
-            requests.post(
-                base_url + "sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-                timeout=10
-            )
-    except Exception:
-        pass
+                if resp.status_code == 200:
+                    print(f"[TG OK] Text sent (attempt {attempt}): {text[:80]}")
+                    ok = True
+                    break
+                print(f"[TG ERR] Text attempt {attempt}: HTTP {resp.status_code} — {resp.text[:120]}")
+        except Exception as e:
+            print(f"[TG ERR] attempt {attempt}: {type(e).__name__}: {e}")
+        # exponential backoff
+        if attempt < 3:
+            time.sleep(2 ** attempt)
+    # cleanup photo in any case
+    if photo_path and os.path.exists(photo_path):
+        try:
+            os.remove(photo_path)
+        except Exception:
+            pass
+    return ok
 
 
 # ============================================================================
@@ -960,9 +981,11 @@ def check_worker():
                                 flush_batch()
 
                         if fail_count[site] == alert_threshold and last_status[site] == 200:
+                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
                             shot_path = take_screenshot_fast(site)
                             msg = f"🚨 DOWN: {site} (Код: {curr_status})"
-                            send_tg_msg(msg, shot_path)
+                            ok = send_tg_msg(msg, shot_path)
+                            print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
                             last_status[site] = curr_status
                             _invalidate_dashboard_cache()
                     else:
@@ -973,19 +996,25 @@ def check_worker():
 
                         if last_status[site] != 200:
                             duration = fail_count[site]
+                            print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                             _db_incident_resolve(site)
-                            send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                            ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                            print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
                             _invalidate_dashboard_cache()
 
                         last_status[site], fail_count[site] = 200, 0
 
                         if resp_time > 20 and not last_latency_map[site]:
-                            send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                            print(f"[ALERT TRIGGER] {site} LATENCY {round(resp_time, 2)}s")
+                            ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                            print(f"[ALERT RESULT] {site} LATENCY send_tg_msg={'OK' if ok else 'FAIL'}")
                             last_latency_map[site] = True
                         elif resp_time < 10 and last_latency_map[site]:
-                            send_tg_msg(
+                            print(f"[ALERT TRIGGER] {site} LATENCY RECOVERED {round(resp_time, 2)}s")
+                            ok = send_tg_msg(
                                 f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."
                             )
+                            print(f"[ALERT RESULT] {site} LATENCY REC send_tg_msg={'OK' if ok else 'FAIL'}")
                             last_latency_map[site] = False
                 except Exception as e:
                     print(f"Ошибка обработки результата для {site}: {e}")
@@ -1141,17 +1170,19 @@ async def health():
 
 
 def _get_stats_from_agg(cur, interval: str):
-    """Статистика из checks_agg; fallback на logs если агрегаты пусты"""
+    """Статистика из checks_agg; fallback на logs если агрегаты пусты.
+    Uptime — взвешенный через SUM, response_time — взвешенное среднее."""
     cur.execute("""
         SELECT
             ROUND(SUM(status_200_count) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as up,
-            ROUND(AVG(avg_response_time)::numeric, 3) as resp
+            ROUND(SUM(avg_response_time * checks_count)
+                  / NULLIF(SUM(checks_count), 0)::numeric, 3) as resp
         FROM checks_agg WHERE bucket > NOW() - INTERVAL %s
     """, (interval,))
     row = cur.fetchone()
     if row and row[0] is not None:
-        return {'up': row[0], 'resp': row[1]}
+        return {'up': float(row[0]), 'resp': float(row[1]) if row[1] is not None else 0}
     # Fallback на logs
     cur.execute("""
         SELECT
@@ -1161,7 +1192,7 @@ def _get_stats_from_agg(cur, interval: str):
         FROM logs WHERE timestamp > NOW() - INTERVAL %s
     """, (interval,))
     row = cur.fetchone()
-    return {'up': row[0] or 0, 'resp': row[1] or 0}
+    return {'up': float(row[0]) if row[0] is not None else 0, 'resp': float(row[1]) if row[1] is not None else 0}
 
 
 # ============================================================================
@@ -1176,7 +1207,8 @@ async def api_charts(auth: bool = Depends(check_auth)):
 
     cur.execute("""
         SELECT site, bucket::date as d,
-               ROUND(AVG(avg_response_time)::numeric, 2) as r,
+               ROUND(SUM(avg_response_time * checks_count)
+                     / NULLIF(SUM(checks_count), 0)::numeric, 2) as r,
                ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
         FROM checks_agg
         WHERE bucket > NOW() - INTERVAL '14 days'
@@ -1263,6 +1295,39 @@ async def index(auth: bool = Depends(check_auth)):
         """)
         stats = {r['site']: r for r in cur.fetchall()}
 
+    # Групповые метрики (правильный расчет uptime/resp через взвешенное среднее)
+    cur.execute("""
+        SELECT 
+            CASE WHEN site = ANY(%s) THEN 0
+                 WHEN site = ANY(%s) THEN 1
+                 ELSE 2 END as grp,
+            ROUND(SUM(status_200_count) * 100.0 
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+            ROUND(SUM(avg_response_time * checks_count) 
+                  / NULLIF(SUM(checks_count), 0)::numeric, 3) as resp
+        FROM checks_agg 
+        WHERE bucket > NOW() - INTERVAL '30 days'
+        GROUP BY grp
+    """, (KEY_SITES, STDO_SITES))
+    group_agg_rows = cur.fetchall()
+    if group_agg_rows and group_agg_rows[0][0] is not None:
+        group_agg = {r['grp']: r for r in group_agg_rows}
+    else:
+        # fallback на logs
+        cur.execute("""
+            SELECT 
+                CASE WHEN site = ANY(%s) THEN 0
+                     WHEN site = ANY(%s) THEN 1
+                     ELSE 2 END as grp,
+                ROUND(COUNT(*) FILTER (WHERE status = 200) * 100.0
+                      / NULLIF(COUNT(*), 0)::numeric, 2) as upt,
+                ROUND(AVG(response_time)::numeric, 3) as resp
+            FROM logs 
+            WHERE timestamp > NOW() - INTERVAL '30 days'
+            GROUP BY grp
+        """, (KEY_SITES, STDO_SITES))
+        group_agg = {r['grp']: r for r in cur.fetchall()}
+
     # Инциденты — читаем из таблицы incidents (быстро), fallback на CTE из logs (разово)
     cur.execute("""
         SELECT site, start_time,
@@ -1314,6 +1379,7 @@ async def index(auth: bool = Depends(check_auth)):
         "s30": s30, "s24": s24,
         "latest": latest, "stats": stats,
         "incidents": incidents_list,
+        "group_agg": group_agg,
         "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
     }
     with _dashboard_cache["lock"]:
@@ -1360,23 +1426,29 @@ def _build_html(data: dict) -> str:
     stdo_sites_json = json.dumps(STDO_SITES)
     external_sites_json = json.dumps(EXTERNAL_SITES)
 
-    # Промежуточные итоги по группам для графиков
+    group_agg = data.get("group_agg", {})
+
+    # Промежуточные итоги по группам для графиков (из checks_agg, взвешенное среднее)
     group_stats = {}
     for g in [0, 1, 2]:
         group_sites = [s for s in sorted_sites if get_site_group(s) == g]
         group_valid = [latest[s] for s in group_sites if s in latest]
-        if group_valid:
-            g_online = sum(1 for v in group_valid if v['status'] == 200)
-            g_avg_resp = sum(float(v['response_time']) for v in group_valid) / len(group_valid)
-            g_upt = round(
-                sum(float((stats.get(site, {}) or {}).get('upt', 0) or 0) for site in group_sites)
-                / max(len(group_sites), 1), 1)
-            group_stats[g] = {
-                'online': g_online, 'total': len(group_sites),
-                'upt': float(g_upt), 'resp': round(float(g_avg_resp), 2)
-            }
+        g_row = group_agg.get(g)
+        if g_row and g_row.get('upt') is not None:
+            g_upt = float(g_row['upt'])
+            g_resp = float(g_row['resp'] or 0)
         else:
-            group_stats[g] = {'online': 0, 'total': len(group_sites), 'upt': 0, 'resp': 0}
+            # fallback: если в checks_agg нет данных — ручной расчет по сайтам
+            if group_valid:
+                g_upt = round(sum(float((stats.get(site, {}) or {}).get('upt', 0) or 0) for site in group_sites) / max(len(group_sites), 1), 1)
+                g_resp = round(sum(float(v['response_time']) for v in group_valid) / len(group_valid), 2)
+            else:
+                g_upt, g_resp = 0, 0
+        g_online = sum(1 for v in group_valid if v['status'] == 200) if group_valid else 0
+        group_stats[g] = {
+            'online': g_online, 'total': len(group_sites),
+            'upt': float(g_upt), 'resp': float(g_resp)
+        }
     group_stats_json = json.dumps(group_stats)
 
     # Используем list для O(n) сборки вместо O(n^2) string concatenation
@@ -1480,16 +1552,8 @@ def _build_html(data: dict) -> str:
     for s in sorted_sites:
         g = get_site_group(s)
         if g != current_group:
-            # Расчёт итогов по группе
-            group_sites = [site for site in sorted_sites if get_site_group(site) == g]
-            group_valid = [latest[site] for site in group_sites if site in latest]
-            if group_valid:
-                g_online = sum(1 for v in group_valid if v['status'] == 200)
-                g_avg_resp = sum(float(v['response_time']) for v in group_valid) / len(group_valid)
-                g_upt = round(sum(float(stats.get(site, {}).get('upt', 0) or 0) for site in group_sites) / len(group_sites), 1)
-                g_sub = f'<span class="group-sub">Online: {g_online}/{len(group_valid)} | Uptime: {g_upt}% | ⌀ Ответ: {round(float(g_avg_resp), 2)}с</span>'
-            else:
-                g_sub = '<span class="group-sub">Нет данных</span>'
+            st = group_stats.get(g, {'online': 0, 'total': 0, 'upt': 0, 'resp': 0})
+            g_sub = f'<span class="group-sub">Online: {st["online"]}/{st["total"]} | Uptime: {st["upt"]}% | ⌀ Ответ: {st["resp"]}с</span>'
             H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}{g_sub}</td></tr>')
             current_group = g
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
