@@ -641,7 +641,7 @@ async def check_single_site(session, site, semaphore):
             else:
                 actual_session = session
 
-            timeout = aiohttp.ClientTimeout(total=25)
+            timeout = aiohttp.ClientTimeout(total=10)
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
@@ -971,7 +971,7 @@ def check_worker():
                     print(f"[WORKER] Processing {site} status={curr_status} resp={round(resp_time,2)}s last_status={last_status[site]} fail_count={fail_count[site]}")
                     if curr_status != 200:
                         fail_count[site] += 1
-                        alert_threshold = 5 if site in PRIORITY_SITES else 10
+                        alert_threshold = 5
                         print(f"[CHECK FAIL] {site} status={curr_status} fail_count={fail_count[site]}/{alert_threshold} last_status={last_status[site]}")
 
                         # --- Incident tracking ---
@@ -989,7 +989,7 @@ def check_worker():
                             if len(batch_buffer) >= BATCH_SIZE:
                                 flush_batch()
 
-                        if fail_count[site] == alert_threshold and last_status[site] == 200:
+                        if fail_count[site] >= alert_threshold and last_status[site] == 200:
                             print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
                             shot_path = take_screenshot_fast(site)
                             msg = f"🚨 DOWN: {site} (Код: {curr_status})"
@@ -1110,9 +1110,6 @@ async def startup_event():
         print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
     else:
         print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}..., token_len={len(TELEGRAM_TOKEN)}")
-        # Тестовая отправка для проверки связи
-        await asyncio.to_thread(send_tg_msg, "🤖 Мониторинг запущен — тестовое сообщение")
-        print("[STARTUP] Test Telegram message sent")
 
 
 # ============================================================================
