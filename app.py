@@ -594,9 +594,37 @@ def send_tg_msg(text, photo_path=None):
 # ============================================================================
 # WHOIS
 # ============================================================================
-def get_domain_info(site):
+def _check_ssl_sync(domain_only, site):
+    """Синхронная SSL-проверка (для вызова через asyncio.to_thread)"""
     try:
-        domain_only = site.split('/')[0]
+        if site in SELF_SIGNED_SITES:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                    cert = ssock.getpeercert()
+                    exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                    ssl_d = (exp - datetime.datetime.utcnow()).days
+                    return ssl_d, None  # N/A for self-signed
+        else:
+            ctx = ssl.create_default_context()
+            with socket.create_connection((domain_only, 443), timeout=3) as sock:
+                with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                    cert = ssock.getpeercert()
+                    exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                    ssl_d = (exp - datetime.datetime.utcnow()).days
+                    return ssl_d, True
+    except ssl.SSLCertVerificationError:
+        return -1, False
+    except Exception:
+        return -1, None
+
+
+def _check_whois_sync(domain_only):
+    """Синхронная WHOIS-проверка (для вызова через asyncio.to_thread)"""
+    try:
+        import whois
         w = whois.whois(domain_only)
         exp = w.expiration_date
         if isinstance(exp, list):
@@ -608,33 +636,25 @@ def get_domain_info(site):
     return -1
 
 
-def get_domain_info_cached(site):
-    """WHOIS с кэшем 24 часа"""
-    now = time.time()
-    if site in _whois_cache:
-        cached_time, value = _whois_cache[site]
-        if now - cached_time < WHOIS_CACHE_TTL:
-            return value
-    result = get_domain_info(site)
-    _whois_cache[site] = (now, result)
-    return result
+def get_domain_info(site):
+    return _check_whois_sync(site.split('/')[0])
 
 
 # ============================================================================
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
 async def check_single_site(session, site, semaphore):
-    """Проверка одного сайта через aiohttp с семафором + SSL chain validation + WHOIS cache"""
+    """Проверка одного сайта: HTTP через aiohttp (async), SSL+WHOIS через to_thread (не блокирует семафор)"""
+    check_url = f"https://{site}"
+    domain_only = site.split('/')[0]
+    curr_status, resp_time = 0, 25.0
+
+    # --- Шаг 1: HTTP проверка (async, под семафором) ---
+    ssl_verify = not should_verify(site)
+    connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
+    start = time.time()
+    actual_session = None
     async with semaphore:
-        check_url = f"https://{site}"
-        domain_only = site.split('/')[0]
-        curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid = 0, 25.0, -1, -1, None
-
-        ssl_verify = not should_verify(site)
-        connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
-
-        start = time.time()
-        actual_session = None
         try:
             if ssl_verify and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
@@ -645,7 +665,6 @@ async def check_single_site(session, site, semaphore):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
-
         except Exception as e:
             print(f"[CHECK ERR] {site}: {type(e).__name__}: {e}")
             curr_status, resp_time = 0, 25.0
@@ -653,35 +672,30 @@ async def check_single_site(session, site, semaphore):
             if ssl_verify and connector and actual_session is not None:
                 await actual_session.close()
 
-        # SSL check + chain validation
-        try:
-            if site in SELF_SIGNED_SITES:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                with socket.create_connection((domain_only, 443), timeout=3) as sock:
-                    with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
-                        cert = ssock.getpeercert()
-                        exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                        ssl_d = (exp - datetime.datetime.utcnow()).days
-                        ssl_chain_valid = None  # N/A for self-signed
-            else:
-                ctx = ssl.create_default_context()
-                with socket.create_connection((domain_only, 443), timeout=3) as sock:
-                    with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
-                        cert = ssock.getpeercert()
-                        exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                        ssl_d = (exp - datetime.datetime.utcnow()).days
-                        ssl_chain_valid = True
-        except ssl.SSLCertVerificationError:
-            ssl_d, ssl_chain_valid = -1, False
-        except Exception:
-            ssl_d, ssl_chain_valid = -1, None
+    # --- Шаг 2: SSL + WHOIS (в отдельном потоке, НЕ блокирует семафор и event loop) ---
+    ssl_d, ssl_chain_valid = -1, None
+    try:
+        ssl_d, ssl_chain_valid = await asyncio.wait_for(
+            asyncio.to_thread(_check_ssl_sync, domain_only, site),
+            timeout=5
+        )
+    except asyncio.TimeoutError:
+        print(f"[SSL TIMEOUT] {site}")
+    except Exception as e:
+        print(f"[SSL ERR] {site}: {e}")
 
-        # WHOIS via thread pool + cache
-        dom_d = await asyncio.to_thread(get_domain_info_cached, domain_only)
+    dom_d = -1
+    try:
+        dom_d = await asyncio.wait_for(
+            asyncio.to_thread(_check_whois_sync, domain_only),
+            timeout=5
+        )
+    except asyncio.TimeoutError:
+        print(f"[WHOIS TIMEOUT] {site}")
+    except Exception as e:
+        print(f"[WHOIS ERR] {site}: {e}")
 
-        return (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
+    return (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
 
 
 async def check_all_sites():
@@ -963,7 +977,7 @@ def check_worker():
     while True:
         try:
             print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
-            results = loop.run_until_complete(asyncio.wait_for(check_all_sites(), timeout=180))
+            results = loop.run_until_complete(check_all_sites())
             print(f"[WORKER] check_all_sites returned {len(results)} results")
 
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in results:
@@ -1037,9 +1051,11 @@ def check_worker():
             print(f"[CHECK SUMMARY] checked={total_checked} failed={failed_now} batch_size={len(batch_buffer)}")
 
         except Exception as e:
-            print(f"Ошибка воркера: {e}")
+            print(f"[WORKER ERROR] {type(e).__name__}: {e}")
 
-        time.sleep(60)
+        finally:
+            # Гарантируем ровно 60 секунд между циклами даже при ошибке
+            time.sleep(60)
 
 
 # ============================================================================
@@ -1359,7 +1375,7 @@ async def index(auth: bool = Depends(check_auth)):
             ssl_chain_valid
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
-        ORDER BY start_time DESC LIMIT 20
+        ORDER BY start_time DESC LIMIT 100
     """)
     incidents_list = [dict(r) for r in cur.fetchall()]
 
@@ -1387,7 +1403,7 @@ async def index(auth: bool = Depends(check_auth)):
                      ELSE 'Server Error' END as description,
                 NULL::boolean as ssl_chain_valid
             FROM incident_groups
-            GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+            GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 100
         """)
         incidents_list = [dict(r) for r in cur.fetchall()]
 
@@ -1525,6 +1541,9 @@ def _build_html(data: dict) -> str:
                   box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
         .group-header {{ background: #e2e8f0; font-weight: bold; color: #475569; padding: 8px 12px; }}
         .group-sub {{ font-weight: normal; font-size: 12px; color: #64748b; margin-left: 12px; }}
+        .incident-hidden {{ display: none; }}
+        .btn-show-all {{ background: #e2e8f0; color: #475569; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; }}
+        .btn-show-all:hover {{ background: #cbd5e1; }}
     </style></head><body>
     <div id="toast" class="toast"></div>
     <div class="container">
@@ -1603,15 +1622,26 @@ def _build_html(data: dict) -> str:
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
     <th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody>""")
 
-    for r in incidents_list:
-        H.append(f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+    for idx, r in enumerate(incidents_list):
+        hidden_class = 'incident-hidden' if idx >= 20 else ''
+        H.append(f"""<tr class="{hidden_class}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
             <td>{r['max_status']}</td><td>{r['description']}</td>
             <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
                 {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td></tr>""")
 
-    H.append("""</tbody></table></div>
-    <div id="t4" class="tab-content">
+    total_incidents = len(incidents_list)
+    if total_incidents > 20:
+        H.append(f"""</tbody></table>
+        <div style="text-align:center;">
+            <button id="btn-show-incidents" class="btn-show-all" onclick="toggleIncidents()">
+                Показать все ({total_incidents})
+            </button>
+        </div></div>""")
+    else:
+        H.append("""</tbody></table></div>""")
+
+    H.append("""<div id="t4" class="tab-content">
     <table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
     </tr></thead><tbody>""")
 
@@ -1736,6 +1766,15 @@ def _build_html(data: dict) -> str:
         }} finally {{
             chartsLoading = false;
         }}
+    }}
+
+    function toggleIncidents() {{
+        const hidden = document.querySelectorAll('#t3 .incident-hidden');
+        const btn = document.getElementById('btn-show-incidents');
+        for (const row of hidden) {{
+            row.classList.remove('incident-hidden');
+        }}
+        if (btn) btn.style.display = 'none';
     }}
 
     setInterval(() => {{ location.reload(); }}, 120000);
