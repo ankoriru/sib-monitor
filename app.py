@@ -87,84 +87,56 @@ CACHE_TTL = 30
 # ============================================================================
 # PLAYWRIGHT SCREENSHOT QUEUE — thread-safe воркер
 # ============================================================================
-_screenshot_queue = queue.Queue()
-_screenshot_thread = None
-_screenshot_thread_lock = threading.Lock()
-
 # Screenshot rate limit (30 sec per site)
 _screenshot_rate_limit = {}
 _screenshot_rate_lock = threading.Lock()
 
 
-def _screenshot_worker():
-    """Отдельный поток с event loop для Playwright (избегает loop conflict)"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(_screenshot_loop())
+def _take_screenshot_sync(site):
+    """Скриншот одного сайта через Playwright. Делает скриншот через 3 сек после загрузки."""
+    import asyncio as _asyncio
+    path = f"debug_{site.replace('/', '_')}_{int(time.time())}.png"
 
-
-def _ensure_screenshot_worker():
-    """Лениво запускает Playwright worker только при первом запросе скриншота."""
-    global _screenshot_thread
-    with _screenshot_thread_lock:
-        if _screenshot_thread is None or not _screenshot_thread.is_alive():
-            _screenshot_thread = threading.Thread(target=_screenshot_worker, daemon=True)
-            _screenshot_thread.start()
-
-
-async def _screenshot_loop():
-    """Event loop воркера: держит браузер открытым и обрабатывает очередь."""
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-sandbox-usage", "--disable-gpu",
-              "--disable-setuid-sandbox", "--no-zygote"]
-    )
-    while True:
+    async def _shoot():
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-sandbox-usage", "--disable-gpu",
+                  "--disable-setuid-sandbox", "--no-zygote"]
+        )
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 720},
+            ignore_https_errors=True
+        )
         try:
-            site, fut = _screenshot_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        try:
-            path = await _do_screenshot(browser, site)
-            fut.set_result(path)
-        except Exception as e:
-            print(f"[SCREEN ERR] {site}: {e}")
+            page = await context.new_page()
             try:
-                fut.set_exception(e)
+                await page.goto(f"https://{site}", timeout=15000, wait_until="domcontentloaded")
             except Exception:
                 pass
+            await _asyncio.sleep(3)
+            await page.screenshot(path=path, type="jpeg", quality=80)
+            print(f"[SCREEN OK] Screenshot saved: {path}")
+            return path
+        finally:
+            await context.close()
+            await browser.close()
 
-
-async def _do_screenshot(browser, site):
-    """Скриншот одного сайта (вызывается в loop воркера)"""
-    full_url = f"https://{site}"
-    path = f"debug_{site.replace('/', '_')}_{int(time.time())}.png"
-    context = await browser.new_context(
-        viewport={'width': 1280, 'height': 720},
-        ignore_https_errors=True
-    )
     try:
-        page = await context.new_page()
-        try:
-            await page.goto(full_url, timeout=15000, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        await page.screenshot(path=path, type="jpeg", quality=80)
-        return path
-    finally:
-        await context.close()
+        return _asyncio.run(_shoot())
+    except Exception as e:
+        print(f"[SCREEN ERR] {site}: {e}")
+        return None
 
 
 def take_screenshot_fast(site):
-    """Синхронный вызов: кладёт задачу в очередь и ждёт результат"""
-    _ensure_screenshot_worker()
-    fut = concurrent.futures.Future()
-    _screenshot_queue.put((site, fut))
+    """Быстрый скриншот: простой вызов через ThreadPoolExecutor"""
     try:
-        return fut.result(timeout=30)
-    except concurrent.futures.TimeoutError:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_take_screenshot_sync, site)
+            return future.result(timeout=45)
+    except Exception as e:
+        print(f"[SCREEN ERR] {site}: {e}")
         return None
 
 
@@ -1013,7 +985,8 @@ def check_worker():
                             duration = fail_count[site]
                             print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                             _db_incident_resolve(site)
-                            ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                            shot_path_up = take_screenshot_fast(site)
+                            ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                             print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
                             _invalidate_dashboard_cache()
 
