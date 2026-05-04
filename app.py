@@ -2109,6 +2109,7 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT * FROM latest_status")
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
     # latest_status — нормализуем status=401 → 200 для self-monitoring
     for s in SELF_MONITORING_SITES:
         if s in self_latest and self_latest[s].get('status') == 401:
