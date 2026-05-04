@@ -1390,7 +1390,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         h1 { color: #00717a; margin: 0 0 20px; }
         .add-form { display: flex; gap: 10px; margin-bottom: 20px; padding: 15px; background: #f1f5f9; border-radius: 8px; flex-wrap: wrap; }
         input, select { padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 14px; }
-        .btn { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; }
+        .btn { padding: 5px 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .btn-primary { background: #00717a; color: white; }
         .btn-primary:hover { background: #005f66; }
         .btn-warn { background: #f59e0b; color: white; }
@@ -1407,7 +1407,8 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         .badge-key { background: #fef3c7; color: #92400e; }
         .badge-stdo { background: #dbeafe; color: #1e40af; }
         .badge-ext { background: #f3f4f6; color: #4b5563; }
-        .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .actions { display: flex; gap: 4px; flex-wrap: nowrap; }
+        .actions .btn { white-space: nowrap; }
         .row-disabled td { opacity: 0.6; background: #f8fafc; }
         .edit-form { display: none; }
         .edit-form select, .edit-form input { padding: 6px; font-size: 13px; width: 100%; }
@@ -1426,7 +1427,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
             <button class="btn btn-gray" style="margin-left:auto;" onclick="location.href='/'">← Назад</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:280px;">Действия</th></tr></thead><tbody>""")
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
     for r in rows:
         badge = 'badge-key' if r['site_group'] == 'key' else ('badge-stdo' if r['site_group'] == 'stdo' else 'badge-ext')
