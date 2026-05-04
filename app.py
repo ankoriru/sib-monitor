@@ -1314,6 +1314,22 @@ async def startup_event():
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
+    # Cleanup: удаляем старые self-monitoring incidents с 401 (auth required, не ошибка)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM incidents
+            WHERE site = ANY(%s) AND max_status = 401
+        """, (SELF_MONITORING_SITES,))
+        if cur.rowcount > 0:
+            print(f"[CLEANUP] Removed {cur.rowcount} self-monitoring incidents with 401")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[CLEANUP WARN] {e}")
+
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
@@ -1587,10 +1603,10 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         const tbody = document.getElementById('self-tbody');
         let html = '';
         for (const s of data.sites) {
-            const isErr = s.status !== 200;
-            html += `<tr class="${isErr ? 'row-err' : ''}">
+            const isOnline = s.status === 200 || s.status === 401;
+            html += `<tr class="${isOnline ? '' : 'row-err'}">
                 <td><strong>${s.site}</strong></td>
-                <td><span class="${isErr ? 'txt-err' : 'txt-ok'}">${isErr ? 'Offline' : 'Online'}</span></td>
+                <td><span class="${isOnline ? 'txt-ok' : 'txt-err'}">${isOnline ? 'Online' : 'Offline'}</span></td>
                 <td>${s.upt}%</td>
                 <td>${s.response_time}с</td>
                 <td class="${(s.ssl_days >= 0 && s.ssl_days <= 20) ? 'txt-err' : ''}">${s.ssl_days}д</td>
@@ -1867,14 +1883,17 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
 
-        # Latest status
+        # Latest status — нормализуем 401 → 200 для self-monitoring
         cur.execute("""
             SELECT site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp
             FROM latest_status WHERE site = ANY(%s)
         """, (SELF_MONITORING_SITES,))
         latest_rows = {r['site']: dict(r) for r in cur.fetchall()}
+        for s in SELF_MONITORING_SITES:
+            if s in latest_rows and latest_rows[s].get('status') == 401:
+                latest_rows[s]['status'] = 200
 
-        # Stats 30 days
+        # Stats 30 days — для self-monitoring 401 считаем как 200
         cur.execute("""
             SELECT site,
                 ROUND(SUM(status_200_count) * 100.0
@@ -1888,16 +1907,16 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
         if not stats_rows:
             cur.execute("""
                 SELECT site,
-                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                    ROUND((COUNT(*) FILTER (WHERE status = 200 OR status = 401) * 100.0
                            / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                    COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+                    COUNT(*) FILTER (WHERE status != 200 AND status != 401) * 60 as down_sec
                 FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
                   AND site = ANY(%s)
                 GROUP BY site
             """, (SELF_MONITORING_SITES,))
             stats_rows = {r['site']: dict(r) for r in cur.fetchall()}
 
-        # Incidents
+        # Incidents — исключаем 401
         cur.execute("""
             SELECT site, start_time,
                 COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
@@ -1910,6 +1929,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
             FROM incidents
             WHERE start_time > NOW() - INTERVAL '30 days'
               AND site = ANY(%s)
+              AND max_status != 401
             ORDER BY start_time DESC LIMIT 20
         """, (SELF_MONITORING_SITES,))
         incidents = []
@@ -1919,7 +1939,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
                 inc['start_time'] = inc['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')
             incidents.append(inc)
 
-        # Charts data
+        # Charts data — для self-monitoring 401 считаем как 200
         cur.execute("""
             SELECT site, bucket::date as d,
                    ROUND((SUM(avg_response_time * checks_count)
@@ -1943,7 +1963,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
             cur.execute("""
                 SELECT site, DATE(timestamp) as d,
                        ROUND(AVG(response_time)::numeric, 2) as r,
-                       ROUND(COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*)::numeric, 2) as u
+                       ROUND(COUNT(*) FILTER (WHERE status=200 OR status=401) * 100.0 / COUNT(*)::numeric, 2) as u
                 FROM logs
                 WHERE timestamp > NOW() - INTERVAL '14 days'
                   AND site = ANY(%s)
@@ -2047,13 +2067,13 @@ async def api_charts(auth: bool = Depends(check_auth)):
         cur.execute("""
             SELECT site, DATE(timestamp) as d,
                    ROUND(AVG(response_time)::numeric, 2) as r,
-                   ROUND(COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*)::numeric, 2) as u
+                   ROUND(COUNT(*) FILTER (WHERE status=200 OR (site = ANY(%s) AND status=401)) * 100.0 / COUNT(*)::numeric, 2) as u
             FROM logs
             WHERE timestamp > NOW() - INTERVAL '14 days'
               AND site = ANY(%s)
             GROUP BY 1, 2
             ORDER BY 2
-        """, (list(allowed_sites),))
+        """, (SELF_MONITORING_SITES, list(allowed_sites),))
 
         for r in cur.fetchall():
             s = r['site']
@@ -2089,7 +2109,14 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT * FROM latest_status")
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
-    self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
+    # latest_status — нормализуем status=401 → 200 для self-monitoring
+    for s in SELF_MONITORING_SITES:
+        if s in self_latest and self_latest[s].get('status') == 401:
+            self_latest[s]['status'] = 200
+    # — и для обычных сайтов (если вдруг попал)
+    for s in latest:
+        if latest[s].get('status') == 401:
+            latest[s]['status'] = 200
 
     # Статистика по сайтам — из checks_agg (self-monitoring исключены)
     cur.execute("""
@@ -2116,12 +2143,12 @@ async def index(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         stats = {r['site']: r for r in cur.fetchall()}
 
-    # Self-monitoring статистика
+    # Self-monitoring статистика — считаем 401 как 200 (uptime OK)
     cur.execute("""
         SELECT site,
-            ROUND(SUM(status_200_count) * 100.0
+            ROUND(SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN checks_count ELSE status_200_count END) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            SUM(checks_count - status_200_count) * 5 as down_sec
+            SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN 0 ELSE checks_count - status_200_count END) * 5 as down_sec
         FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
           AND site = ANY(%s)
         GROUP BY site
@@ -2132,9 +2159,9 @@ async def index(auth: bool = Depends(check_auth)):
     else:
         cur.execute("""
             SELECT site,
-                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                ROUND((COUNT(*) FILTER (WHERE status = 200 OR status = 401) * 100.0
                        / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+                COUNT(*) FILTER (WHERE status != 200 AND status != 401) * 60 as down_sec
             FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
               AND site = ANY(%s)
             GROUP BY site
@@ -2222,7 +2249,7 @@ async def index(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         incidents_list = [dict(r) for r in cur.fetchall()]
 
-    # Self-monitoring инциденты
+    # Self-monitoring инциденты — исключаем 401 (это auth required, не ошибка)
     cur.execute("""
         SELECT site, start_time,
             COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
@@ -2235,6 +2262,7 @@ async def index(auth: bool = Depends(check_auth)):
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
           AND site = ANY(%s)
+          AND max_status != 401
         ORDER BY start_time DESC LIMIT 20
     """, (SELF_MONITORING_SITES,))
     self_incidents_list = [dict(r) for r in cur.fetchall()]
@@ -2244,7 +2272,7 @@ async def index(auth: bool = Depends(check_auth)):
         cur.execute("""
             WITH status_changes AS (
                 SELECT site, timestamp, status,
-                    CASE WHEN status != 200 AND
+                    CASE WHEN status != 200 AND status != 401 AND
                         (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
                          OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
                     THEN 1 ELSE 0 END as is_start
@@ -2254,7 +2282,7 @@ async def index(auth: bool = Depends(check_auth)):
             incident_groups AS (
                 SELECT site, timestamp, status,
                     SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
-                FROM status_changes WHERE status != 200
+                FROM status_changes WHERE status != 200 AND status != 401
             )
             SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
                 MAX(status) as max_status,
@@ -2541,11 +2569,12 @@ def _build_html(data: dict) -> str:
     for s in SELF_MONITORING_SITES:
         v = self_latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = self_stats.get(s, {'upt': 0, 'down_sec': 0})
-        is_err = v['status'] != 200
+        is_online = v['status'] == 200 or v['status'] == 401
+        is_err = not is_online
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td><strong>{s}</strong></td>
-            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
-                {'Online' if v['status']==200 else 'Offline'}</span></td>
+            <td><span class="{'txt-ok' if is_online else 'txt-err'}">
+                {'Online' if is_online else 'Offline'}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
