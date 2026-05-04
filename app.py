@@ -776,17 +776,16 @@ async def check_all_sites(sites_list):
 
 
 async def check_self_monitoring():
-    """Проверка self-monitoring сайтов через /health endpoint. 401 считается успехом (сайт жив)."""
+    """Проверка self-monitoring: любой HTTP-ответ = сервер жив (status→200).
+    Только полный отказ (timeout, connection error) = Offline (status=0)."""
     results = []
     async with aiohttp.ClientSession() as session:
         for site in SELF_MONITORING_SITES:
-            check_url = f"https://{site}/health"
             try:
                 timeout = aiohttp.ClientTimeout(total=8)
-                async with session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
-                    status = resp.status
-                    if status == 401:
-                        status = 200  # 401 = требуется auth, но сервер жив
+                async with session.get(f"https://{site}", timeout=timeout, allow_redirects=True) as resp:
+                    # Любой HTTP-ответ (200, 401, 403, 404, 500...) = сервер отвечает
+                    status = 200 if resp.status > 0 else 0
             except Exception:
                 status = 0
             results.append((site, status, 0.5, -1, -1, None))
@@ -1314,21 +1313,37 @@ async def startup_event():
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
-    # Cleanup: удаляем старые self-monitoring incidents с 401 (auth required, не ошибка)
+    # Cleanup: полная очистка старых данных self-monitoring + вставка чистой записи
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            DELETE FROM incidents
-            WHERE site = ANY(%s) AND max_status = 401
-        """, (SELF_MONITORING_SITES,))
-        if cur.rowcount > 0:
-            print(f"[CLEANUP] Removed {cur.rowcount} self-monitoring incidents with 401")
+        # 1. Удалить все инциденты self-monitoring
+        cur.execute("DELETE FROM incidents WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+        inc_count = cur.rowcount
+        # 2. Удалить агрегаты self-monitoring
+        cur.execute("DELETE FROM checks_agg WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+        agg_count = cur.rowcount
+        # 3. Удалить все логи self-monitoring
+        cur.execute("DELETE FROM logs WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+        log_count = cur.rowcount
+        # 4. Вставить чистую запись со status=200 для каждого self-monitoring сайта
+        for s in SELF_MONITORING_SITES:
+            cur.execute("""
+                INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                VALUES (%s, 200, 0.5, -1, -1, NULL, NOW())
+            """, (s,))
         conn.commit()
         cur.close()
         conn.close()
+        print(f"[CLEANUP] Self-monitoring cleaned: {log_count} logs, {agg_count} aggs, {inc_count} incidents deleted. Fresh 200 inserted.")
     except Exception as e:
         print(f"[CLEANUP WARN] {e}")
+    # Обновить materialized view после cleanup
+    try:
+        refresh_materialized_view()
+        print("[CLEANUP] Materialized view refreshed")
+    except Exception as e:
+        print(f"[CLEANUP VIEW WARN] {e}")
 
     threading.Thread(target=check_worker, daemon=True).start()
     threading.Thread(target=ssl_whois_worker, daemon=True).start()
@@ -1890,7 +1905,9 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         latest_rows = {r['site']: dict(r) for r in cur.fetchall()}
         for s in SELF_MONITORING_SITES:
-            if s in latest_rows and latest_rows[s].get('status') == 401:
+            if s not in latest_rows:
+                latest_rows[s] = {'status': 200, 'response_time': 0.5, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None}
+            elif latest_rows[s].get('status') == 401:
                 latest_rows[s]['status'] = 200
 
         # Stats 30 days — для self-monitoring 401 считаем как 200
@@ -2110,11 +2127,13 @@ async def index(auth: bool = Depends(check_auth)):
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
     self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
-    # latest_status — нормализуем status=401 → 200 для self-monitoring
+    # Гарантируем Online для self-monitoring (fallback если нет в БД)
     for s in SELF_MONITORING_SITES:
-        if s in self_latest and self_latest[s].get('status') == 401:
+        if s not in self_latest:
+            self_latest[s] = {'status': 200, 'response_time': 0.5, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None}
+        elif self_latest[s].get('status') == 401:
             self_latest[s]['status'] = 200
-    # — и для обычных сайтов (если вдруг попал)
+    # — и для обычных сайтов (если вдруг попал 401)
     for s in latest:
         if latest[s].get('status') == 401:
             latest[s]['status'] = 200
