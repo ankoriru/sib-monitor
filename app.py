@@ -39,6 +39,10 @@ NEW_MONITORING_SITES = [
     "cp.tdms.sibur.ru/cp/"
 ]
 
+SELF_MONITORING_SITES = [
+    "sib-monitor-ankori.amvera.io"
+]
+
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
 if os.getenv("SELF_SIGNED_SITES"):
@@ -63,7 +67,7 @@ SITES = [
     "rusvinyl.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
     "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
-] + NEW_MONITORING_SITES
+] + NEW_MONITORING_SITES + SELF_MONITORING_SITES
 
 PRIORITY_SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"
@@ -1430,6 +1434,11 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
         site_esc = r['site'].replace("'", "\\'")
+        toggle_btn = (
+            '<button class="btn btn-gray" onclick="toggleSite(' + "'" + site_esc + "'" + ')">🛑 Отключить</button>'
+            if r['is_active']
+            else '<button class="btn btn-success" onclick="toggleSite(' + "'" + site_esc + "'" + ')">✅ Восстановить</button>'
+        )
         H.append(f"""<tr class="{disabled_cls}" id="row-{site_esc}">
             <td><strong>{r['site']}</strong></td>
             <td><span class="badge {badge}">{grp_name}</span></td>
@@ -1438,7 +1447,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             <td>
                 <div class="actions">
                     <button class="btn btn-warn" onclick="editRow('{site_esc}')">✏️ Изменить</button>
-                    {'<button class="btn btn-gray" onclick="toggleSite(\'' + site_esc + '\')">🛑 Отключить</button>' if r['is_active'] else '<button class="btn btn-success" onclick="toggleSite(\'' + site_esc + '\')">✅ Восстановить</button>'}
+                    {toggle_btn}
                     <button class="btn btn-danger" onclick="deleteSite('{site_esc}')">🗑️ Удалить</button>
                 </div>
                 <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;">
