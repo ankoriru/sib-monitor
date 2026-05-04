@@ -16,6 +16,7 @@ import bcrypt
 import queue
 import concurrent.futures
 from io import StringIO
+from string import Template
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -37,6 +38,10 @@ NEW_MONITORING_SITES = [
     "agpp.tdms.nipigas.ru/DMS21/",
     "tst-stdo.tdms.sibur.ru/cp/",
     "cp.tdms.sibur.ru/cp/"
+]
+
+SELF_MONITORING_SITES = [
+    "sib-monitor-ankori.amvera.io"
 ]
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
@@ -209,7 +214,7 @@ def get_db_connection():
 
 
 def load_active_sites():
-    """Читает список активных сайтов из БД. Fallback на дефолтный список."""
+    """Читает список активных сайтов из БД. Fallback на дефолтный список. Self-monitoring исключены."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -218,19 +223,19 @@ def load_active_sites():
         cur.close()
         conn.close()
         if rows:
-            sites = [r[0] for r in rows]
-            thresholds = {r[0]: r[2] for r in rows}
+            sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
+            thresholds = {r[0]: r[2] for r in rows if r[0] not in SELF_MONITORING_SITES}
             key = [r[0] for r in rows if r[1] == 'key']
             stdo = [r[0] for r in rows if r[1] == 'stdo']
-            ext = [r[0] for r in rows if r[1] not in ('key', 'stdo')]
+            ext = [r[0] for r in rows if r[1] not in ('key', 'stdo') and r[0] not in SELF_MONITORING_SITES]
             return sites, key, stdo, ext, thresholds
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
     # Fallback
-    all_sites = SITES[:]
+    all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
-    ext = EXTERNAL_SITES[:]
+    ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
     thresholds = {s: 5 for s in all_sites}
     return all_sites, key, stdo, ext, thresholds
 
@@ -407,7 +412,6 @@ def init_db():
         except psycopg2.Error:
             conn.rollback()
     else:
-        # Индекс на существующее представление
         try:
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
         except psycopg2.Error:
@@ -495,6 +499,19 @@ def init_db():
             "INSERT INTO monitored_sites (site, site_group) VALUES %s ON CONFLICT DO NOTHING",
             default_sites
         )
+
+    # Self-monitoring сайты — отдельная группа 'self'
+    for s in SELF_MONITORING_SITES:
+        cur.execute("""
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+            VALUES (%s, 'self', 10, TRUE)
+            ON CONFLICT (site) DO UPDATE SET
+                site_group = 'self',
+                is_active = TRUE,
+                alert_threshold = 10
+        """, (s,))
+        if cur.rowcount > 0:
+            print(f"[INIT] Added/updated self-monitoring site: {s}")
 
     conn.commit()
     cur.close()
@@ -749,13 +766,31 @@ async def check_single_site(session, site, semaphore):
     return (site, curr_status, resp_time)
 
 
-async def check_all_sites():
+async def check_all_sites(sites_list):
     """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
     semaphore = asyncio.Semaphore(15)
     async with aiohttp.ClientSession() as session:
-        tasks = [check_single_site(session, site, semaphore) for site in SITES]
+        tasks = [check_single_site(session, site, semaphore) for site in sites_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
+
+
+async def check_self_monitoring():
+    """Проверка self-monitoring сайтов через /health endpoint. 401 считается успехом (сайт жив)."""
+    results = []
+    async with aiohttp.ClientSession() as session:
+        for site in SELF_MONITORING_SITES:
+            check_url = f"https://{site}/health"
+            try:
+                timeout = aiohttp.ClientTimeout(total=8)
+                async with session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
+                    status = resp.status
+                    if status == 401:
+                        status = 200  # 401 = требуется auth, но сервер жив
+            except Exception:
+                status = 0
+            results.append((site, status, 0.5, -1, -1, None))
+    return results
 
 
 # ============================================================================
@@ -960,6 +995,8 @@ def rotate_logs(retention_days: int = 30):
                                     / (checks_agg.checks_count + EXCLUDED.checks_count),
                 min_response_time = LEAST(checks_agg.min_response_time, EXCLUDED.min_response_time),
                 max_response_time = GREATEST(checks_agg.max_response_time, EXCLUDED.max_response_time),
+                last_ssl_days = COALESCE(EXCLUDED.last_ssl_days, checks_agg.last_ssl_days),
+                last_domain_days = COALESCE(EXCLUDED.last_domain_days, checks_agg.last_domain_days),
                 last_ssl_chain_valid = COALESCE(EXCLUDED.last_ssl_chain_valid, checks_agg.last_ssl_chain_valid)
         """, (cutoff_date, cutoff_date))
 
@@ -1021,6 +1058,66 @@ def _get_ssl_whois_data(site, latest_data):
     )
 
 
+def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
+                         last_status, fail_count, last_latency_map, thresholds):
+    """Обработка результата проверки одного сайта (общая логика)"""
+    try:
+        changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
+        if changed:
+            print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
+
+        if curr_status != 200:
+            fail_count[site] = fail_count.get(site, 0) + 1
+            alert_threshold = thresholds.get(site, 5)
+
+            if fail_count[site] == 1 and last_status.get(site, 200) == 200:
+                print(f"[INCIDENT START] {site}")
+                _db_incident_start(site, curr_status, ssl_chain_valid)
+            elif fail_count[site] > 1:
+                _db_incident_update(site, curr_status, ssl_chain_valid)
+
+            with BATCH_LOCK:
+                if fail_count[site] >= 2:
+                    batch_buffer.append(
+                        (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
+                    )
+                if len(batch_buffer) >= BATCH_SIZE:
+                    flush_batch()
+
+            if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
+                print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
+                shot_path = take_screenshot_fast(site)
+                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
+                print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
+                last_status[site] = curr_status
+                _invalidate_dashboard_cache()
+        else:
+            with BATCH_LOCK:
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                if len(batch_buffer) >= BATCH_SIZE:
+                    flush_batch()
+
+            if last_status.get(site, 200) != 200:
+                duration = fail_count.get(site, 0)
+                print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
+                _db_incident_resolve(site)
+                shot_path_up = take_screenshot_fast(site)
+                ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
+                print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
+                _invalidate_dashboard_cache()
+
+            last_status[site], fail_count[site] = 200, 0
+
+            if resp_time > 20 and not last_latency_map.get(site, False):
+                ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                last_latency_map[site] = True
+            elif resp_time < 10 and last_latency_map.get(site, False):
+                ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                last_latency_map[site] = False
+    except Exception as e:
+        print(f"[ERR] {site}: {e}")
+
+
 def check_worker():
     """Фоновый воркер: быстрые HTTP-проверки каждую минуту. SSL+WHOIS — отдельный воркер."""
     import urllib3
@@ -1048,17 +1145,21 @@ def check_worker():
                     last_latency_map[site] = False
             # Убираем удаленные сайты
             for site in list(last_status.keys()):
-                if site not in SITES:
+                if site not in SITES and site not in SELF_MONITORING_SITES:
                     del last_status[site]
                     del fail_count[site]
                     del last_latency_map[site]
 
             print(f"[WORKER] {len(SITES)} sites, starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
-            # Быстрые HTTP-проверки (только status + response_time)
-            results = loop.run_until_complete(check_all_sites())
+            # Быстрые HTTP-проверки обычных сайтов
+            results = loop.run_until_complete(check_all_sites(SITES))
             http_time = round(time.time() - t_start, 1)
             print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
+
+            # Проверка self-monitoring через /health
+            self_results = loop.run_until_complete(check_self_monitoring())
+            print(f"[WORKER] Self-monitoring: {len(self_results)} sites")
 
             # Читаем SSL/WHOIS из latest_status
             conn = get_db_connection()
@@ -1068,63 +1169,20 @@ def check_worker():
             cur.close()
             conn.close()
 
+            # Обработка обычных сайтов
             for site, curr_status, resp_time in results:
-                try:
-                    ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
-                    changed = (curr_status != 200) or (last_status[site] != 200)
-                    if changed:
-                        print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count[site]} last={last_status[site]}")
+                ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
+                _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
+                                     last_status, fail_count, last_latency_map, thresholds)
 
-                    if curr_status != 200:
-                        fail_count[site] += 1
-                        alert_threshold = thresholds.get(site, 5)
-
-                        if fail_count[site] == 1 and last_status[site] == 200:
-                            print(f"[INCIDENT START] {site}")
-                            _db_incident_start(site, curr_status, ssl_chain_valid)
-                        elif fail_count[site] > 1:
-                            _db_incident_update(site, curr_status, ssl_chain_valid)
-
-                        with BATCH_LOCK:
-                            if fail_count[site] >= 2:
-                                batch_buffer.append(
-                                    (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
-                                )
-                            if len(batch_buffer) >= BATCH_SIZE:
-                                flush_batch()
-
-                        if fail_count[site] >= alert_threshold and last_status[site] == 200:
-                            print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
-                            shot_path = take_screenshot_fast(site)
-                            ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
-                            print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
-                            last_status[site] = curr_status
-                            _invalidate_dashboard_cache()
-                    else:
-                        with BATCH_LOCK:
-                            batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
-                            if len(batch_buffer) >= BATCH_SIZE:
-                                flush_batch()
-
-                        if last_status[site] != 200:
-                            duration = fail_count[site]
-                            print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
-                            _db_incident_resolve(site)
-                            shot_path_up = take_screenshot_fast(site)
-                            ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
-                            print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
-                            _invalidate_dashboard_cache()
-
-                        last_status[site], fail_count[site] = 200, 0
-
-                        if resp_time > 20 and not last_latency_map[site]:
-                            ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
-                            last_latency_map[site] = True
-                        elif resp_time < 10 and last_latency_map[site]:
-                            ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
-                            last_latency_map[site] = False
-                except Exception as e:
-                    print(f"[ERR] {site}: {e}")
+            # Обработка self-monitoring сайтов (отдельно, без алертов)
+            for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
+                with BATCH_LOCK:
+                    batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                    if len(batch_buffer) >= BATCH_SIZE:
+                        flush_batch()
+                last_status[site] = curr_status
+                fail_count[site] = 0 if curr_status == 200 else fail_count.get(site, 0) + 1
 
             flush_batch()
             refresh_materialized_view()
@@ -1154,7 +1212,9 @@ def ssl_whois_worker():
             t_start = time.time()
             print(f"[SSL WORKER] Starting SSL+WHOIS checks at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
-            for site in SITES:
+            # Проверяем все сайты, включая self-monitoring
+            all_sites_to_check = list(SITES) + list(SELF_MONITORING_SITES)
+            for site in all_sites_to_check:
                 domain_only = site.split('/')[0]
                 try:
                     ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site)
@@ -1213,7 +1273,7 @@ def daily_report_worker():
                 ssl_alerts = [
                     f"🔒 {r[0]} — осталось {r[1]}д."
                     for r in rows
-                    if r[1] is not None and 0 <= r[1] <= 20
+                    if r[1] is not None and 0 <= r[1] <= 20 and r[0] not in SELF_MONITORING_SITES
                 ]
 
                 if ssl_alerts:
@@ -1289,7 +1349,7 @@ def check_screenshot_rate(site: str) -> bool:
 
 @app.get("/test-screen/{site_name:path}")
 async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
-    if site_name not in SITES:
+    if site_name not in SITES and site_name not in SELF_MONITORING_SITES:
         return JSONResponse(
             {"status": "error", "msg": "Сайт не найден в списке"},
             status_code=404
@@ -1365,13 +1425,13 @@ async def admin_auth(request: Request, response: Response):
 
 @app.get("/admin/page", response_class=HTMLResponse)
 async def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
-    """Страница управления сайтами (требует admin-пароль)"""
+    """Страница управления сайтами (требует admin-пароль) + Self Monitoring"""
     if admin_session != "authenticated_admin":
         return HTMLResponse("""<script>location.href='/admin/login';</script>""", status_code=302)
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -1380,13 +1440,19 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
 
     H = []
     H.append("""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }
         .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         h1 { color: #00717a; margin: 0 0 20px; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
+        .tab-btn { padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .tab-btn.active { background: #00717a; color: white; }
+        .tab-content { display: none; }
+        .active-content { display: block; }
         .add-form { display: flex; gap: 10px; margin-bottom: 20px; padding: 15px; background: #f1f5f9; border-radius: 8px; flex-wrap: wrap; }
         input, select { padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 14px; }
-        .btn { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; }
+        .btn { padding: 5px 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .btn-primary { background: #00717a; color: white; }
         .btn-primary:hover { background: #005f66; }
         .btn-warn { background: #f59e0b; color: white; }
@@ -1403,14 +1469,28 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         .badge-key { background: #fef3c7; color: #92400e; }
         .badge-stdo { background: #dbeafe; color: #1e40af; }
         .badge-ext { background: #f3f4f6; color: #4b5563; }
-        .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .actions { display: flex; gap: 4px; flex-wrap: nowrap; }
+        .actions .btn { white-space: nowrap; }
         .row-disabled td { opacity: 0.6; background: #f8fafc; }
         .edit-form { display: none; }
         .edit-form select, .edit-form input { padding: 6px; font-size: 13px; width: 100%; }
         .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; }
+        .kpi-card { background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #e2e8f0; border-top: 4px solid #00717a; text-align: center; }
+        .row-err { background-color: #fff1f2 !important; }
+        .txt-err { color: #dc2626; font-weight: bold; }
+        .txt-ok { color: #16a34a; font-weight: bold; }
+        .loading { text-align: center; padding: 40px; color: #999; }
     </style></head><body>
     <div class="container">
-        <h1>🔧 Управление сайтами</h1>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <h1>🔧 Управление</h1>
+            <button class="btn btn-gray" onclick="location.href='/'">← Назад</button>
+        </div>
+        <div class="tabs">
+            <button class="tab-btn active" onclick="adminTab(event, 'sites-tab')">Сайты</button>
+            <button class="tab-btn" onclick="adminTab(event, 'self-tab')">Self Monitoring</button>
+        </div>
+        <div id="sites-tab" class="tab-content active-content">
         <div class="add-form">
             <input type="text" id="newSite" placeholder="site.ru" style="flex:1;min-width:200px;">
             <select id="newGroup">
@@ -1420,16 +1500,20 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
-            <button class="btn btn-gray" style="margin-left:auto;" onclick="location.href='/'">← Назад</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:280px;">Действия</th></tr></thead><tbody>""")
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
     for r in rows:
         badge = 'badge-key' if r['site_group'] == 'key' else ('badge-stdo' if r['site_group'] == 'stdo' else 'badge-ext')
         grp_name = '⭐ Ключевой' if r['site_group'] == 'key' else ('🛡️ СТДО' if r['site_group'] == 'stdo' else '🌐 Внешний')
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
-        site_esc = r['site'].replace("'", "\\'")
+        site_esc = r['site'].replace("'", "\'")
+        toggle_btn = (
+            '<button class="btn btn-gray" onclick="toggleSite(' + "'" + site_esc + "'" + ')">🛑 Отключить</button>'
+            if r['is_active']
+            else '<button class="btn btn-success" onclick="toggleSite(' + "'" + site_esc + "'" + ')">✅ Восстановить</button>'
+        )
         H.append(f"""<tr class="{disabled_cls}" id="row-{site_esc}">
             <td><strong>{r['site']}</strong></td>
             <td><span class="badge {badge}">{grp_name}</span></td>
@@ -1438,7 +1522,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             <td>
                 <div class="actions">
                     <button class="btn btn-warn" onclick="editRow('{site_esc}')">✏️ Изменить</button>
-                    {'<button class="btn btn-gray" onclick="toggleSite(\'' + site_esc + '\')">🛑 Отключить</button>' if r['is_active'] else '<button class="btn btn-success" onclick="toggleSite(\'' + site_esc + '\')">✅ Восстановить</button>'}
+                    {toggle_btn}
                     <button class="btn btn-danger" onclick="deleteSite('{site_esc}')">🗑️ Удалить</button>
                 </div>
                 <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;">
@@ -1455,8 +1539,119 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         </tr>""")
 
     H.append("""</tbody></table></div>
+    <div id="self-tab" class="tab-content">
+        <div id="self-loading" class="loading">Загрузка данных self-monitoring...</div>
+        <div id="self-content" style="display:none;">
+            <h3 style="color:#00717a;margin-top:0;">Self Monitoring</h3>
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th></tr></thead><tbody id="self-tbody"></tbody></table>
+            <h4 style="color:#475569;margin-top:25px;">📈 График</h4>
+            <div id="self-chart-container" style="max-width:600px;"><div style="text-align:center;padding:30px;color:#999;">Загрузка графика...</div></div>
+            <h4 style="color:#475569;margin-top:25px;">📋 Инциденты</h4>
+            <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody id="self-incidents-tbody"></tbody></table>
+        </div>
+    </div>
+    </div>
     <div id="toast" class="toast"></div>
     <script>
+    function adminTab(e, n) {
+        var i, x = document.getElementsByClassName('tab-content'),
+            b = document.getElementsByClassName('tab-btn');
+        for(i = 0; i < x.length; i++) x[i].className = 'tab-content';
+        for(i = 0; i < b.length; i++) b[i].className = 'tab-btn';
+        document.getElementById(n).className = 'tab-content active-content';
+        e.currentTarget.className += ' active';
+        if (n === 'self-tab') loadSelfMonitoring();
+    }
+    async function loadSelfMonitoring() {
+        const loading = document.getElementById('self-loading');
+        const content = document.getElementById('self-content');
+        loading.style.display = 'block';
+        content.style.display = 'none';
+        try {
+            const r = await fetch('/api/self-monitoring');
+            const data = await r.json();
+            if (data.status === 'ok') {
+                renderSelfTable(data);
+                renderSelfIncidents(data.incidents);
+                renderSelfChart(data.charts);
+                loading.style.display = 'none';
+                content.style.display = 'block';
+            } else {
+                loading.innerText = 'Ошибка загрузки данных';
+            }
+        } catch (e) {
+            loading.innerText = 'Ошибка связи с сервером';
+        }
+    }
+    function renderSelfTable(data) {
+        const tbody = document.getElementById('self-tbody');
+        let html = '';
+        for (const s of data.sites) {
+            const isErr = s.status !== 200;
+            html += `<tr class="${isErr ? 'row-err' : ''}">
+                <td><strong>${s.site}</strong></td>
+                <td><span class="${isErr ? 'txt-err' : 'txt-ok'}">${isErr ? 'Offline' : 'Online'}</span></td>
+                <td>${s.upt}%</td>
+                <td>${s.response_time}с</td>
+                <td class="${(s.ssl_days >= 0 && s.ssl_days <= 20) ? 'txt-err' : ''}">${s.ssl_days}д</td>
+                <td class="${s.ssl_chain_valid === false ? 'txt-err' : (s.ssl_chain_valid === true ? 'txt-ok' : '')}">${s.ssl_chain_valid === true ? '✅' : (s.ssl_chain_valid === false ? '❌' : '—')}</td>
+                <td class="${(s.domain_days >= 0 && s.domain_days <= 30) ? 'txt-err' : ''}">${s.domain_days}д</td>
+            </tr>`;
+        }
+        tbody.innerHTML = html;
+    }
+    function renderSelfIncidents(incidents) {
+        const tbody = document.getElementById('self-incidents-tbody');
+        if (!incidents || incidents.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999;">Нет инцидентов за 30 дней</td></tr>';
+            return;
+        }
+        let html = '';
+        for (const inc of incidents) {
+            html += `<tr>
+                <td>${inc.start_time}</td>
+                <td>${inc.site}</td>
+                <td class="txt-err">${inc.dur} мин</td>
+                <td>${inc.max_status}</td>
+                <td>${inc.description}</td>
+                <td class="${inc.ssl_chain_valid === false ? 'txt-err' : (inc.ssl_chain_valid === true ? 'txt-ok' : '')}">${inc.ssl_chain_valid === true ? '✅' : (inc.ssl_chain_valid === false ? '❌' : '—')}</td>
+            </tr>`;
+        }
+        tbody.innerHTML = html;
+    }
+    function renderSelfChart(charts) {
+        const container = document.getElementById('self-chart-container');
+        container.innerHTML = '';
+        if (!charts) {
+            container.innerHTML = '<div style="text-align:center;padding:30px;color:#999;">Нет данных для графика</div>';
+            return;
+        }
+        for (const site in charts) {
+            const d = charts[site];
+            if (!d || !d.l || d.l.length === 0) continue;
+            const div = document.createElement('div');
+            div.className = 'kpi-card';
+            div.style.borderTop = '2px solid #eee';
+            div.innerHTML = `<h5>${site}</h5><canvas id="admin-self-${site.replace(/\\./g, '_')}"></canvas>`;
+            container.appendChild(div);
+            new Chart(document.getElementById('admin-self-' + site.replace(/\\./g, '_')), {
+                type: 'line',
+                data: {
+                    labels: d.l,
+                    datasets: [
+                        { label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3 },
+                        { label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3 }
+                    ]
+                },
+                options: {
+                    scales: {
+                        y: { suggestedMin: 95, suggestedMax: 100.5, title: { display: true, text: 'Uptime %' } },
+                        y1: { position: 'right', grid: { display: false }, title: { display: true, text: 'Ответ, сек' } }
+                    }
+                }
+            });
+        }
+    }
     async function addSite() {
         const site = document.getElementById('newSite').value.trim();
         const group = document.getElementById('newGroup').value;
@@ -1537,11 +1732,11 @@ async def health():
 
 @app.get("/api/sites")
 async def list_sites(auth: bool = Depends(check_auth)):
-    """Список всех сайтов в мониторинге"""
+    """Список всех сайтов в мониторинге (без self-monitoring)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -1560,8 +1755,12 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         threshold = int(data.get("threshold", 5))
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
+        if group not in ('key', 'stdo', 'external'):
+            return JSONResponse({"status": "error", "msg": "group must be key/stdo/external"}, status_code=400)
         if threshold < 1 or threshold > 60:
             return JSONResponse({"status": "error", "msg": "threshold must be 1-60"}, status_code=400)
+        if site in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -1587,6 +1786,8 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(che
         data = await request.json()
         group = data.get("group")
         threshold = data.get("threshold")
+        if site_name in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
         if group and threshold is not None:
@@ -1614,6 +1815,8 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(che
 async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
     """Включить / отключить сайт (toggle is_active)"""
     try:
+        if site_name in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -1638,6 +1841,8 @@ async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
 async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
     """Окончательное удаление сайта из БД"""
     try:
+        if site_name in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM monitored_sites WHERE site = %s", (site_name,))
@@ -1652,9 +1857,137 @@ async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
+# ============================================================================
+# API: Self Monitoring (для админ-панели)
+# ============================================================================
+@app.get("/api/self-monitoring")
+async def api_self_monitoring(auth: bool = Depends(check_auth)):
+    """Данные self-monitoring для админ-панели"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+
+        # Latest status
+        cur.execute("""
+            SELECT site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp
+            FROM latest_status WHERE site = ANY(%s)
+        """, (SELF_MONITORING_SITES,))
+        latest_rows = {r['site']: dict(r) for r in cur.fetchall()}
+
+        # Stats 30 days
+        cur.execute("""
+            SELECT site,
+                ROUND(SUM(status_200_count) * 100.0
+                      / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+                SUM(checks_count - status_200_count) * 5 as down_sec
+            FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
+              AND site = ANY(%s)
+            GROUP BY site
+        """, (SELF_MONITORING_SITES,))
+        stats_rows = {r['site']: dict(r) for r in cur.fetchall()}
+        if not stats_rows:
+            cur.execute("""
+                SELECT site,
+                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                           / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
+                    COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+                FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                  AND site = ANY(%s)
+                GROUP BY site
+            """, (SELF_MONITORING_SITES,))
+            stats_rows = {r['site']: dict(r) for r in cur.fetchall()}
+
+        # Incidents
+        cur.execute("""
+            SELECT site, start_time,
+                COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+                max_status,
+                CASE WHEN max_status = 0 THEN 'Timeout'
+                     WHEN max_status = 502 THEN 'Bad Gateway'
+                     WHEN max_status = 503 THEN 'Service Unavailable'
+                     ELSE 'Server Error' END as description,
+                ssl_chain_valid
+            FROM incidents
+            WHERE start_time > NOW() - INTERVAL '30 days'
+              AND site = ANY(%s)
+            ORDER BY start_time DESC LIMIT 20
+        """, (SELF_MONITORING_SITES,))
+        incidents = []
+        for r in cur.fetchall():
+            inc = dict(r)
+            if inc.get('start_time'):
+                inc['start_time'] = inc['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')
+            incidents.append(inc)
+
+        # Charts data
+        cur.execute("""
+            SELECT site, bucket::date as d,
+                   ROUND((SUM(avg_response_time * checks_count)
+                         / NULLIF(SUM(checks_count), 0))::numeric, 2) as r,
+                   ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
+            FROM checks_agg
+            WHERE bucket > NOW() - INTERVAL '14 days'
+              AND site = ANY(%s)
+            GROUP BY site, bucket::date
+            ORDER BY bucket::date
+        """, (SELF_MONITORING_SITES,))
+        charts = {}
+        for r in cur.fetchall():
+            s = r['site']
+            charts.setdefault(s, {'l': [], 'u': [], 'r': []})
+            charts[s]['l'].append(r['d'].strftime("%d.%m"))
+            charts[s]['u'].append(float(r['u']) if r['u'] is not None else 0)
+            charts[s]['r'].append(float(r['r']) if r['r'] is not None else 0)
+
+        if not charts:
+            cur.execute("""
+                SELECT site, DATE(timestamp) as d,
+                       ROUND(AVG(response_time)::numeric, 2) as r,
+                       ROUND(COUNT(*) FILTER (WHERE status=200) * 100.0 / COUNT(*)::numeric, 2) as u
+                FROM logs
+                WHERE timestamp > NOW() - INTERVAL '14 days'
+                  AND site = ANY(%s)
+                GROUP BY 1, 2
+                ORDER BY 2
+            """, (SELF_MONITORING_SITES,))
+            for r in cur.fetchall():
+                s = r['site']
+                charts.setdefault(s, {'l': [], 'u': [], 'r': []})
+                charts[s]['l'].append(r['d'].strftime("%d.%m"))
+                charts[s]['u'].append(float(r['u']) if r['u'] is not None else 0)
+                charts[s]['r'].append(float(r['r']) if r['r'] is not None else 0)
+
+        cur.close()
+        conn.close()
+
+        sites_data = []
+        for s in SELF_MONITORING_SITES:
+            lr = latest_rows.get(s, {})
+            sr = stats_rows.get(s, {})
+            sites_data.append({
+                'site': s,
+                'status': lr.get('status', 0),
+                'response_time': round(float(lr.get('response_time', 0) or 0), 2),
+                'upt': float(sr.get('upt', 0) or 0),
+                'ssl_days': lr.get('ssl_days', -1),
+                'domain_days': lr.get('domain_days', -1),
+                'ssl_chain_valid': lr.get('ssl_chain_valid')
+            })
+
+        return {
+            "status": "ok",
+            "sites": sites_data,
+            "incidents": incidents,
+            "charts": charts
+        }
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
 def _get_stats_from_agg(cur, interval: str):
-    """Статистика из checks_agg; fallback на logs если агрегаты пусты.
-    Uptime — взвешенный через SUM, response_time — взвешенное среднее."""
+    """Статистика из checks_agg; fallback на logs если агрегаты пустые.
+    Uptime — взвешенный через SUM, response_time — взвешенное среднее.
+    Self-monitoring сайты исключены."""
     cur.execute("""
         SELECT
             ROUND(SUM(status_200_count) * 100.0
@@ -1662,7 +1995,8 @@ def _get_stats_from_agg(cur, interval: str):
             ROUND((SUM(avg_response_time * checks_count)
                   / NULLIF(SUM(checks_count), 0))::numeric, 3) as resp
         FROM checks_agg WHERE bucket > NOW() - INTERVAL %s
-    """, (interval,))
+          AND site <> ALL(%s)
+    """, (interval, SELF_MONITORING_SITES))
     row = cur.fetchone()
     if row and row[0] is not None:
         return {'up': float(row[0]), 'resp': float(row[1]) if row[1] is not None else 0}
@@ -1673,7 +2007,8 @@ def _get_stats_from_agg(cur, interval: str):
                    / NULLIF(COUNT(*), 0))::numeric, 2) as up,
             ROUND(AVG(response_time)::numeric, 3) as resp
         FROM logs WHERE timestamp > NOW() - INTERVAL %s
-    """, (interval,))
+          AND site <> ALL(%s)
+    """, (interval, SELF_MONITORING_SITES))
     row = cur.fetchone()
     return {'up': float(row[0]) if row[0] is not None else 0, 'resp': float(row[1]) if row[1] is not None else 0}
 
@@ -1686,7 +2021,7 @@ async def api_charts(auth: bool = Depends(check_auth)):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
-    allowed_sites = set(SITES)
+    allowed_sites = set(SITES) | set(SELF_MONITORING_SITES)  # include self-monitoring for charts
 
     cur.execute("""
         SELECT site, bucket::date as d,
@@ -1754,16 +2089,18 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("SELECT * FROM latest_status")
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
 
-    # Статистика по сайтам — из checks_agg
+    # Статистика по сайтам — из checks_agg (self-monitoring исключены)
     cur.execute("""
         SELECT site,
             ROUND(SUM(status_200_count) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
             SUM(checks_count - status_200_count) * 5 as down_sec
         FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
+          AND site <> ALL(%s)
         GROUP BY site
-    """)
+    """, (SELF_MONITORING_SITES,))
     stats_rows = cur.fetchall()
     if stats_rows and stats_rows[0][0] is not None:
         stats = {r['site']: r for r in stats_rows}
@@ -1774,11 +2111,37 @@ async def index(auth: bool = Depends(check_auth)):
                        / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
                 COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
             FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+              AND site <> ALL(%s)
             GROUP BY site
-        """)
+        """, (SELF_MONITORING_SITES,))
         stats = {r['site']: r for r in cur.fetchall()}
 
-    # Групповые метрики (правильный расчет uptime/resp через взвешенное среднее)
+    # Self-monitoring статистика
+    cur.execute("""
+        SELECT site,
+            ROUND(SUM(status_200_count) * 100.0
+                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+            SUM(checks_count - status_200_count) * 5 as down_sec
+        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
+          AND site = ANY(%s)
+        GROUP BY site
+    """, (SELF_MONITORING_SITES,))
+    self_stats_rows = cur.fetchall()
+    if self_stats_rows and self_stats_rows[0][0] is not None:
+        self_stats = {r['site']: r for r in self_stats_rows}
+    else:
+        cur.execute("""
+            SELECT site,
+                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
+                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+              AND site = ANY(%s)
+            GROUP BY site
+        """, (SELF_MONITORING_SITES,))
+        self_stats = {r['site']: r for r in cur.fetchall()}
+
+    # Групповые метрики (правильный расчет uptime/resp через взвешенное среднее, self-monitoring исключены)
     cur.execute("""
         SELECT 
             CASE WHEN site = ANY(%s) THEN 0
@@ -1790,8 +2153,9 @@ async def index(auth: bool = Depends(check_auth)):
                   / NULLIF(SUM(checks_count), 0))::numeric, 3) as resp
         FROM checks_agg 
         WHERE bucket > NOW() - INTERVAL '30 days'
+          AND site <> ALL(%s)
         GROUP BY grp
-    """, (KEY_SITES, STDO_SITES))
+    """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
     group_agg_rows = cur.fetchall()
     if group_agg_rows and group_agg_rows[0][0] is not None:
         group_agg = {r['grp']: r for r in group_agg_rows}
@@ -1807,8 +2171,9 @@ async def index(auth: bool = Depends(check_auth)):
                 ROUND(AVG(response_time)::numeric, 3) as resp
             FROM logs 
             WHERE timestamp > NOW() - INTERVAL '30 days'
+              AND site <> ALL(%s)
             GROUP BY grp
-        """, (KEY_SITES, STDO_SITES))
+        """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
         group_agg = {r['grp']: r for r in cur.fetchall()}
 
     # Инциденты — читаем из таблицы incidents (быстро), fallback на CTE из logs (разово)
@@ -1823,8 +2188,9 @@ async def index(auth: bool = Depends(check_auth)):
             ssl_chain_valid
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
+          AND site <> ALL(%s)
         ORDER BY start_time DESC LIMIT 100
-    """)
+    """, (SELF_MONITORING_SITES,))
     incidents_list = [dict(r) for r in cur.fetchall()]
 
     # Fallback: если таблица incidents пустая — один раз используем CTE из logs
@@ -1837,6 +2203,7 @@ async def index(auth: bool = Depends(check_auth)):
                          OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
                     THEN 1 ELSE 0 END as is_start
                 FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                  AND site <> ALL(%s)
             ),
             incident_groups AS (
                 SELECT site, timestamp, status,
@@ -1852,8 +2219,54 @@ async def index(auth: bool = Depends(check_auth)):
                 NULL::boolean as ssl_chain_valid
             FROM incident_groups
             GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 100
-        """)
+        """, (SELF_MONITORING_SITES,))
         incidents_list = [dict(r) for r in cur.fetchall()]
+
+    # Self-monitoring инциденты
+    cur.execute("""
+        SELECT site, start_time,
+            COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+            max_status,
+            CASE WHEN max_status = 0 THEN 'Timeout'
+                 WHEN max_status = 502 THEN 'Bad Gateway'
+                 WHEN max_status = 503 THEN 'Service Unavailable'
+                 ELSE 'Server Error' END as description,
+            ssl_chain_valid
+        FROM incidents
+        WHERE start_time > NOW() - INTERVAL '30 days'
+          AND site = ANY(%s)
+        ORDER BY start_time DESC LIMIT 20
+    """, (SELF_MONITORING_SITES,))
+    self_incidents_list = [dict(r) for r in cur.fetchall()]
+
+    # Fallback: если таблица incidents пустая — один раз используем CTE из logs
+    if not self_incidents_list:
+        cur.execute("""
+            WITH status_changes AS (
+                SELECT site, timestamp, status,
+                    CASE WHEN status != 200 AND
+                        (LAG(status) OVER (PARTITION BY site ORDER BY timestamp) = 200
+                         OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
+                    THEN 1 ELSE 0 END as is_start
+                FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                  AND site = ANY(%s)
+            ),
+            incident_groups AS (
+                SELECT site, timestamp, status,
+                    SUM(is_start) OVER (PARTITION BY site ORDER BY timestamp) as grp_id
+                FROM status_changes WHERE status != 200
+            )
+            SELECT site, MIN(timestamp) as start_time, COUNT(*) * 1 as dur,
+                MAX(status) as max_status,
+                CASE WHEN MAX(status) = 0 THEN 'Timeout'
+                     WHEN MAX(status) = 502 THEN 'Bad Gateway'
+                     WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                     ELSE 'Server Error' END as description,
+                NULL::boolean as ssl_chain_valid
+            FROM incident_groups
+            GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 20
+        """, (SELF_MONITORING_SITES,))
+        self_incidents_list = [dict(r) for r in cur.fetchall()]
 
     cur.close()
     conn.close()
@@ -1863,6 +2276,9 @@ async def index(auth: bool = Depends(check_auth)):
         "latest": latest, "stats": stats,
         "incidents": incidents_list,
         "group_agg": group_agg,
+        "self_latest": self_latest,
+        "self_stats": self_stats,
+        "self_incidents": self_incidents_list,
         "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
     }
     with _dashboard_cache["lock"]:
@@ -1871,14 +2287,20 @@ async def index(auth: bool = Depends(check_auth)):
     return _build_html(data)
 
 
+
 def _build_html(data: dict) -> str:
-    """Сборка HTML из кэшированного dict (без SQL, <10 мс) — оптимизировано через list"""
+    """Сборка HTML из кэшированного dict (без SQL, <10 мс) — оптимизировано через list.
+    JS часть использует string.Template для безопасной подстановки JSON."""
     s30 = data["s30"]
     s24 = data["s24"]
     latest = data["latest"]
     stats = data["stats"]
     incidents_list = data["incidents"]
     now_msk = data["now_msk"]
+    self_latest = data.get("self_latest", {})
+    self_stats = data.get("self_stats", {})
+    self_incidents_list = data.get("self_incidents", [])
+    group_agg = data.get("group_agg", {})
 
     incidents = [s for s, v in latest.items() if v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
@@ -1909,9 +2331,6 @@ def _build_html(data: dict) -> str:
     stdo_sites_json = json.dumps(STDO_SITES)
     external_sites_json = json.dumps(EXTERNAL_SITES)
 
-    group_agg = data.get("group_agg", {})
-
-    # Промежуточные итоги по группам для графиков (из checks_agg, взвешенное среднее)
     group_stats = {}
     for g in [0, 1, 2]:
         group_sites = [s for s in sorted_sites if get_site_group(s) == g]
@@ -1921,7 +2340,6 @@ def _build_html(data: dict) -> str:
             g_upt = float(g_row['upt'])
             g_resp = float(g_row['resp'] or 0)
         else:
-            # fallback: если в checks_agg нет данных — ручной расчет по сайтам
             if group_valid:
                 g_upt = round(sum(float((stats.get(site, {}) or {}).get('upt', 0) or 0) for site in group_sites) / max(len(group_sites), 1), 1)
                 g_resp = round(sum(float(v['response_time']) for v in group_valid) / len(group_valid), 2)
@@ -1934,7 +2352,16 @@ def _build_html(data: dict) -> str:
         }
     group_stats_json = json.dumps(group_stats)
 
-    # Используем list для O(n) сборки вместо O(n^2) string concatenation
+    self_sites_json = json.dumps(SELF_MONITORING_SITES)
+
+    js_vars = {
+        'key_sites_json': key_sites_json,
+        'stdo_sites_json': stdo_sites_json,
+        'external_sites_json': external_sites_json,
+        'group_stats_json': group_stats_json,
+        'self_sites_json': self_sites_json,
+    }
+
     H = []
 
     H.append(f"""<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
@@ -2028,6 +2455,7 @@ def _build_html(data: dict) -> str:
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
             <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
             <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
+            <button class="tab-btn" onclick="tab(event, 't5')">Self Monitoring</button>
             <button class="tab-btn" onclick="location.href='/admin/page'">Управление</button>
         </div>
         <div id="t1" class="tab-content active-content">
@@ -2040,7 +2468,7 @@ def _build_html(data: dict) -> str:
         g = get_site_group(s)
         if g != current_group:
             st = group_stats.get(g, {'online': 0, 'total': 0, 'upt': 0, 'resp': 0})
-            g_sub = f'<span class="group-sub">Online: {st["online"]}/{st["total"]} | Uptime: {st["upt"]}% | ⌀ Ответ: {st["resp"]}с</span>'
+            g_sub = f'<span class="group-sub">Online: {st["online"]}/{st["total"]} | Uptime: {st["upt"]}% | Avg Ответ: {st["resp"]}с</span>'
             H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}{g_sub}</td></tr>')
             current_group = g
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
@@ -2105,17 +2533,56 @@ def _build_html(data: dict) -> str:
         H.append(f"""<tr><td>{ev['t']}</td><td>{ev['s']}</td>
             <td class="{'txt-err' if ev['d']<=30 else ''}">{ev['d']} дн.</td></tr>""")
 
-    H.append(f"""</tbody></table></div></div><script>
+    H.append("""</tbody></table></div>
+    <div id="t5" class="tab-content">
+        <h3 style="color:#00717a;margin-top:0;">Self Monitoring</h3>
+        <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th></tr></thead><tbody>""")
+
+    for s in SELF_MONITORING_SITES:
+        v = self_latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
+        st30 = self_stats.get(s, {'upt': 0, 'down_sec': 0})
+        is_err = v['status'] != 200
+        H.append(f"""<tr class="{'row-err' if is_err else ''}">
+            <td><strong>{s}</strong></td>
+            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
+                {'Online' if v['status']==200 else 'Offline'}</span></td>
+            <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
+            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+            <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
+                {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
+            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
+        </tr>""")
+
+    H.append("""</tbody></table>
+        <h4 style="color:#475569;margin-top:25px;">📈 График</h4>
+        <div id="self-chart-container" style="max-width:600px;"><div style="text-align:center;padding:30px;color:#999;">Загрузка графика...</div></div>
+        <h4 style="color:#475569;margin-top:25px;">📋 Инциденты</h4>
+        <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody>""")
+
+    for r in self_incidents_list:
+        H.append(f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+            <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
+            <td>{r['max_status']}</td><td>{r['description']}</td>
+            <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
+                {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td></tr>""")
+
+    H.append("</tbody></table>\n</div>")
+
+    js_template_str = """
+    <script>
     let chartsLoaded = false;
     let chartsLoading = false;
     let showingAll = false;
+    let selfChartLoaded = false;
+    let selfChartLoading = false;
 
-    const keySites = {key_sites_json};
-    const stdoSites = {stdo_sites_json};
-    const externalSites = {external_sites_json};
-    const groupStats = {group_stats_json};
+    const keySites = $key_sites_json;
+    const stdoSites = $stdo_sites_json;
+    const externalSites = $external_sites_json;
+    const groupStats = $group_stats_json;
+    const selfSites = $self_sites_json;
 
-    function tab(e, n){{
+    function tab(e, n){
         var i, x = document.getElementsByClassName('tab-content'),
             b = document.getElementsByClassName('tab-btn');
         for(i = 0; i < x.length; i++) x[i].className = 'tab-content';
@@ -2123,67 +2590,68 @@ def _build_html(data: dict) -> str:
         document.getElementById(n).className = 'tab-content active-content';
         e.currentTarget.className += ' active';
         if (n === 't2') loadCharts();
-    }}
+        if (n === 't5') loadSelfChart();
+    }
 
-    async function runTest(site, btn) {{
+    async function runTest(site, btn) {
         if (btn.classList.contains('loading')) return;
         btn.classList.add('loading');
         btn.disabled = true;
-        try {{
+        try {
             const response = await fetch('/test-screen/' + site);
             const data = await response.json();
             showToast(data.msg);
-        }} catch (e) {{ showToast('Ошибка связи с сервером'); }}
-        finally {{ btn.classList.remove('loading'); btn.disabled = false; }}
-    }}
+        } catch (e) { showToast('Ошибка связи с сервером'); }
+        finally { btn.classList.remove('loading'); btn.disabled = false; }
+    }
 
-    function showToast(msg) {{
+    function showToast(msg) {
         const t = document.getElementById('toast');
         t.innerText = msg;
         t.style.display = 'block';
-        setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
-    }}
+        setTimeout(() => { t.style.display = 'none'; }, 4000);
+    }
 
-    function renderChartSection(titleKey, titleIdx, sitesList, g_data, container) {{
+    function renderChartSection(titleKey, titleIdx, sitesList, g_data, container) {
         const filtered = sitesList.filter(s => g_data[s]);
         if (filtered.length === 0) return;
-        const st = groupStats[titleIdx] || {{online:0, total:0, upt:0, resp:0}};
+        const st = groupStats[titleIdx] || {online:0, total:0, upt:0, resp:0};
         const h3 = document.createElement('h3');
         h3.style.gridColumn = '1 / -1';
         h3.style.marginTop = '20px';
         h3.style.color = '#475569';
-        h3.innerHTML = `${{titleKey}} <span style="float:right;font-weight:normal;font-size:13px;">Online: ${{st.online}}/${{st.total}} | Uptime: ${{st.upt}}% | ⌀ Ответ: ${{st.resp}}с</span>`;
+        h3.innerHTML = titleKey + ' <span style="float:right;font-weight:normal;font-size:13px;">Online: ' + st.online + '/' + st.total + ' | Uptime: ' + st.upt + '% | Avg Ответ: ' + st.resp + 'с</span>';
         container.appendChild(h3);
-        for (const s of filtered) {{
+        for (const s of filtered) {
             const d = g_data[s];
             const div = document.createElement('div');
             div.className = 'kpi-card';
             div.style.borderTop = '2px solid #eee';
-            div.innerHTML = `<h5>${{s}}</h5><canvas id="c-${{s.replace(/\\./g, '_')}}"></canvas>`;
+            div.innerHTML = '<h5>' + s + '</h5><canvas id="c-' + s.replace(/\\./g, '_') + '"></canvas>';
             container.appendChild(div);
-            new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {{
+            new Chart(document.getElementById('c-' + s.replace(/\\./g, '_')), {
                 type: 'line',
-                data: {{
+                data: {
                     labels: d.l,
                     datasets: [
-                        {{ label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 }},
-                        {{ label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 }}
+                        { label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 },
+                        { label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3, pointHoverRadius: 5 }
                     ]
-                }},
-                options: {{
-                    scales: {{
-                        y: {{ suggestedMin: 95, suggestedMax: 100.5, title: {{ display: true, text: 'Uptime %' }} }},
-                        y1: {{ position: 'right', grid: {{ display: false }}, title: {{ display: true, text: 'Ответ, сек' }} }}
-                    }}
-                }}
-            }});
-        }}
-    }}
+                },
+                options: {
+                    scales: {
+                        y: { suggestedMin: 95, suggestedMax: 100.5, title: { display: true, text: 'Uptime %' } },
+                        y1: { position: 'right', grid: { display: false }, title: { display: true, text: 'Ответ, сек' } }
+                    }
+                }
+            });
+        }
+    }
 
-    async function loadCharts() {{
+    async function loadCharts() {
         if (chartsLoaded || chartsLoading) return;
         chartsLoading = true;
-        try {{
+        try {
             const res = await fetch('/api/charts');
             const g_data = await res.json();
             const container = document.getElementById('charts-container');
@@ -2192,9 +2660,9 @@ def _build_html(data: dict) -> str:
             renderChartSection('Ключевые', 0, keySites, g_data, container);
             renderChartSection('СТДО', 1, stdoSites, g_data, container);
 
-            if (showingAll) {{
+            if (showingAll) {
                 renderChartSection('Внешние сайты', 2, externalSites, g_data, container);
-            }} else {{
+            } else {
                 const btnDiv = document.createElement('div');
                 btnDiv.style.textAlign = 'center';
                 btnDiv.style.padding = '20px';
@@ -2203,31 +2671,76 @@ def _build_html(data: dict) -> str:
                 btn.innerText = 'Показать все внешние сайты';
                 btn.className = 'tab-btn';
                 btn.style.cursor = 'pointer';
-                btn.onclick = () => {{ showingAll = true; chartsLoaded = false; loadCharts(); }};
+                btn.onclick = () => { showingAll = true; chartsLoaded = false; loadCharts(); };
                 btnDiv.appendChild(btn);
                 container.appendChild(btnDiv);
-            }}
+            }
 
             chartsLoaded = true;
-        }} catch (e) {{
+        } catch (e) {
             document.getElementById('charts-container').innerHTML =
                 '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
-        }} finally {{
+        } finally {
             chartsLoading = false;
-        }}
-    }}
+        }
+    }
 
-    function toggleIncidents() {{
+    async function loadSelfChart() {
+        if (selfChartLoaded || selfChartLoading) return;
+        selfChartLoading = true;
+        try {
+            const res = await fetch('/api/charts');
+            const g_data = await res.json();
+            const container = document.getElementById('self-chart-container');
+            container.innerHTML = '';
+            for (const s of selfSites) {
+                if (!g_data[s]) continue;
+                const d = g_data[s];
+                const div = document.createElement('div');
+                div.className = 'kpi-card';
+                div.style.borderTop = '2px solid #eee';
+                div.innerHTML = '<h5>' + s + '</h5><canvas id="self-c-' + s.replace(/\\./g, '_') + '"></canvas>';
+                container.appendChild(div);
+                new Chart(document.getElementById('self-c-' + s.replace(/\\./g, '_')), {
+                    type: 'line',
+                    data: {
+                        labels: d.l,
+                        datasets: [
+                            { label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3 },
+                            { label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3 }
+                        ]
+                    },
+                    options: {
+                        scales: {
+                            y: { suggestedMin: 95, suggestedMax: 100.5, title: { display: true, text: 'Uptime %' } },
+                            y1: { position: 'right', grid: { display: false }, title: { display: true, text: 'Ответ, сек' } }
+                        }
+                    }
+                });
+            }
+            selfChartLoaded = true;
+        } catch (e) {
+            document.getElementById('self-chart-container').innerHTML =
+                '<div style="text-align:center; padding:30px; color:#b91c1c;">Ошибка загрузки графика</div>';
+        } finally {
+            selfChartLoading = false;
+        }
+    }
+
+    function toggleIncidents() {
         const hidden = document.querySelectorAll('#t3 .incident-hidden');
         const btn = document.getElementById('btn-show-incidents');
-        for (const row of hidden) {{
+        for (const row of hidden) {
             row.classList.remove('incident-hidden');
-        }}
+        }
         if (btn) btn.style.display = 'none';
-    }}
+    }
 
-    setInterval(() => {{ location.reload(); }}, 120000);
-    </script></body></html>""")
+    setInterval(() => { location.reload(); }, 120000);
+    </script></body></html>"""
+
+    js_part = Template(js_template_str).substitute(js_vars)
+    H.append(js_part)
 
     return "".join(H)
 
