@@ -763,6 +763,15 @@ async def check_single_site(session, site, semaphore):
     return (site, curr_status, resp_time)
 
 
+async def check_all_sites():
+    """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
+    semaphore = asyncio.Semaphore(15)
+    async with aiohttp.ClientSession() as session:
+        tasks = [check_single_site(session, site, semaphore) for site in SITES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if not isinstance(r, Exception)]
+
+
 async def check_self_monitoring():
     """Проверка self-monitoring сайтов через /health endpoint. 401 считается успехом (сайт жив)."""
     async with aiohttp.ClientSession() as session:
