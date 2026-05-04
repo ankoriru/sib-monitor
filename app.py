@@ -48,6 +48,9 @@ if os.getenv("SELF_SIGNED_SITES"):
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
 AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
 
+# --- ADMIN: Пароль для вкладки Управление (bcrypt hash for "flvby") ---
+ADMIN_PASSWORD_HASH = "$2b$12$rsNPWPiJyP5NSwg71GUw9uBxPAbGk..gOD2W.CU9SGLrNuFO.bIgC"
+
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
     "alphapor.ru", "amur-gcc.ru", "ar24.sibur.ru",
@@ -179,6 +182,28 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
 # ============================================================================
 # УТИЛИТЫ
 # ============================================================================
+def admin_check_auth(request: Request, response: Response, admin_session: str = Cookie(None)):
+    """Аутентификация для вкладки Управление (пароль 'flvby')"""
+    if admin_session == "authenticated_admin":
+        return True
+    auth = request.headers.get("X-Admin-Auth")
+    if auth:
+        try:
+            if bcrypt.checkpw(auth.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+                response.set_cookie(
+                    key="admin_session",
+                    value="authenticated_admin",
+                    max_age=86400,
+                    httponly=True,
+                    secure=True,
+                    samesite="lax"
+                )
+                return True
+        except Exception:
+            pass
+    raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -1285,6 +1310,146 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
     )
 
 
+@app.get("/admin/login", response_class=HTMLResponse)
+async def admin_login_page():
+    """Страница входа в админ-панель"""
+    return """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Вход — Управление</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 320px; }
+        h2 { color: #00717a; margin: 0 0 20px; }
+        input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #00717a; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #005f66; }
+        .error { color: #dc2626; font-size: 13px; margin-top: 8px; display: none; }
+    </style></head><body>
+    <div class="login-box">
+        <h2>🔐 Управление</h2>
+        <input type="password" id="pwd" placeholder="Пароль" onkeypress="if(event.key==='Enter')doLogin()">
+        <button onclick="doLogin()">Войти</button>
+        <div id="err" class="error">Неверный пароль</div>
+    </div>
+    <script>
+    async function doLogin() {
+        const pwd = document.getElementById('pwd').value;
+        const r = await fetch('/admin/auth', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pwd})});
+        if (r.ok) { location.href = '/admin/page'; }
+        else { document.getElementById('err').style.display = 'block'; }
+    }
+    </script></body></html>"""
+
+
+@app.post("/admin/auth")
+async def admin_auth(request: Request, response: Response):
+    """Проверка пароля для админ-панели"""
+    try:
+        data = await request.json()
+        pwd = data.get("password", "")
+        if bcrypt.checkpw(pwd.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+            response.set_cookie(
+                key="admin_session",
+                value="authenticated_admin",
+                max_age=86400,
+                httponly=True,
+                secure=True,
+                samesite="lax"
+            )
+            return {"status": "ok"}
+        return JSONResponse({"status": "error", "msg": "Invalid password"}, status_code=401)
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.get("/admin/page", response_class=HTMLResponse)
+async def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
+    """Страница управления сайтами (требует admin-пароль)"""
+    if admin_session != "authenticated_admin":
+        return HTMLResponse("""<script>location.href='/admin/login';</script>""", status_code=302)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites ORDER BY site_group, site")
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception:
+        rows = []
+
+    H = []
+    H.append("""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }
+        .container { max-width: 900px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #00717a; margin: 0 0 20px; }
+        .add-form { display: flex; gap: 10px; margin-bottom: 20px; padding: 15px; background: #f1f5f9; border-radius: 8px; }
+        input, select { padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 14px; }
+        .btn { padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn-primary { background: #00717a; color: white; }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }
+        th { background: #e2e8f0; color: #475569; }
+        .badge { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .badge-key { background: #fef3c7; color: #92400e; }
+        .badge-stdo { background: #dbeafe; color: #1e40af; }
+        .badge-ext { background: #f3f4f6; color: #4b5563; }
+        .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; }
+    </style></head><body>
+    <div class="container">
+        <h1>🔧 Управление сайтами</h1>
+        <div class="add-form">
+            <input type="text" id="newSite" placeholder="site.ru" style="flex:1;">
+            <select id="newGroup">
+                <option value="external">Внешний</option>
+                <option value="key">Ключевой</option>
+                <option value="stdo">СТДО</option>
+            </select>
+            <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
+            <button class="btn" style="background:#e2e8f0;margin-left:auto;" onclick="location.href='/'">← Назад</button>
+        </div>
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th></th></tr></thead><tbody>""")
+
+    for r in rows:
+        badge = 'badge-key' if r['site_group'] == 'key' else ('badge-stdo' if r['site_group'] == 'stdo' else 'badge-ext')
+        grp_name = '⭐ Ключевой' if r['site_group'] == 'key' else ('🛡️ СТДО' if r['site_group'] == 'stdo' else '🌐 Внешний')
+        status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
+        H.append(f"""<tr>
+            <td><strong>{r['site']}</strong></td>
+            <td><span class="badge {badge}">{grp_name}</span></td>
+            <td>{status}</td>
+            <td>{r['alert_threshold']}</td>
+            <td><button class="btn btn-danger" onclick="delSite('{r['site']}')">🗑️ Удалить</button></td>
+        </tr>""")
+
+    H.append("""</tbody></table></div>
+    <div id="toast" class="toast"></div>
+    <script>
+    async function addSite() {
+        const site = document.getElementById('newSite').value.trim();
+        const group = document.getElementById('newGroup').value;
+        if (!site) return showToast('Введите сайт');
+        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group})});
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    async function delSite(site) {
+        if (!confirm('Удалить ' + site + '?')) return;
+        const r = await fetch('/api/sites/' + encodeURIComponent(site), {method:'DELETE'});
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    function showToast(msg) {
+        const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
+        setTimeout(() => { t.style.display = 'none'; }, 3000);
+    }
+    </script></body></html>""")
+    return HTMLResponse("".join(H))
+
+
 @app.get("/health")
 async def health():
     """Health-check: проверяет heartbeat worker'а"""
@@ -1747,6 +1912,7 @@ def _build_html(data: dict) -> str:
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
             <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
             <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
+            <button class="tab-btn" onclick="location.href='/admin/page'">Управление</button>
         </div>
         <div id="t1" class="tab-content active-content">
             <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
