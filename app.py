@@ -213,16 +213,17 @@ def load_active_sites():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, site_group FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
+        cur.execute("SELECT site, site_group, alert_threshold FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
         rows = cur.fetchall()
         cur.close()
         conn.close()
         if rows:
             sites = [r[0] for r in rows]
+            thresholds = {r[0]: r[2] for r in rows}
             key = [r[0] for r in rows if r[1] == 'key']
             stdo = [r[0] for r in rows if r[1] == 'stdo']
             ext = [r[0] for r in rows if r[1] not in ('key', 'stdo')]
-            return sites, key, stdo, ext
+            return sites, key, stdo, ext, thresholds
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
     # Fallback
@@ -230,7 +231,8 @@ def load_active_sites():
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
     ext = EXTERNAL_SITES[:]
-    return all_sites, key, stdo, ext
+    thresholds = {s: 5 for s in all_sites}
+    return all_sites, key, stdo, ext, thresholds
 
 
 def should_verify(site: str) -> bool:
@@ -1037,7 +1039,7 @@ def check_worker():
         t_start = time.time()
         try:
             # Обновляем список сайтов из БД каждый цикл
-            SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES = load_active_sites()
+            SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
             # Инициализируем состояние для новых сайтов
             for site in SITES:
                 if site not in last_status:
@@ -1075,7 +1077,7 @@ def check_worker():
 
                     if curr_status != 200:
                         fail_count[site] += 1
-                        alert_threshold = 5
+                        alert_threshold = thresholds.get(site, 5)
 
                         if fail_count[site] == 1 and last_status[site] == 200:
                             print(f"[INCIDENT START] {site}")
@@ -1380,47 +1382,76 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     H.append("""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }
-        .container { max-width: 900px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         h1 { color: #00717a; margin: 0 0 20px; }
-        .add-form { display: flex; gap: 10px; margin-bottom: 20px; padding: 15px; background: #f1f5f9; border-radius: 8px; }
+        .add-form { display: flex; gap: 10px; margin-bottom: 20px; padding: 15px; background: #f1f5f9; border-radius: 8px; flex-wrap: wrap; }
         input, select { padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 14px; }
-        .btn { padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; }
         .btn-primary { background: #00717a; color: white; }
+        .btn-primary:hover { background: #005f66; }
+        .btn-warn { background: #f59e0b; color: white; }
+        .btn-warn:hover { background: #d97706; }
         .btn-danger { background: #ef4444; color: white; }
         .btn-danger:hover { background: #dc2626; }
+        .btn-success { background: #10b981; color: white; }
+        .btn-success:hover { background: #059669; }
+        .btn-gray { background: #e2e8f0; color: #475569; }
         table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f1f5f9; }
+        th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
         th { background: #e2e8f0; color: #475569; }
         .badge { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .badge-key { background: #fef3c7; color: #92400e; }
         .badge-stdo { background: #dbeafe; color: #1e40af; }
         .badge-ext { background: #f3f4f6; color: #4b5563; }
+        .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .row-disabled td { opacity: 0.6; background: #f8fafc; }
+        .edit-form { display: none; }
+        .edit-form select, .edit-form input { padding: 6px; font-size: 13px; width: 100%; }
         .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; }
     </style></head><body>
     <div class="container">
         <h1>🔧 Управление сайтами</h1>
         <div class="add-form">
-            <input type="text" id="newSite" placeholder="site.ru" style="flex:1;">
+            <input type="text" id="newSite" placeholder="site.ru" style="flex:1;min-width:200px;">
             <select id="newGroup">
-                <option value="external">Внешний</option>
-                <option value="key">Ключевой</option>
-                <option value="stdo">СТДО</option>
+                <option value="external">🌐 Внешний</option>
+                <option value="key">⭐ Ключевой</option>
+                <option value="stdo">🛡️ СТДО</option>
             </select>
+            <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
-            <button class="btn" style="background:#e2e8f0;margin-left:auto;" onclick="location.href='/'">← Назад</button>
+            <button class="btn btn-gray" style="margin-left:auto;" onclick="location.href='/'">← Назад</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th></th></tr></thead><tbody>""")
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:280px;">Действия</th></tr></thead><tbody>""")
 
     for r in rows:
         badge = 'badge-key' if r['site_group'] == 'key' else ('badge-stdo' if r['site_group'] == 'stdo' else 'badge-ext')
         grp_name = '⭐ Ключевой' if r['site_group'] == 'key' else ('🛡️ СТДО' if r['site_group'] == 'stdo' else '🌐 Внешний')
+        disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
-        H.append(f"""<tr>
+        site_esc = r['site'].replace("'", "\\'")
+        H.append(f"""<tr class="{disabled_cls}" id="row-{site_esc}">
             <td><strong>{r['site']}</strong></td>
             <td><span class="badge {badge}">{grp_name}</span></td>
             <td>{status}</td>
             <td>{r['alert_threshold']}</td>
-            <td><button class="btn btn-danger" onclick="delSite('{r['site']}')">🗑️ Удалить</button></td>
+            <td>
+                <div class="actions">
+                    <button class="btn btn-warn" onclick="editRow('{site_esc}')">✏️ Изменить</button>
+                    {'<button class="btn btn-gray" onclick="toggleSite(\'' + site_esc + '\')">🛑 Отключить</button>' if r['is_active'] else '<button class="btn btn-success" onclick="toggleSite(\'' + site_esc + '\')">✅ Восстановить</button>'}
+                    <button class="btn btn-danger" onclick="deleteSite('{site_esc}')">🗑️ Удалить</button>
+                </div>
+                <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;">
+                    <select id="grp-{site_esc}" style="width:120px;">
+                        <option value="external" {'selected' if r['site_group']=='external' else ''}>🌐 Внешний</option>
+                        <option value="key" {'selected' if r['site_group']=='key' else ''}>⭐ Ключевой</option>
+                        <option value="stdo" {'selected' if r['site_group']=='stdo' else ''}>🛡️ СТДО</option>
+                    </select>
+                    <input type="number" id="thr-{site_esc}" value="{r['alert_threshold']}" min="1" max="60" style="width:70px;">
+                    <button class="btn btn-primary" onclick="saveRow('{site_esc}')">💾 Сохранить</button>
+                    <button class="btn btn-gray" onclick="cancelEdit('{site_esc}')">Отмена</button>
+                </div>
+            </td>
         </tr>""")
 
     H.append("""</tbody></table></div>
@@ -1429,14 +1460,39 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     async function addSite() {
         const site = document.getElementById('newSite').value.trim();
         const group = document.getElementById('newGroup').value;
+        const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
         if (!site) return showToast('Введите сайт');
-        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group})});
+        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold})});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
-    async function delSite(site) {
-        if (!confirm('Удалить ' + site + '?')) return;
+    function editRow(site) {
+        const form = document.getElementById('edit-' + site);
+        form.style.display = form.style.display === 'none' ? 'flex' : 'none';
+    }
+    function cancelEdit(site) {
+        document.getElementById('edit-' + site).style.display = 'none';
+    }
+    async function saveRow(site) {
+        const group = document.getElementById('grp-' + site).value;
+        const threshold = parseInt(document.getElementById('thr-' + site).value);
+        const r = await fetch('/api/sites/' + encodeURIComponent(site), {
+            method:'PUT', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({group, threshold})
+        });
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    async function toggleSite(site) {
+        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle', {method:'POST'});
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    async function deleteSite(site) {
+        if (!confirm('Удалить ' + site + ' окончательно?')) return;
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {method:'DELETE'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
@@ -1501,15 +1557,21 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         data = await request.json()
         site = data.get("site", "").strip()
         group = data.get("group", "external")
+        threshold = int(data.get("threshold", 5))
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
+        if threshold < 1 or threshold > 60:
+            return JSONResponse({"status": "error", "msg": "threshold must be 1-60"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO monitored_sites (site, site_group)
-            VALUES (%s, %s)
-            ON CONFLICT (site) DO UPDATE SET is_active = TRUE, site_group = EXCLUDED.site_group
-        """, (site, group))
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+            VALUES (%s, %s, %s, TRUE)
+            ON CONFLICT (site) DO UPDATE SET
+                is_active = TRUE,
+                site_group = EXCLUDED.site_group,
+                alert_threshold = EXCLUDED.alert_threshold
+        """, (site, group, threshold))
         conn.commit()
         cur.close()
         conn.close()
@@ -1518,20 +1580,74 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
-@app.delete("/api/sites/{site_name:path}")
-async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
-    """Удалить (деактивировать) сайт из мониторинга"""
+@app.put("/api/sites/{site_name:path}")
+async def update_site(site_name: str, request: Request, auth: bool = Depends(check_auth)):
+    """Обновить группу и порог сайта"""
     try:
+        data = await request.json()
+        group = data.get("group")
+        threshold = data.get("threshold")
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE monitored_sites SET is_active = FALSE WHERE site = %s", (site_name,))
+        if group and threshold is not None:
+            cur.execute("""
+                UPDATE monitored_sites
+                SET site_group = %s, alert_threshold = %s
+                WHERE site = %s
+            """, (group, int(threshold), site_name))
+        elif group:
+            cur.execute("UPDATE monitored_sites SET site_group = %s WHERE site = %s", (group, site_name))
+        elif threshold is not None:
+            cur.execute("UPDATE monitored_sites SET alert_threshold = %s WHERE site = %s", (int(threshold), site_name))
         conn.commit()
         affected = cur.rowcount
         cur.close()
         conn.close()
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
-        return {"status": "ok", "msg": f"Site '{site_name}' deactivated"}
+        return {"status": "ok", "msg": f"Site '{site_name}' updated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.post("/api/sites/{site_name:path}/toggle")
+async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
+    """Включить / отключить сайт (toggle is_active)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE monitored_sites
+            SET is_active = NOT is_active
+            WHERE site = %s
+            RETURNING is_active
+        """, (site_name,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if row is None:
+            return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        new_status = "enabled" if row[0] else "disabled"
+        return {"status": "ok", "msg": f"Site '{site_name}' {new_status}", "is_active": row[0]}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.delete("/api/sites/{site_name:path}")
+async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
+    """Окончательное удаление сайта из БД"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM monitored_sites WHERE site = %s", (site_name,))
+        conn.commit()
+        affected = cur.rowcount
+        cur.close()
+        conn.close()
+        if affected == 0:
+            return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        return {"status": "ok", "msg": f"Site '{site_name}' deleted"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
