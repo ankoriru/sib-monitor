@@ -500,6 +500,16 @@ def init_db():
             default_sites
         )
 
+    # Миграция: добавляем self-monitoring сайты если отсутствуют
+    for s in SELF_MONITORING_SITES:
+        cur.execute("""
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+            VALUES (%s, 'external', 10, TRUE)
+            ON CONFLICT (site) DO NOTHING
+        """, (s,))
+        if cur.rowcount > 0:
+            print(f"[INIT] Added self-monitoring site: {s}")
+
     conn.commit()
     cur.close()
     conn.close()
