@@ -183,6 +183,31 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 
+def load_active_sites():
+    """Читает список активных сайтов из БД. Fallback на дефолтный список."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT site, site_group FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if rows:
+            sites = [r[0] for r in rows]
+            key = [r[0] for r in rows if r[1] == 'key']
+            stdo = [r[0] for r in rows if r[1] == 'stdo']
+            ext = [r[0] for r in rows if r[1] not in ('key', 'stdo')]
+            return sites, key, stdo, ext
+    except Exception as e:
+        print(f"[WARN] Failed to load sites from DB: {e}")
+    # Fallback
+    all_sites = SITES[:]
+    key = KEY_SITES[:]
+    stdo = STDO_SITES[:]
+    ext = EXTERNAL_SITES[:]
+    return all_sites, key, stdo, ext
+
+
 def should_verify(site: str) -> bool:
     """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
     return site not in SELF_SIGNED_SITES
@@ -386,6 +411,63 @@ def init_db():
         """)
     except psycopg2.Error:
         conn.rollback()
+
+    # Таблица управляемых сайтов
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS monitored_sites (
+            site TEXT PRIMARY KEY,
+            site_group TEXT DEFAULT 'external',
+            is_active BOOLEAN DEFAULT TRUE,
+            alert_threshold INTEGER DEFAULT 5,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Заполняем дефолтными сайтами если таблица пустая
+    cur.execute("SELECT COUNT(*) FROM monitored_sites")
+    if cur.fetchone()[0] == 0:
+        print("[INIT] Seeding monitored_sites with default list...")
+        default_sites = [
+            ("sibur.ru", "key"),
+            ("eshop.sibur.ru", "key"),
+            ("shop.sibur.ru", "key"),
+            ("srm.sibur.ru", "key"),
+            ("career.sibur.ru", "key"),
+            ("alphapor.ru", "external"),
+            ("amur-gcc.ru", "external"),
+            ("ar24.sibur.ru", "external"),
+            ("bopp.sibur.ru", "external"),
+            ("carbo.sibur.ru", "external"),
+            ("carbonfootprintcalculator.sibur.ru", "external"),
+            ("catalog.sibur.ru", "external"),
+            ("coach.sibur.ru", "external"),
+            ("ecoball.sibur.ru", "external"),
+            ("greencity-sibur.ru", "external"),
+            ("guide.sibur.ru", "external"),
+            ("laika.sibur.ru", "external"),
+            ("magazine.sibur.ru", "external"),
+            ("mendeleev-smena.ru", "external"),
+            ("messages2.sibur.ru", "external"),
+            ("nauka.sibur.ru", "external"),
+            ("oknavdome.info", "external"),
+            ("photo.sibur.ru", "external"),
+            ("polylabsearch.ru", "external"),
+            ("portenergo.com", "external"),
+            ("rusvinyl.ru", "external"),
+            ("sibur.digital", "external"),
+            ("sibur-int.com", "external"),
+            ("sibur-int.ru", "external"),
+            ("sibur-yug.ru", "external"),
+            ("snck.ru", "external"),
+            ("tu-sibur.ru", "external"),
+            ("vivilen.sibur.ru", "external"),
+        ]
+        # STDO сайты
+        for s in NEW_MONITORING_SITES:
+            default_sites.append((s, "stdo"))
+        execute_values(cur,
+            "INSERT INTO monitored_sites (site, site_group) VALUES %s ON CONFLICT DO NOTHING",
+            default_sites
+        )
 
     conn.commit()
     cur.close()
@@ -918,9 +1000,10 @@ def check_worker():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     print("[WORKER START] check_worker started")
 
-    last_status = {site: 200 for site in SITES}
-    fail_count = {site: 0 for site in SITES}
-    last_latency_map = {site: False for site in SITES}
+    global SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES
+    last_status = {}
+    fail_count = {}
+    last_latency_map = {}
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -928,7 +1011,22 @@ def check_worker():
     while True:
         t_start = time.time()
         try:
-            print(f"[WORKER] Starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
+            # Обновляем список сайтов из БД каждый цикл
+            SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES = load_active_sites()
+            # Инициализируем состояние для новых сайтов
+            for site in SITES:
+                if site not in last_status:
+                    last_status[site] = 200
+                    fail_count[site] = 0
+                    last_latency_map[site] = False
+            # Убираем удаленные сайты
+            for site in list(last_status.keys()):
+                if site not in SITES:
+                    del last_status[site]
+                    del fail_count[site]
+                    del last_latency_map[site]
+
+            print(f"[WORKER] {len(SITES)} sites, starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
             # Быстрые HTTP-проверки (только status + response_time)
             results = loop.run_until_complete(check_all_sites())
@@ -1214,6 +1312,63 @@ async def health():
             {"status": "error", "reason": str(e)},
             status_code=500
         )
+
+
+@app.get("/api/sites")
+async def list_sites(auth: bool = Depends(check_auth)):
+    """Список всех сайтов в мониторинге"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites ORDER BY site_group, site")
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return {"sites": rows, "total": len(rows)}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.post("/api/sites")
+async def add_site(request: Request, auth: bool = Depends(check_auth)):
+    """Добавить сайт в мониторинг"""
+    try:
+        data = await request.json()
+        site = data.get("site", "").strip()
+        group = data.get("group", "external")
+        if not site:
+            return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO monitored_sites (site, site_group)
+            VALUES (%s, %s)
+            ON CONFLICT (site) DO UPDATE SET is_active = TRUE, site_group = EXCLUDED.site_group
+        """, (site, group))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "msg": f"Site '{site}' added"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.delete("/api/sites/{site_name:path}")
+async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
+    """Удалить (деактивировать) сайт из мониторинга"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE monitored_sites SET is_active = FALSE WHERE site = %s", (site_name,))
+        conn.commit()
+        affected = cur.rowcount
+        cur.close()
+        conn.close()
+        if affected == 0:
+            return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        return {"status": "ok", "msg": f"Site '{site_name}' deactivated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
 def _get_stats_from_agg(cur, interval: str):
