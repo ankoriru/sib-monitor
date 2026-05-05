@@ -1552,6 +1552,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         <div class="tabs">
             <button class="tab-btn active" onclick="adminTab(event, 'sites-tab')">Сайты</button>
             <button class="tab-btn" onclick="adminTab(event, 'self-tab')">Self Monitoring</button>
+            <button class="tab-btn" onclick="adminTab(event, 'docs-tab')">Описание</button>
         </div>
         <div id="sites-tab" class="tab-content active-content">
         <div class="add-form">
@@ -1613,6 +1614,11 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody id="self-incidents-tbody"></tbody></table>
         </div>
     </div>
+    <div id="docs-tab" class="tab-content">
+        <h3 style="color:#00717a;margin-top:0;">📖 Описание функционала</h3>
+        <div id="docs-loading" style="padding:20px;color:#999;">Загрузка...</div>
+        <pre id="docs-content" style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;white-space:pre-wrap;font-family:'Segoe UI',sans-serif;font-size:13px;line-height:1.6;max-height:70vh;overflow-y:auto;display:none;"></pre>
+    </div>
     </div>
     <div id="toast" class="toast"></div>
     <script>
@@ -1624,6 +1630,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         document.getElementById(n).className = 'tab-content active-content';
         e.currentTarget.className += ' active';
         if (n === 'self-tab') loadSelfMonitoring();
+        if (n === 'docs-tab') loadDocs();
     }
     async function loadSelfMonitoring() {
         const loading = document.getElementById('self-loading');
@@ -1641,6 +1648,25 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
                 content.style.display = 'block';
             } else {
                 loading.innerText = 'Ошибка загрузки данных';
+            }
+        } catch (e) {
+            loading.innerText = 'Ошибка связи с сервером';
+        }
+    }
+    async function loadDocs() {
+        const loading = document.getElementById('docs-loading');
+        const content = document.getElementById('docs-content');
+        loading.style.display = 'block';
+        content.style.display = 'none';
+        try {
+            const r = await fetch('/api/functional');
+            const data = await r.json();
+            if (data.status === 'ok') {
+                content.innerText = data.content;
+                loading.style.display = 'none';
+                content.style.display = 'block';
+            } else {
+                loading.innerText = 'Ошибка загрузки описания';
             }
         } catch (e) {
             loading.innerText = 'Ошибка связи с сервером';
@@ -1965,10 +1991,13 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
             """, (SELF_MONITORING_SITES,))
             stats_rows = {r['site']: dict(r) for r in cur.fetchall()}
 
-        # Incidents — исключаем 401
+        # Incidents — исключаем 401, длительность пересчитываем динамически
         cur.execute("""
             SELECT site, start_time,
-                COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+                CASE 
+                    WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                    ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+                END as dur,
                 max_status,
                 CASE WHEN max_status = 0 THEN 'Timeout'
                      WHEN max_status = 502 THEN 'Bad Gateway'
@@ -2080,6 +2109,20 @@ def _get_stats_from_agg(cur, interval: str):
     """, (interval, SELF_MONITORING_SITES))
     row = cur.fetchone()
     return {'up': float(row[0]) if row[0] is not None else 0, 'resp': float(row[1]) if row[1] is not None else 0}
+
+
+@app.get("/api/functional")
+async def api_functional(auth: bool = Depends(check_auth)):
+    """Отдает содержимое FUNCTIONAL.md — документацию функционала"""
+    try:
+        md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FUNCTIONAL.md")
+        if os.path.exists(md_path):
+            with open(md_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return {"status": "ok", "content": content}
+        return JSONResponse({"status": "error", "msg": "FUNCTIONAL.md not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
 # ============================================================================
@@ -2255,10 +2298,13 @@ async def index(auth: bool = Depends(check_auth)):
         """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
         group_agg = {r['grp']: r for r in cur.fetchall()}
 
-    # Инциденты — читаем из таблицы incidents (быстро), fallback на CTE из logs (разово)
+    # Инциденты — читаем из таблицы incidents, длительность пересчитываем динамически (end_time — start_time)
     cur.execute("""
         SELECT site, start_time,
-            COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+            CASE 
+                WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+            END as dur,
             max_status, resolved,
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
@@ -2471,6 +2517,7 @@ def _build_html(data: dict) -> str:
         .tab-btn.active {{ background: #00717a; color: white; }}
         .tab-content {{ display: none; }}
         .active-content {{ display: block; }}
+        .tab-content {{ overflow-x: auto; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
         th, td {{ padding: 12px; text-align: left;
                   border-bottom: 1px solid #f1f5f9; }}
