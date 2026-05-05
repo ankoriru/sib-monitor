@@ -592,7 +592,7 @@ def _backfill_incidents():
                              ELSE 'Server Error' END as description
                     FROM incident_groups
                     GROUP BY site, grp_id
-                    HAVING COUNT(*) >= 2
+                    HAVING COUNT(*) >= 5
                 )
                 INSERT INTO incidents (site, start_time, end_time, duration_min,
                                        max_status, description, resolved, ssl_chain_valid)
@@ -1074,11 +1074,17 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 alert_threshold = 5
             print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
-            if fail_count[site] == 1 and last_status.get(site, 200) == 200:
+            if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
                 print(f"[INCIDENT START] {site}")
                 _db_incident_start(site, curr_status, ssl_chain_valid)
-                # last_status НЕ обновляем здесь — только при алерте (fail >= threshold)
-            elif fail_count[site] > 1:
+                print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
+                print(f"[ALERT TG] Calling send_tg_msg for DOWN: {site}")
+                shot_path = take_screenshot_fast(site)
+                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
+                print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
+                last_status[site] = curr_status
+                _invalidate_dashboard_cache()
+            elif fail_count[site] > alert_threshold:
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
@@ -1088,23 +1094,14 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                     )
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
-
-            if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
-                print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
-                print(f"[ALERT TG] Calling send_tg_msg for DOWN: {site}")
-                shot_path = take_screenshot_fast(site)
-                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
-                print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
-                last_status[site] = curr_status
-                _invalidate_dashboard_cache()
         else:
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
-            # Закрываем инцидент если был даун (независимо от алерта)
-            if fail_count.get(site, 0) > 0:
+            # Закрываем инцидент только если он был создан (fail_count >= threshold)
+            if fail_count.get(site, 0) >= thresholds.get(site, 5):
                 _db_incident_resolve(site)
 
             # UP алерт только если был отправлен DOWN алерт (last_status != 200)
@@ -1139,31 +1136,29 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
         if curr_status != 200:
             fail_count[site] = fail_count.get(site, 0) + 1
 
-            if fail_count[site] == 1 and last_status.get(site, 200) == 200:
+            if fail_count[site] >= SM_THRESHOLD and last_status.get(site, 200) == 200:
                 print(f"[SM INCIDENT START] {site}")
                 _db_incident_start(site, curr_status, ssl_chain_valid)
-            elif fail_count[site] > 1:
-                _db_incident_update(site, curr_status, ssl_chain_valid)
-
-            with BATCH_LOCK:
-                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
-                if len(batch_buffer) >= BATCH_SIZE:
-                    flush_batch()
-
-            if fail_count[site] >= SM_THRESHOLD and last_status.get(site, 200) == 200:
                 print(f"[SM ALERT] {site} fail={fail_count[site]} thr={SM_THRESHOLD}")
                 shot_path = take_screenshot_fast(site)
                 ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})", shot_path)
                 print(f"[SM ALERT RESULT] {'OK' if ok else 'FAIL'}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
+            elif fail_count[site] > SM_THRESHOLD:
+                _db_incident_update(site, curr_status, ssl_chain_valid)
+
+            with BATCH_LOCK:
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                if len(batch_buffer) >= BATCH_SIZE:
+                    flush_batch()
         else:
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
-            if fail_count.get(site, 0) > 0:
+            if fail_count.get(site, 0) >= SM_THRESHOLD:
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
