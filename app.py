@@ -2356,9 +2356,6 @@ async def index(auth: bool = Depends(check_auth)):
         "incidents": incidents_list,
         "active_incidents": active_incidents,
         "group_agg": group_agg,
-        "self_latest": self_latest,
-        "self_stats": self_stats,
-        "self_incidents": self_incidents_list,
         "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
     }
     with _dashboard_cache["lock"]:
@@ -2377,9 +2374,7 @@ def _build_html(data: dict) -> str:
     stats = data["stats"]
     incidents_list = data["incidents"]
     now_msk = data["now_msk"]
-    self_latest = data.get("self_latest", {})
-    self_stats = data.get("self_stats", {})
-    self_incidents_list = data.get("self_incidents", [])
+    active_incidents = data.get("active_incidents", [])
     group_agg = data.get("group_agg", {})
 
     incidents = [s for s, v in latest.items() if v['status'] != 200]
@@ -2437,14 +2432,11 @@ def _build_html(data: dict) -> str:
         }
     group_stats_json = json.dumps(group_stats)
 
-    self_sites_json = json.dumps(SELF_MONITORING_SITES)
-
     js_vars = {
         'key_sites_json': key_sites_json,
         'stdo_sites_json': stdo_sites_json,
         'external_sites_json': external_sites_json,
         'group_stats_json': group_stats_json,
-        'self_sites_json': self_sites_json,
     }
 
     H = []
@@ -2541,7 +2533,6 @@ def _build_html(data: dict) -> str:
             <button class="tab-btn" onclick="tab(event, 't2')">Аналитика</button>
             <button class="tab-btn" onclick="tab(event, 't3')">Инциденты</button>
             <button class="tab-btn" onclick="tab(event, 't4')">Календарь событий</button>
-            <button class="tab-btn" onclick="tab(event, 't5')">Self Monitoring</button>
             <button class="tab-btn" onclick="location.href='/admin/page'">Управление</button>
         </div>
         <div id="t1" class="tab-content active-content">
@@ -2606,6 +2597,7 @@ def _build_html(data: dict) -> str:
     else:
         H.append("""</tbody></table></div>""")
 
+    H.append("""</tbody></table></div>""")
     H.append("""<div id="t4" class="tab-content">
     <table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
     </tr></thead><tbody>""")
@@ -2622,54 +2614,18 @@ def _build_html(data: dict) -> str:
             <td class="{'txt-err' if ev['d']<=30 else ''}">{ev['d']} дн.</td></tr>""")
 
     H.append("""</tbody></table></div>
-    <div id="t5" class="tab-content">
-        <h3 style="color:#00717a;margin-top:0;">Self Monitoring</h3>
-        <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th></tr></thead><tbody>""")
+    </div>""")
 
-    for s in SELF_MONITORING_SITES:
-        v = self_latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
-        st30 = self_stats.get(s, {'upt': 0, 'down_sec': 0})
-        is_online = v['status'] == 200 or v['status'] == 401
-        is_err = not is_online
-        H.append(f"""<tr class="{'row-err' if is_err else ''}">
-            <td><strong>{s}</strong></td>
-            <td><span class="{'txt-ok' if is_online else 'txt-err'}">
-                {'Online' if is_online else 'Offline'}</span></td>
-            <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
-            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
-            <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
-                {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
-            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
-        </tr>""")
-
-    H.append("""</tbody></table>
-        <h4 style="color:#475569;margin-top:25px;">📈 График</h4>
-        <div id="self-chart-container" style="max-width:600px;"><div style="text-align:center;padding:30px;color:#999;">Загрузка графика...</div></div>
-        <h4 style="color:#475569;margin-top:25px;">📋 Инциденты</h4>
-        <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody>""")
-
-    for r in self_incidents_list:
-        H.append(f"""<tr><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
-            <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
-            <td>{r['max_status']}</td><td>{r['description']}</td>
-            <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
-                {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td></tr>""")
-
-    H.append("</tbody></table>\n</div>")
-
-    js_template_str = """
+    dash_js_template = """
     <script>
     let chartsLoaded = false;
     let chartsLoading = false;
     let showingAll = false;
-    let selfChartLoaded = false;
-    let selfChartLoading = false;
 
     const keySites = $key_sites_json;
     const stdoSites = $stdo_sites_json;
     const externalSites = $external_sites_json;
     const groupStats = $group_stats_json;
-    const selfSites = $self_sites_json;
 
     function tab(e, n){
         var i, x = document.getElementsByClassName('tab-content'),
@@ -2679,7 +2635,6 @@ def _build_html(data: dict) -> str:
         document.getElementById(n).className = 'tab-content active-content';
         e.currentTarget.className += ' active';
         if (n === 't2') loadCharts();
-        if (n === 't5') loadSelfChart();
     }
 
     async function runTest(site, btn) {
@@ -2774,48 +2729,6 @@ def _build_html(data: dict) -> str:
         }
     }
 
-    async function loadSelfChart() {
-        if (selfChartLoaded || selfChartLoading) return;
-        selfChartLoading = true;
-        try {
-            const res = await fetch('/api/charts');
-            const g_data = await res.json();
-            const container = document.getElementById('self-chart-container');
-            container.innerHTML = '';
-            for (const s of selfSites) {
-                if (!g_data[s]) continue;
-                const d = g_data[s];
-                const div = document.createElement('div');
-                div.className = 'kpi-card';
-                div.style.borderTop = '2px solid #eee';
-                div.innerHTML = '<h5>' + s + '</h5><canvas id="self-c-' + s.replace(/\\./g, '_') + '"></canvas>';
-                container.appendChild(div);
-                new Chart(document.getElementById('self-c-' + s.replace(/\\./g, '_')), {
-                    type: 'line',
-                    data: {
-                        labels: d.l,
-                        datasets: [
-                            { label: 'Uptime %', data: d.u, borderColor: '#10b981', backgroundColor: '#10b981', yAxisID: 'y', tension: 0.3, pointRadius: 3 },
-                            { label: 'Ответ сек', data: d.r, borderColor: '#3b82f6', backgroundColor: '#3b82f6', yAxisID: 'y1', tension: 0.3, pointRadius: 3 }
-                        ]
-                    },
-                    options: {
-                        scales: {
-                            y: { suggestedMin: 95, suggestedMax: 100.5, title: { display: true, text: 'Uptime %' } },
-                            y1: { position: 'right', grid: { display: false }, title: { display: true, text: 'Ответ, сек' } }
-                        }
-                    }
-                });
-            }
-            selfChartLoaded = true;
-        } catch (e) {
-            document.getElementById('self-chart-container').innerHTML =
-                '<div style="text-align:center; padding:30px; color:#b91c1c;">Ошибка загрузки графика</div>';
-        } finally {
-            selfChartLoading = false;
-        }
-    }
-
     function toggleIncidents() {
         const hidden = document.querySelectorAll('#t3 .incident-hidden');
         const btn = document.getElementById('btn-show-incidents');
@@ -2828,8 +2741,8 @@ def _build_html(data: dict) -> str:
     setInterval(() => { location.reload(); }, 120000);
     </script></body></html>"""
 
-    js_part = Template(js_template_str).substitute(js_vars)
-    H.append(js_part)
+    dash_js = Template(dash_js_template).substitute(js_vars)
+    H.append(dash_js)
 
     return "".join(H)
 
