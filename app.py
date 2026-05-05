@@ -2499,7 +2499,8 @@ def _build_html(data: dict) -> str:
         return 2
 
     group_names = {0: "Ключевые", 1: "СТДО", 2: "Внешние сайты"}
-    sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), x))
+    # sibur.ru всегда первый внутри своей группы, остальные по алфавиту
+    sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
     key_sites_json = json.dumps(KEY_SITES)
     stdo_sites_json = json.dumps(STDO_SITES)
@@ -2690,7 +2691,7 @@ def _build_html(data: dict) -> str:
             <button id="btn-show-incidents" class="btn-show-all" onclick="toggleIncidents()">
                 Показать все ({total_incidents})
             </button>
-        </div></div>""")
+        </div></div></div>""")
     else:
         H.append("""</tbody></table></div></div>""")
 
