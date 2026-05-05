@@ -1374,6 +1374,7 @@ async def startup_event():
         print(f"[STARTUP WARN] Stale incident cleanup: {e}")
 
     threading.Thread(target=check_worker, daemon=True).start()
+    threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
     # Telegram config check
