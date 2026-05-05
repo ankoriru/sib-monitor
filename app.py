@@ -224,7 +224,7 @@ def load_active_sites():
         conn.close()
         if rows:
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
-            thresholds = {r[0]: r[2] for r in rows if r[0] not in SELF_MONITORING_SITES}
+            thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
             key = [r[0] for r in rows if r[1] == 'key']
             stdo = [r[0] for r in rows if r[1] == 'stdo']
             ext = [r[0] for r in rows if r[1] not in ('key', 'stdo') and r[0] not in SELF_MONITORING_SITES]
@@ -1067,7 +1067,10 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
         if curr_status != 200:
             fail_count[site] = fail_count.get(site, 0) + 1
-            alert_threshold = thresholds.get(site, 5)
+            alert_threshold = thresholds.get(site)
+            if alert_threshold is None:
+                alert_threshold = 5
+            print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
             if fail_count[site] == 1 and last_status.get(site, 200) == 200:
                 print(f"[INCIDENT START] {site}")
