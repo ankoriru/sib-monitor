@@ -2518,9 +2518,10 @@ def _build_html(data: dict) -> str:
         .tab-content {{ display: none; }}
         .active-content {{ display: block; }}
         .tab-content {{ overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
         th, td {{ padding: 12px; text-align: left;
-                  border-bottom: 1px solid #f1f5f9; }}
+                  border-bottom: 1px solid #f1f5f9; word-break: break-all; }}
+        .table-wrap {{ overflow-x: auto; }}
         .row-err {{ background-color: #fff1f2 !important; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
         .txt-ok {{ color: #16a34a; font-weight: bold; }}
@@ -2587,7 +2588,7 @@ def _build_html(data: dict) -> str:
             <button class="tab-btn" onclick="location.href='/admin/page'">Управление</button>
         </div>
         <div id="t1" class="tab-content active-content">
-            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
+            <div class="table-wrap"><table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
             <th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """)
 
@@ -2618,13 +2619,13 @@ def _build_html(data: dict) -> str:
             <td><button class="btn-test" onclick="runTest('{s}', this)">
                 <div class="loader"></div><span>📸 Screen</span></button></td></tr>""")
 
-    H.append("""</tbody></table></div>
+    H.append("""</tbody></table></div></div>
     <div id="t2" class="tab-content">
     <div id="charts-container" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:20px;">
         <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
     </div></div>
     <div id="t3" class="tab-content">
-    <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
+    <div class="table-wrap"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
     <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th></tr></thead><tbody>""")
 
     for idx, r in enumerate(incidents_list):
@@ -2648,9 +2649,8 @@ def _build_html(data: dict) -> str:
     else:
         H.append("""</tbody></table></div>""")
 
-    H.append("""</tbody></table></div>""")
     H.append("""<div id="t4" class="tab-content">
-    <table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
+    <div class="table-wrap"><table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
     </tr></thead><tbody>""")
 
     cal_events = []
