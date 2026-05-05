@@ -558,7 +558,7 @@ def backfill_checks_agg():
 
 
 def _backfill_incidents():
-    """Предзаполнение incidents из существующих logs (разово при первом создании таблицы)"""
+    """Предзаполнение incidents из существующих logs (разово при первом создании таблицы). Self-monitoring исключён."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -573,6 +573,7 @@ def _backfill_incidents():
                              OR LAG(status) OVER (PARTITION BY site ORDER BY timestamp) IS NULL)
                         THEN 1 ELSE 0 END as is_start
                     FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                      AND site <> ALL(%s)
                 ),
                 incident_groups AS (
                     SELECT site, timestamp, status,
@@ -600,7 +601,7 @@ def _backfill_incidents():
                        max_status, description, TRUE, NULL
                 FROM incident_summary
                 ORDER BY start_time
-            """)
+            """, (SELF_MONITORING_SITES,))
             conn.commit()
             print(f"Backfill incidents завершён: {cur.rowcount} записей")
         cur.close()
@@ -640,6 +641,7 @@ def ensure_partitions():
 # ============================================================================
 def send_tg_msg(text, photo_path=None):
     """Отправка в Telegram с retry (3 попытки) + логированием"""
+    print(f"[TG SEND] Attempting to send: {text[:80]} photo={'yes' if photo_path else 'no'} token_len={len(TELEGRAM_TOKEN or '')} chat_id={TELEGRAM_CHAT_ID}")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[TG SKIP] No token/chat_id configured. Message: {text[:60]}")
         return False
@@ -1075,6 +1077,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if fail_count[site] == 1 and last_status.get(site, 200) == 200:
                 print(f"[INCIDENT START] {site}")
                 _db_incident_start(site, curr_status, ssl_chain_valid)
+                last_status[site] = curr_status  # запоминаем фейл для resolve при восстановлении
             elif fail_count[site] > 1:
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
@@ -1088,6 +1091,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
             if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
                 print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
+                print(f"[ALERT TG] Calling send_tg_msg for DOWN: {site}")
                 shot_path = take_screenshot_fast(site)
                 ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
                 print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
@@ -1104,6 +1108,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                 _db_incident_resolve(site)
                 shot_path_up = take_screenshot_fast(site)
+                print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
                 ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
                 _invalidate_dashboard_cache()
@@ -1111,9 +1116,11 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             last_status[site], fail_count[site] = 200, 0
 
             if resp_time > 20 and not last_latency_map.get(site, False):
+                print(f"[ALERT TG] Calling send_tg_msg for LATENCY: {site}")
                 ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = True
             elif resp_time < 10 and last_latency_map.get(site, False):
+                print(f"[ALERT TG] Calling send_tg_msg for SPEED RESTORED: {site}")
                 ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = False
     except Exception as e:
@@ -1131,6 +1138,12 @@ def check_worker():
     fail_count = {}
     last_latency_map = {}
 
+    # Инициализация self-monitoring состояния
+    for site in SELF_MONITORING_SITES:
+        last_status[site] = 200
+        fail_count[site] = 0
+        last_latency_map[site] = False
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -1139,6 +1152,10 @@ def check_worker():
         try:
             # Обновляем список сайтов из БД каждый цикл
             SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
+            # Защита: если thresholds пустой (например, БД пустая), fallback на 5
+            if not thresholds and SITES:
+                thresholds = {s: 5 for s in SITES}
+                print(f"[WORKER] thresholds empty, fallback to 5 for all {len(SITES)} sites")
             # Инициализируем состояние для новых сайтов
             for site in SITES:
                 if site not in last_status:
@@ -1314,22 +1331,13 @@ async def startup_event():
     # Неблокирующий запуск тяжёлых операций в отдельных потоках
     print("[STARTUP] Starting init_db, backfill, workers...")
     await asyncio.to_thread(init_db)
-    await asyncio.to_thread(backfill_checks_agg)
-    await asyncio.to_thread(_backfill_incidents)
-    # Cleanup: полная очистка старых данных self-monitoring + вставка чистой записи
+    # Cleanup self-monitoring ДО backfill — иначе старые данные попадут в incidents
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # 1. Удалить все инциденты self-monitoring
         cur.execute("DELETE FROM incidents WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        inc_count = cur.rowcount
-        # 2. Удалить агрегаты self-monitoring
         cur.execute("DELETE FROM checks_agg WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        agg_count = cur.rowcount
-        # 3. Удалить все логи self-monitoring
         cur.execute("DELETE FROM logs WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        log_count = cur.rowcount
-        # 4. Вставить чистую запись со status=200 для каждого self-monitoring сайта
         for s in SELF_MONITORING_SITES:
             cur.execute("""
                 INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
@@ -1338,25 +1346,41 @@ async def startup_event():
         conn.commit()
         cur.close()
         conn.close()
-        print(f"[CLEANUP] Self-monitoring cleaned: {log_count} logs, {agg_count} aggs, {inc_count} incidents deleted. Fresh 200 inserted.")
+        print("[STARTUP] Self-monitoring old data cleaned")
     except Exception as e:
-        print(f"[CLEANUP WARN] {e}")
-    # Обновить materialized view после cleanup
+        print(f"[STARTUP WARN] Self-monitoring cleanup: {e}")
+    await asyncio.to_thread(backfill_checks_agg)
+    await asyncio.to_thread(_backfill_incidents)
+    # Cleanup: закрыть "висящие" unresolved инциденты для сайтов, которые сейчас Online
     try:
-        refresh_materialized_view()
-        print("[CLEANUP] Materialized view refreshed")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE incidents
+            SET end_time = NOW(),
+                duration_min = CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                resolved = TRUE
+            WHERE resolved = FALSE
+              AND site IN (
+                  SELECT site FROM latest_status WHERE status = 200
+              )
+        """)
+        if cur.rowcount > 0:
+            print(f"[STARTUP] Closed {cur.rowcount} stale unresolved incidents for online sites")
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        print(f"[CLEANUP VIEW WARN] {e}")
+        print(f"[STARTUP WARN] Stale incident cleanup: {e}")
 
     threading.Thread(target=check_worker, daemon=True).start()
-    threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
     # Telegram config check
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
     else:
-        print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}..., token_len={len(TELEGRAM_TOKEN)}")
+        print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}... (len={len(TELEGRAM_CHAT_ID)}), token_len={len(TELEGRAM_TOKEN)}")
 
 
 # ============================================================================
@@ -2230,7 +2254,7 @@ async def index(auth: bool = Depends(check_auth)):
     cur.execute("""
         SELECT site, start_time,
             COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
-            max_status,
+            max_status, resolved,
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
                  WHEN max_status = 503 THEN 'Service Unavailable'
@@ -2322,10 +2346,14 @@ async def index(auth: bool = Depends(check_auth)):
     cur.close()
     conn.close()
 
+    # Неотработанные (unresolved) инциденты для блока "Обратите внимание"
+    active_incidents = [r for r in incidents_list if not r.get('resolved', True)]
+
     data = {
         "s30": s30, "s24": s24,
         "latest": latest, "stats": stats,
         "incidents": incidents_list,
+        "active_incidents": active_incidents,
         "group_agg": group_agg,
         "self_latest": self_latest,
         "self_stats": self_stats,
@@ -2357,16 +2385,21 @@ def _build_html(data: dict) -> str:
     ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s, v in latest.items()
                     if v['response_time'] > 20 and v['status'] == 200]
+    active_incidents = data.get("active_incidents", [])
 
     all_warn_list = (
         [f"❌ {s} (Offline)" for s in incidents]
         + [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
         + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)"
            for s in latency_warn]
+        + [f"⚠️ {r['site']} (Инцидент {r['dur']} мин, {r['description']})"
+           for r in active_incidents]
     )
 
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
     total_sites = len(SITES)
+    active_incidents_count = len(active_incidents)
+    offline_count = len(incidents)
 
     def get_site_group(site_name):
         if site_name in KEY_SITES:
@@ -2492,8 +2525,9 @@ def _build_html(data: dict) -> str:
                 <span>Ответ (24ч / 30д)</span>
                 <strong><br>{s24['resp']}с / {s30['resp']}с</strong>
             </div>
-            <div class="kpi-card {'danger-card' if len(incidents) > 0 else ''}">
-                <span>Инциденты</span><strong><br>{len(incidents)}</strong>
+            <div class="kpi-card {'danger-card' if active_incidents_count > 0 or offline_count > 0 else ''}">
+                <span>Инциденты</span><strong><br>{active_incidents_count + offline_count}</strong>
+                {f'<br><span style="font-size:11px;color:#dc2626;">({active_incidents_count} active)</span>' if active_incidents_count > 0 else ''}
             </div>
             <div class="kpi-card {'danger-card' if ssl_warn else ''}">
                 <span>SSL &lt;=20д</span><strong><br>{len(ssl_warn)}</strong>
@@ -2548,15 +2582,17 @@ def _build_html(data: dict) -> str:
     </div></div>
     <div id="t3" class="tab-content">
     <table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
-    <th>Код</th><th>Описание</th><th>Цепочка SSL</th></tr></thead><tbody>""")
+    <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th></tr></thead><tbody>""")
 
     for idx, r in enumerate(incidents_list):
         hidden_class = 'incident-hidden' if idx >= 20 else ''
+        resolved_badge = '✅ Resolved' if r.get('resolved', True) else '🔴 Active'
         H.append(f"""<tr class="{hidden_class}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
             <td>{r['max_status']}</td><td>{r['description']}</td>
             <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
-                {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td></tr>""")
+                {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td>
+            <td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{'#dcfce7;color:#166534' if r.get('resolved', True) else '#fee2e2;color:#991b1b'}">{resolved_badge}</span></td></tr>""")
 
     total_incidents = len(incidents_list)
     if total_incidents > 20:
