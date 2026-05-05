@@ -2562,9 +2562,10 @@ def _build_html(data: dict) -> str:
         .tab-content {{ display: none; }}
         .active-content {{ display: block; }}
         .tab-content {{ overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
-        th, td {{ padding: 12px; text-align: left;
-                  border-bottom: 1px solid #f1f5f9; word-break: break-all; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ padding: 10px 8px; text-align: left;
+                  border-bottom: 1px solid #f1f5f9; white-space: nowrap; }}
+        td:first-child, th:first-child {{ white-space: nowrap; min-width: 220px; }}
         .table-wrap {{ overflow-x: auto; }}
         .row-err {{ background-color: #fff1f2 !important; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
@@ -2691,7 +2692,7 @@ def _build_html(data: dict) -> str:
             </button>
         </div></div>""")
     else:
-        H.append("""</tbody></table></div>""")
+        H.append("""</tbody></table></div></div>""")
 
     H.append("""<div id="t4" class="tab-content">
     <div class="table-wrap"><table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
