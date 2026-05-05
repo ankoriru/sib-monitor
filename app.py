@@ -872,8 +872,8 @@ def flush_batch():
 # ============================================================================
 # ИНЦИДЕНТЫ — запись из worker
 # ============================================================================
-def _db_incident_start(site, status, ssl_chain_valid=None):
-    """Фиксирует начало инцидента (первый фейл сайта)"""
+def _db_incident_start(site, status, ssl_chain_valid=None, start_time=None):
+    """Фиксирует начало инцидента. start_time — время первого фейла (по умолчанию NOW())."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -882,10 +882,11 @@ def _db_incident_start(site, status, ssl_chain_valid=None):
             502: 'Bad Gateway',
             503: 'Service Unavailable'
         }.get(status, 'Server Error')
+        ts = start_time if start_time else datetime.datetime.now()
         cur.execute("""
             INSERT INTO incidents (site, start_time, max_status, description, ssl_chain_valid)
-            VALUES (%s, NOW(), %s, %s, %s)
-        """, (site, status, description, ssl_chain_valid))
+            VALUES (%s, %s, %s, %s, %s)
+        """, (site, ts, status, description, ssl_chain_valid))
         conn.commit()
         cur.close()
         conn.close()
@@ -1060,7 +1061,7 @@ def _get_ssl_whois_data(site, latest_data):
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                         last_status, fail_count, last_latency_map, thresholds):
+                         last_status, fail_count, last_latency_map, thresholds, first_fail_time):
     """Обработка результата проверки одного сайта (общая логика)"""
     try:
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
@@ -1069,14 +1070,23 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
         if curr_status != 200:
             fail_count[site] = fail_count.get(site, 0) + 1
+            # Сохраняем время первого фейла для корректного расчёта длительности
+            if fail_count[site] == 1:
+                first_fail_time[site] = datetime.datetime.now()
+                print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
+
             alert_threshold = thresholds.get(site)
             if alert_threshold is None:
                 alert_threshold = 5
             print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
-                print(f"[INCIDENT START] {site}")
-                _db_incident_start(site, curr_status, ssl_chain_valid)
+                # Инцидент начинается с момента первого фейла (first_fail_time), не сейчас
+                incident_start = first_fail_time.get(site)
+                if not incident_start:
+                    incident_start = datetime.datetime.now()
+                print(f"[INCIDENT START] {site} (actual start: {incident_start})")
+                _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
                 print(f"[ALERT TG] Calling send_tg_msg for DOWN: {site}")
                 shot_path = take_screenshot_fast(site)
@@ -1115,6 +1125,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 _invalidate_dashboard_cache()
 
             last_status[site], fail_count[site] = 200, 0
+            first_fail_time.pop(site, None)
 
             if resp_time > 20 and not last_latency_map.get(site, False):
                 print(f"[ALERT TG] Calling send_tg_msg for LATENCY: {site}")
@@ -1129,16 +1140,23 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
 
 def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                    last_status, fail_count, last_latency_map):
+                                    last_status, fail_count, last_latency_map, first_fail_time):
     """Обработка self-monitoring: алерты с фиксированным порогом 10 мин, помечены [SELF-MONITORING]"""
     try:
         SM_THRESHOLD = 10
         if curr_status != 200:
             fail_count[site] = fail_count.get(site, 0) + 1
+            # Сохраняем время первого фейла
+            if fail_count[site] == 1:
+                first_fail_time[site] = datetime.datetime.now()
+                print(f"[SM FIRST FAIL] {site} at {first_fail_time[site]}")
 
             if fail_count[site] >= SM_THRESHOLD and last_status.get(site, 200) == 200:
-                print(f"[SM INCIDENT START] {site}")
-                _db_incident_start(site, curr_status, ssl_chain_valid)
+                incident_start = first_fail_time.get(site)
+                if not incident_start:
+                    incident_start = datetime.datetime.now()
+                print(f"[SM INCIDENT START] {site} (actual start: {incident_start})")
+                _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[SM ALERT] {site} fail={fail_count[site]} thr={SM_THRESHOLD}")
                 shot_path = take_screenshot_fast(site)
                 ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})", shot_path)
@@ -1170,6 +1188,7 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                 _invalidate_dashboard_cache()
 
             last_status[site], fail_count[site] = 200, 0
+            first_fail_time.pop(site, None)
     except Exception as e:
         print(f"[SM ERR] {site}: {e}")
 
@@ -1184,6 +1203,7 @@ def check_worker():
     last_status = {}
     fail_count = {}
     last_latency_map = {}
+    first_fail_time = {}
 
     # Инициализация self-monitoring состояния
     for site in SELF_MONITORING_SITES:
@@ -1239,12 +1259,12 @@ def check_worker():
             for site, curr_status, resp_time in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                     last_status, fail_count, last_latency_map, thresholds)
+                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time)
 
             # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
                 _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                                last_status, fail_count, last_latency_map)
+                                                last_status, fail_count, last_latency_map, first_fail_time)
 
             flush_batch()
             refresh_materialized_view()
@@ -2562,6 +2582,7 @@ def _build_html(data: dict) -> str:
         th, td {{ padding: 10px 8px; text-align: left;
                   border-bottom: 1px solid #f1f5f9; white-space: nowrap; }}
         td:first-child, th:first-child {{ white-space: nowrap; min-width: 220px; }}
+        .incidents-table th:first-child, .incidents-table td:first-child {{ min-width: auto; width: 11ch; }}
         .table-wrap {{ overflow-x: auto; }}
         .row-err {{ background-color: #fff1f2 !important; }}
         .txt-err {{ color: #dc2626; font-weight: bold; }}
@@ -2666,7 +2687,7 @@ def _build_html(data: dict) -> str:
         <div style="text-align:center; padding:40px; color:#999;">Загрузка графиков...</div>
     </div></div>
     <div id="t3" class="tab-content">
-    <div class="table-wrap"><table><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
+    <div class="table-wrap"><table class="incidents-table"><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
     <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th></tr></thead><tbody>""")
 
     for idx, r in enumerate(incidents_list):
