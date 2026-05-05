@@ -1131,6 +1131,54 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
         print(f"[ERR] {site}: {e}")
 
 
+def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
+                                    last_status, fail_count, last_latency_map):
+    """Обработка self-monitoring: алерты с фиксированным порогом 10 мин, помечены [SELF-MONITORING]"""
+    try:
+        SM_THRESHOLD = 10
+        if curr_status != 200:
+            fail_count[site] = fail_count.get(site, 0) + 1
+
+            if fail_count[site] == 1 and last_status.get(site, 200) == 200:
+                print(f"[SM INCIDENT START] {site}")
+                _db_incident_start(site, curr_status, ssl_chain_valid)
+            elif fail_count[site] > 1:
+                _db_incident_update(site, curr_status, ssl_chain_valid)
+
+            with BATCH_LOCK:
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                if len(batch_buffer) >= BATCH_SIZE:
+                    flush_batch()
+
+            if fail_count[site] >= SM_THRESHOLD and last_status.get(site, 200) == 200:
+                print(f"[SM ALERT] {site} fail={fail_count[site]} thr={SM_THRESHOLD}")
+                shot_path = take_screenshot_fast(site)
+                ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})", shot_path)
+                print(f"[SM ALERT RESULT] {'OK' if ok else 'FAIL'}")
+                last_status[site] = curr_status
+                _invalidate_dashboard_cache()
+        else:
+            with BATCH_LOCK:
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                if len(batch_buffer) >= BATCH_SIZE:
+                    flush_batch()
+
+            if fail_count.get(site, 0) > 0:
+                _db_incident_resolve(site)
+
+            if last_status.get(site, 200) != 200:
+                duration = fail_count.get(site, 0)
+                print(f"[SM ALERT] {site} UP after {duration} min")
+                shot_path_up = take_screenshot_fast(site)
+                ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
+                print(f"[SM ALERT RESULT] UP {'OK' if ok else 'FAIL'}")
+                _invalidate_dashboard_cache()
+
+            last_status[site], fail_count[site] = 200, 0
+    except Exception as e:
+        print(f"[SM ERR] {site}: {e}")
+
+
 def check_worker():
     """Фоновый воркер: быстрые HTTP-проверки каждую минуту. SSL+WHOIS — отдельный воркер."""
     import urllib3
@@ -1198,14 +1246,10 @@ def check_worker():
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                      last_status, fail_count, last_latency_map, thresholds)
 
-            # Обработка self-monitoring сайтов (отдельно, без алертов)
+            # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
-                with BATCH_LOCK:
-                    batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
-                    if len(batch_buffer) >= BATCH_SIZE:
-                        flush_batch()
-                last_status[site] = curr_status
-                fail_count[site] = 0 if curr_status == 200 else fail_count.get(site, 0) + 1
+                _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
+                                                last_status, fail_count, last_latency_map)
 
             flush_batch()
             refresh_materialized_view()
