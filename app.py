@@ -1077,7 +1077,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if fail_count[site] == 1 and last_status.get(site, 200) == 200:
                 print(f"[INCIDENT START] {site}")
                 _db_incident_start(site, curr_status, ssl_chain_valid)
-                last_status[site] = curr_status  # запоминаем фейл для resolve при восстановлении
+                # last_status НЕ обновляем здесь — только при алерте (fail >= threshold)
             elif fail_count[site] > 1:
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
@@ -1103,10 +1103,14 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
+            # Закрываем инцидент если был даун (независимо от алерта)
+            if fail_count.get(site, 0) > 0:
+                _db_incident_resolve(site)
+
+            # UP алерт только если был отправлен DOWN алерт (last_status != 200)
             if last_status.get(site, 200) != 200:
                 duration = fail_count.get(site, 0)
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
-                _db_incident_resolve(site)
                 shot_path_up = take_screenshot_fast(site)
                 print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
                 ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
