@@ -15,6 +15,7 @@ import aiohttp
 import bcrypt
 import queue
 import concurrent.futures
+import re
 from io import StringIO
 from string import Template
 from psycopg2.extras import DictCursor, execute_values
@@ -43,6 +44,17 @@ NEW_MONITORING_SITES = [
 SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
 ]
+
+# --- Content match для Ключевых сайтов ---
+# Проверяем наличие ключевого текста на странице при status=200
+# (?i) — case-insensitive. При mismatch: status=701 (Content Mismatch)
+CONTENT_MATCH_SITES = {
+    "sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
+    "eshop.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
+    "shop.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
+    "srm.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
+    "career.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
+}
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
@@ -589,6 +601,7 @@ def _backfill_incidents():
                         CASE WHEN MAX(status) = 0 THEN 'Timeout'
                              WHEN MAX(status) = 502 THEN 'Bad Gateway'
                              WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                             WHEN MAX(status) = 701 THEN 'Content Mismatch'
                              ELSE 'Server Error' END as description
                     FROM incident_groups
                     GROUP BY site, grp_id
@@ -740,7 +753,8 @@ def get_domain_info(site):
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
 async def check_single_site(session, site, semaphore):
-    """Быстрая HTTP-проверка сайта. SSL+WHOIS обновляются отдельным циклом."""
+    """Быстрая HTTP-проверка сайта. Content match для Ключевых сайтов.
+    SSL+WHOIS обновляются отдельным циклом."""
     check_url = f"https://{site}"
     curr_status, resp_time = 0, 25.0
 
@@ -759,6 +773,17 @@ async def check_single_site(session, site, semaphore):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
+                # Content match для Ключевых сайтов: при 200 проверяем тело ответа
+                if curr_status == 200 and site in CONTENT_MATCH_SITES:
+                    try:
+                        text = await asyncio.wait_for(resp.text(), timeout=3)
+                        if not re.search(CONTENT_MATCH_SITES[site], text):
+                            curr_status = 701  # Content Mismatch
+                            print(f"[CONTENT MISMATCH] {site} — текст 'sibur/сибур' не найден")
+                    except Exception:
+                        # Таймаут чтения тела = считаем mismatch
+                        curr_status = 701
+                        print(f"[CONTENT MISMATCH] {site} — таймаут чтения тела")
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
@@ -880,7 +905,8 @@ def _db_incident_start(site, status, ssl_chain_valid=None, start_time=None):
         description = {
             0: 'Timeout',
             502: 'Bad Gateway',
-            503: 'Service Unavailable'
+            503: 'Service Unavailable',
+            701: 'Content Mismatch'
         }.get(status, 'Server Error')
         ts = start_time if start_time else datetime.datetime.now()
         cur.execute("""
@@ -902,7 +928,8 @@ def _db_incident_update(site, status, ssl_chain_valid=None):
         description = {
             0: 'Timeout',
             502: 'Bad Gateway',
-            503: 'Service Unavailable'
+            503: 'Service Unavailable',
+            701: 'Content Mismatch'
         }.get(status, 'Server Error')
         cur.execute("""
             UPDATE incidents
@@ -2061,6 +2088,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
                 CASE WHEN max_status = 0 THEN 'Timeout'
                      WHEN max_status = 502 THEN 'Bad Gateway'
                      WHEN max_status = 503 THEN 'Service Unavailable'
+                     WHEN max_status = 701 THEN 'Content Mismatch'
                      ELSE 'Server Error' END as description,
                 ssl_chain_valid
             FROM incidents
@@ -2368,6 +2396,7 @@ async def index(auth: bool = Depends(check_auth)):
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
                  WHEN max_status = 503 THEN 'Service Unavailable'
+                 WHEN max_status = 701 THEN 'Content Mismatch'
                  ELSE 'Server Error' END as description,
             ssl_chain_valid
         FROM incidents
@@ -2399,6 +2428,7 @@ async def index(auth: bool = Depends(check_auth)):
                 CASE WHEN MAX(status) = 0 THEN 'Timeout'
                      WHEN MAX(status) = 502 THEN 'Bad Gateway'
                      WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                     WHEN MAX(status) = 701 THEN 'Content Mismatch'
                      ELSE 'Server Error' END as description,
                 NULL::boolean as ssl_chain_valid
             FROM incident_groups
@@ -2414,6 +2444,7 @@ async def index(auth: bool = Depends(check_auth)):
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
                  WHEN max_status = 503 THEN 'Service Unavailable'
+                 WHEN max_status = 701 THEN 'Content Mismatch'
                  ELSE 'Server Error' END as description,
             ssl_chain_valid
         FROM incidents
@@ -2446,6 +2477,7 @@ async def index(auth: bool = Depends(check_auth)):
                 CASE WHEN MAX(status) = 0 THEN 'Timeout'
                      WHEN MAX(status) = 502 THEN 'Bad Gateway'
                      WHEN MAX(status) = 503 THEN 'Service Unavailable'
+                     WHEN MAX(status) = 701 THEN 'Content Mismatch'
                      ELSE 'Server Error' END as description,
                 NULL::boolean as ssl_chain_valid
             FROM incident_groups
@@ -2672,7 +2704,7 @@ def _build_html(data: dict) -> str:
             <td>{prefix}<a href="https://{s}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
-                {'Online' if v['status']==200 else 'Offline'}</span></td>
+                {'Online' if v['status']==200 else ('Content Mismatch' if v['status']==701 else 'Offline')}</span></td>
             <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
