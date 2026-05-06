@@ -2111,7 +2111,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
                          / NULLIF(SUM(checks_count), 0))::numeric, 2) as r,
                    ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
             FROM checks_agg
-            WHERE bucket > NOW() - INTERVAL '14 days'
+            WHERE bucket > NOW() - INTERVAL '30 days'
               AND site = ANY(%s)
             GROUP BY site, bucket::date
             ORDER BY bucket::date
@@ -2130,7 +2130,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
                        ROUND(AVG(response_time)::numeric, 2) as r,
                        ROUND(COUNT(*) FILTER (WHERE status=200 OR status=401) * 100.0 / COUNT(*)::numeric, 2) as u
                 FROM logs
-                WHERE timestamp > NOW() - INTERVAL '14 days'
+                WHERE timestamp > NOW() - INTERVAL '30 days'
                   AND site = ANY(%s)
                 GROUP BY 1, 2
                 ORDER BY 2
@@ -2228,7 +2228,7 @@ async def api_charts(auth: bool = Depends(check_auth)):
                      / NULLIF(SUM(checks_count), 0))::numeric, 2) as r,
                ROUND(SUM(status_200_count) * 100.0 / NULLIF(SUM(checks_count), 0)::numeric, 2) as u
         FROM checks_agg
-        WHERE bucket > NOW() - INTERVAL '14 days'
+        WHERE bucket > NOW() - INTERVAL '30 days'
           AND site = ANY(%s)
         GROUP BY site, bucket::date
         ORDER BY bucket::date
@@ -2248,7 +2248,7 @@ async def api_charts(auth: bool = Depends(check_auth)):
                    ROUND(AVG(response_time)::numeric, 2) as r,
                    ROUND(COUNT(*) FILTER (WHERE status=200 OR (site = ANY(%s) AND status=401)) * 100.0 / COUNT(*)::numeric, 2) as u
             FROM logs
-            WHERE timestamp > NOW() - INTERVAL '14 days'
+            WHERE timestamp > NOW() - INTERVAL '30 days'
               AND site = ANY(%s)
             GROUP BY 1, 2
             ORDER BY 2
