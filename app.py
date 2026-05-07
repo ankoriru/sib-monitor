@@ -115,7 +115,7 @@ _screenshot_rate_lock = threading.Lock()
 def _take_screenshot_sync(site):
     """Скриншот одного сайта через Playwright. Делает скриншот через 3 сек после загрузки."""
     import asyncio as _asyncio
-    path = f"debug_{site.replace('/', '_')}_{int(time.time())}.png"
+    path = f"debug_{site.replace('/', '_')}_{int(time.time())}.jpg"
 
     async def _shoot():
         p = await async_playwright().start()
@@ -131,13 +131,17 @@ def _take_screenshot_sync(site):
         try:
             page = await context.new_page()
             try:
-                await page.goto(f"https://{site}", timeout=15000, wait_until="domcontentloaded")
-            except Exception:
-                pass
+                await page.goto(f"https://{site}", timeout=20000, wait_until="domcontentloaded")
+            except Exception as e:
+                print(f"[SCREEN WARN] {site} goto timeout/error: {e}")
             await _asyncio.sleep(3)
             await page.screenshot(path=path, type="jpeg", quality=80)
-            print(f"[SCREEN OK] Screenshot saved: {path}")
-            return path
+            if os.path.exists(path) and os.path.getsize(path) > 1000:
+                print(f"[SCREEN OK] Screenshot saved: {path} ({os.path.getsize(path)} bytes)")
+                return path
+            else:
+                print(f"[SCREEN ERR] {site} screenshot too small or missing")
+                return None
         finally:
             await context.close()
             await browser.close()
@@ -145,19 +149,27 @@ def _take_screenshot_sync(site):
     try:
         return _asyncio.run(_shoot())
     except Exception as e:
-        print(f"[SCREEN ERR] {site}: {e}")
+        print(f"[SCREEN ERR] {site}: {type(e).__name__}: {e}")
         return None
 
 
-def take_screenshot_fast(site):
-    """Быстрый скриншот: простой вызов через ThreadPoolExecutor"""
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_take_screenshot_sync, site)
-            return future.result(timeout=45)
-    except Exception as e:
-        print(f"[SCREEN ERR] {site}: {e}")
-        return None
+def take_screenshot_fast(site, retries=2):
+    """Скриншот с retry: если не удался, пробуем ещё через 3 сек"""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_take_screenshot_sync, site)
+                result = future.result(timeout=60)
+                if result:
+                    return result
+                print(f"[SCREEN RETRY] {site} attempt {attempt}/{retries} returned None")
+        except Exception as e:
+            last_err = e
+            print(f"[SCREEN ERR] {site} attempt {attempt}/{retries}: {type(e).__name__}: {e}")
+        if attempt < retries:
+            time.sleep(3)
+    return None
 
 
 # ============================================================================
