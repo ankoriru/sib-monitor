@@ -46,15 +46,8 @@ SELF_MONITORING_SITES = [
 ]
 
 # --- Content match для Ключевых сайтов ---
-# Проверяем наличие ключевого текста на странице при status=200
-# (?i) — case-insensitive. При mismatch: status=701 (Content Mismatch)
-CONTENT_MATCH_SITES = {
-    "sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
-    "eshop.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
-    "shop.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
-    "srm.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
-    "career.sibur.ru": r"(?i)(sibur|сибур|СИБУР)",
-}
+# re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
+CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур", re.IGNORECASE)
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
@@ -785,17 +778,16 @@ async def check_single_site(session, site, semaphore):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
-                # Content match для Ключевых сайтов: при 200 проверяем тело ответа
-                if curr_status == 200 and site in CONTENT_MATCH_SITES:
+                # Content match для Ключевых сайтов
+                if curr_status == 200 and site in KEY_SITES:
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=3)
-                        if not re.search(CONTENT_MATCH_SITES[site], text):
-                            curr_status = 701  # Content Mismatch
-                            print(f"[CONTENT MISMATCH] {site} — текст 'sibur/сибур' не найден")
+                        if not CONTENT_MATCH_KEYWORDS.search(text):
+                            curr_status = 701
+                            print(f"[CONTENT MISMATCH] {site}")
                     except Exception:
-                        # Таймаут чтения тела = считаем mismatch
                         curr_status = 701
-                        print(f"[CONTENT MISMATCH] {site} — таймаут чтения тела")
+                        print(f"[CONTENT MISMATCH] {site} — timeout")
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
@@ -1100,15 +1092,23 @@ def _get_ssl_whois_data(site, latest_data):
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                         last_status, fail_count, last_latency_map, thresholds, first_fail_time):
-    """Обработка результата проверки одного сайта (общая логика)"""
+                         last_status, fail_count, last_latency_map, thresholds, first_fail_time, up_alert_sent):
+    """Обработка результата проверки одного сайта (общая логика).
+    Content match: при восстановлении (status=200) не сбрасываем last_status/fail_count
+    до подтверждения content match на следующей проверке."""
     try:
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
 
         if curr_status != 200:
+            # Сайт недоступен (включая 701 Content Mismatch)
             fail_count[site] = fail_count.get(site, 0) + 1
+            # Сбрасываем флаг UP алерта — сайт снова даун
+            if site in up_alert_sent:
+                up_alert_sent.discard(site)
+                print(f"[UP FLAG RESET] {site} — content mismatch, clearing up_alert_sent")
+
             # Сохраняем время первого фейла для корректного расчёта длительности
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
@@ -1144,6 +1144,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
+            # Сайт доступен (status=200)
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
@@ -1153,18 +1154,22 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if fail_count.get(site, 0) >= thresholds.get(site, 5):
                 _db_incident_resolve(site)
 
-            # UP алерт только если был отправлен DOWN алерт (last_status != 200)
-            if last_status.get(site, 200) != 200:
+            # UP алерт только если был отправлен DOWN алерт и UP ещё не отправляли
+            if last_status.get(site, 200) != 200 and site not in up_alert_sent:
                 duration = fail_count.get(site, 0)
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                 shot_path_up = take_screenshot_fast(site)
                 print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
                 ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
+                up_alert_sent.add(site)
                 _invalidate_dashboard_cache()
 
-            last_status[site], fail_count[site] = 200, 0
-            first_fail_time.pop(site, None)
+            # Сбрасываем состояние ТОЛЬКО после подтверждения content match (up_alert_sent)
+            if site in up_alert_sent:
+                last_status[site], fail_count[site] = 200, 0
+                first_fail_time.pop(site, None)
+                print(f"[STATUS RESET] {site} — content match confirmed, resetting state")
 
             if resp_time > 20 and not last_latency_map.get(site, False):
                 print(f"[ALERT TG] Calling send_tg_msg for LATENCY: {site}")
@@ -1179,12 +1184,15 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
 
 def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                    last_status, fail_count, last_latency_map, first_fail_time):
+                                    last_status, fail_count, last_latency_map, first_fail_time, up_alert_sent):
     """Обработка self-monitoring: алерты с фиксированным порогом 10 мин, помечены [SELF-MONITORING]"""
     try:
         SM_THRESHOLD = 10
         if curr_status != 200:
             fail_count[site] = fail_count.get(site, 0) + 1
+            if site in up_alert_sent:
+                up_alert_sent.discard(site)
+
             # Сохраняем время первого фейла
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
@@ -1218,16 +1226,18 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
             if fail_count.get(site, 0) >= SM_THRESHOLD:
                 _db_incident_resolve(site)
 
-            if last_status.get(site, 200) != 200:
+            if last_status.get(site, 200) != 200 and site not in up_alert_sent:
                 duration = fail_count.get(site, 0)
                 print(f"[SM ALERT] {site} UP after {duration} min")
                 shot_path_up = take_screenshot_fast(site)
                 ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                 print(f"[SM ALERT RESULT] UP {'OK' if ok else 'FAIL'}")
+                up_alert_sent.add(site)
                 _invalidate_dashboard_cache()
 
-            last_status[site], fail_count[site] = 200, 0
-            first_fail_time.pop(site, None)
+            if site in up_alert_sent:
+                last_status[site], fail_count[site] = 200, 0
+                first_fail_time.pop(site, None)
     except Exception as e:
         print(f"[SM ERR] {site}: {e}")
 
@@ -1243,6 +1253,7 @@ def check_worker():
     fail_count = {}
     last_latency_map = {}
     first_fail_time = {}
+    up_alert_sent = set()  # сайты, для которых уже отправлен UP алерт
 
     # Инициализация self-monitoring состояния
     for site in SELF_MONITORING_SITES:
@@ -1298,12 +1309,12 @@ def check_worker():
             for site, curr_status, resp_time in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time)
+                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time, up_alert_sent)
 
             # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
                 _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                                last_status, fail_count, last_latency_map, first_fail_time)
+                                                last_status, fail_count, last_latency_map, first_fail_time, up_alert_sent)
 
             flush_batch()
             refresh_materialized_view()
