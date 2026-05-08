@@ -1156,7 +1156,12 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
             # UP алерт только если был отправлен DOWN алерт и UP ещё не отправляли
             if last_status.get(site, 200) != 200 and site not in up_alert_sent:
-                duration = fail_count.get(site, 0)
+                # Длительность от first_fail_time до восстановления (как в incidents.duration_min)
+                ft = first_fail_time.get(site)
+                if ft:
+                    duration = max(1, int((datetime.datetime.now() - ft).total_seconds() // 60))
+                else:
+                    duration = fail_count.get(site, 0)
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                 shot_path_up = take_screenshot_fast(site)
                 print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
@@ -1227,7 +1232,12 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200 and site not in up_alert_sent:
-                duration = fail_count.get(site, 0)
+                # Длительность от first_fail_time до восстановления (как в incidents.duration_min)
+                ft = first_fail_time.get(site)
+                if ft:
+                    duration = max(1, int((datetime.datetime.now() - ft).total_seconds() // 60))
+                else:
+                    duration = fail_count.get(site, 0)
                 print(f"[SM ALERT] {site} UP after {duration} min")
                 shot_path_up = take_screenshot_fast(site)
                 ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
