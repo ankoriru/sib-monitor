@@ -70,7 +70,7 @@ SITES = [
     "laika.sibur.ru", "magazine.sibur.ru", "mendeleev-smena.ru",
     "messages2.sibur.ru", "nauka.sibur.ru", "oknavdome.info",
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
-    "rusvinyl.ru",
+    "rusvinyl.ru", "sharefile.sibur.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
     "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ] + NEW_MONITORING_SITES
@@ -501,6 +501,7 @@ def init_db():
             ("polylabsearch.ru", "external"),
             ("portenergo.com", "external"),
             ("rusvinyl.ru", "external"),
+            ("sharefile.sibur.ru", "external"),
             ("sibur.digital", "external"),
             ("sibur-int.com", "external"),
             ("sibur-int.ru", "external"),
@@ -1092,35 +1093,29 @@ def _get_ssl_whois_data(site, latest_data):
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                         last_status, fail_count, last_latency_map, thresholds, first_fail_time, up_alert_sent):
-    """Обработка результата проверки одного сайта (общая логика).
-    Content match: при восстановлении (status=200) не сбрасываем last_status/fail_count
-    до подтверждения content match на следующей проверке."""
+                         last_status, fail_count, last_latency_map, thresholds, first_fail_time):
+    """Обработка результата проверки одного сайта.
+    State machine: last_status + fail_count определяют переходы.
+    При восстановлении: сразу сбрасываем состояние — никаких отложенных reset."""
     try:
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
 
         if curr_status != 200:
-            # Сайт недоступен (включая 701 Content Mismatch)
+            # ===== ВЕТКА: сайт НЕДОСТУПЕН (включая 701 Content Mismatch) =====
             fail_count[site] = fail_count.get(site, 0) + 1
-            # Сбрасываем флаг UP алерта — сайт снова даун
-            if site in up_alert_sent:
-                up_alert_sent.discard(site)
-                print(f"[UP FLAG RESET] {site} — content mismatch, clearing up_alert_sent")
 
-            # Сохраняем время первого фейла для корректного расчёта длительности
+            # Фиксируем время первого фейла для корректного расчёта длительности инцидента
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
 
-            alert_threshold = thresholds.get(site)
-            if alert_threshold is None:
-                alert_threshold = 5
+            alert_threshold = thresholds.get(site, 5)
             print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
-                # Инцидент начинается с момента первого фейла (first_fail_time), не сейчас
+                # Порог превышен И сайт считался UP → создаём инцидент
                 incident_start = first_fail_time.get(site)
                 if not incident_start:
                     incident_start = datetime.datetime.now()
@@ -1134,6 +1129,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > alert_threshold:
+                # Продолжающийся инцидент — обновляем max_status
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
@@ -1144,37 +1140,31 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
-            # Сайт доступен (status=200)
+            # ===== ВЕТКА: сайт ДОСТУПЕН (status=200) =====
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
-            # Закрываем инцидент только если он был создан (fail_count >= threshold)
+            # Закрываем инцидент если порог был превышен
             if fail_count.get(site, 0) >= thresholds.get(site, 5):
                 _db_incident_resolve(site)
 
-            # UP алерт только если был отправлен DOWN алерт и UP ещё не отправляли
-            if last_status.get(site, 200) != 200 and site not in up_alert_sent:
-                # Длительность от first_fail_time до восстановления (как в incidents.duration_min)
-                ft = first_fail_time.get(site)
-                if ft:
-                    duration = max(1, int((datetime.datetime.now() - ft).total_seconds() // 60))
-                else:
-                    duration = fail_count.get(site, 0)
+            # UP-алерт: отправляем если сайт восстановился из DOWN-состояния
+            if last_status.get(site, 200) != 200:
+                # Длительность = время от первого фейла до сейчас (приблизительно fail_count минут)
+                duration = fail_count.get(site, 0)
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
                 shot_path_up = take_screenshot_fast(site)
                 print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
                 ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
-                up_alert_sent.add(site)
                 _invalidate_dashboard_cache()
 
-            # Сбрасываем состояние ТОЛЬКО после подтверждения content match (up_alert_sent)
-            if site in up_alert_sent:
-                last_status[site], fail_count[site] = 200, 0
-                first_fail_time.pop(site, None)
-                print(f"[STATUS RESET] {site} — content match confirmed, resetting state")
+            # СБРОС СОСТОЯНИЯ: немедленно, без отложенных проверок
+            last_status[site] = 200
+            fail_count[site] = 0
+            first_fail_time.pop(site, None)
 
             if resp_time > 20 and not last_latency_map.get(site, False):
                 print(f"[ALERT TG] Calling send_tg_msg for LATENCY: {site}")
@@ -1189,16 +1179,14 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
 
 def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                    last_status, fail_count, last_latency_map, first_fail_time, up_alert_sent):
+                                    last_status, fail_count, last_latency_map, first_fail_time):
     """Обработка self-monitoring: алерты с фиксированным порогом 10 мин, помечены [SELF-MONITORING]"""
     try:
         SM_THRESHOLD = 10
         if curr_status != 200:
+            # ===== ВЕТКА: self-monitoring НЕДОСТУПЕН =====
             fail_count[site] = fail_count.get(site, 0) + 1
-            if site in up_alert_sent:
-                up_alert_sent.discard(site)
 
-            # Сохраняем время первого фейла
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[SM FIRST FAIL] {site} at {first_fail_time[site]}")
@@ -1223,6 +1211,7 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
+            # ===== ВЕТКА: self-monitoring ДОСТУПЕН =====
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
@@ -1231,23 +1220,18 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
             if fail_count.get(site, 0) >= SM_THRESHOLD:
                 _db_incident_resolve(site)
 
-            if last_status.get(site, 200) != 200 and site not in up_alert_sent:
-                # Длительность от first_fail_time до восстановления (как в incidents.duration_min)
-                ft = first_fail_time.get(site)
-                if ft:
-                    duration = max(1, int((datetime.datetime.now() - ft).total_seconds() // 60))
-                else:
-                    duration = fail_count.get(site, 0)
+            if last_status.get(site, 200) != 200:
+                duration = fail_count.get(site, 0)
                 print(f"[SM ALERT] {site} UP after {duration} min")
                 shot_path_up = take_screenshot_fast(site)
                 ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
                 print(f"[SM ALERT RESULT] UP {'OK' if ok else 'FAIL'}")
-                up_alert_sent.add(site)
                 _invalidate_dashboard_cache()
 
-            if site in up_alert_sent:
-                last_status[site], fail_count[site] = 200, 0
-                first_fail_time.pop(site, None)
+            # Немедленный сброс состояния
+            last_status[site] = 200
+            fail_count[site] = 0
+            first_fail_time.pop(site, None)
     except Exception as e:
         print(f"[SM ERR] {site}: {e}")
 
@@ -1263,7 +1247,6 @@ def check_worker():
     fail_count = {}
     last_latency_map = {}
     first_fail_time = {}
-    up_alert_sent = set()  # сайты, для которых уже отправлен UP алерт
 
     # Инициализация self-monitoring состояния
     for site in SELF_MONITORING_SITES:
@@ -1319,12 +1302,12 @@ def check_worker():
             for site, curr_status, resp_time in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time, up_alert_sent)
+                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time)
 
             # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
                 _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                                last_status, fail_count, last_latency_map, first_fail_time, up_alert_sent)
+                                                last_status, fail_count, last_latency_map, first_fail_time)
 
             flush_batch()
             refresh_materialized_view()
@@ -2675,7 +2658,39 @@ def _build_html(data: dict) -> str:
         .incident-hidden {{ display: none; }}
         .btn-show-all {{ background: #e2e8f0; color: #475569; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; }}
         .btn-show-all:hover {{ background: #cbd5e1; }}
+        /* === LOADING OVERLAY === */
+        #load-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #ffffff; z-index: 99999; display: flex;
+            flex-direction: column; align-items: center; justify-content: center;
+            transition: opacity 0.5s ease, visibility 0.5s ease; }}
+        #load-overlay.hidden {{ opacity: 0; visibility: hidden; pointer-events: none; }}
+        .load-spinner {{ position: relative; width: 100px; height: 100px; margin-bottom: 25px; }}
+        .load-spinner svg {{ transform: rotate(-90deg); width: 100px; height: 100px; }}
+        .load-spinner .track {{ fill: none; stroke: #e2e8f0; stroke-width: 6; }}
+        .load-spinner .fill {{ fill: none; stroke: #00717a; stroke-width: 6;
+            stroke-linecap: round; stroke-dasharray: 251.2;
+            stroke-dashoffset: 251.2;
+            transition: stroke-dashoffset 0.3s ease; }}
+        .load-pct {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            font-size: 22px; font-weight: 700; color: #00717a; font-family: 'Segoe UI', sans-serif; }}
+        .load-label {{ font-size: 15px; color: #475569; font-weight: 500;
+            margin-top: 5px; letter-spacing: 0.3px; }}
+        .load-sub {{ font-size: 12px; color: #94a3b8; margin-top: 6px; }}
+        .load-dots::after {{ content: ''; animation: loadDots 1.5s infinite; }}
+        @keyframes loadDots {{ 0%{{content:'.'}} 33%{{content:'..'}} 66%{{content:'...'}} 100%{{content:'.'}} }}
     </style></head><body>
+    <!-- Loading overlay -->
+    <div id="load-overlay">
+        <div class="load-spinner">
+            <svg viewBox="0 0 100 100">
+                <circle class="track" cx="50" cy="50" r="40"/>
+                <circle class="fill" id="load-fill" cx="50" cy="50" r="40"/>
+            </svg>
+            <div class="load-pct" id="load-pct">0%</div>
+        </div>
+        <div class="load-label">Опрос объектов мониторинга<span class="load-dots"></span></div>
+        <div class="load-sub" id="load-sub">Инициализация</div>
+    </div>
     <div id="toast" class="toast"></div>
     <div class="container">
         <div style="display:flex; justify-content:space-between;
@@ -2796,6 +2811,77 @@ def _build_html(data: dict) -> str:
 
     dash_js_template = """
     <script>
+    // ===== LOADING PROGRESS =====
+    (function(){
+        const CIRC = 2 * Math.PI * 40; // circumference for r=40
+        const fill = document.getElementById('load-fill');
+        const pctTxt = document.getElementById('load-pct');
+        const subTxt = document.getElementById('load-sub');
+        const overlay = document.getElementById('load-overlay');
+        let progress = 0;
+        let target = 5;
+        let phase = 0;
+        const phases = [
+            { t: 15, sub: 'Загрузка статусов сайтов' },
+            { t: 35, sub: 'Сбор метрик доступности' },
+            { t: 55, sub: 'Анализ SSL-сертификатов' },
+            { t: 70, sub: 'Загрузка истории инцидентов' },
+            { t: 88, sub: 'Формирование интерфейса' },
+            { t: 100, sub: 'Готово' }
+        ];
+        function setProg(p) {
+            progress = Math.min(100, Math.max(0, p));
+            const offset = CIRC - (progress / 100) * CIRC;
+            fill.style.strokeDashoffset = offset;
+            pctTxt.textContent = Math.round(progress) + '%';
+            // phase text
+            for (let i = phases.length - 1; i >= 0; i--) {
+                if (progress >= phases[i].t) { subTxt.textContent = phases[i].sub; break; }
+            }
+        }
+        // Animate toward target smoothly
+        function tick() {
+            if (progress < target) {
+                const step = Math.max(0.3, (target - progress) * 0.06);
+                setProg(progress + step);
+            }
+            if (progress < 100) requestAnimationFrame(tick);
+        }
+        // Advance phases over time
+        let phaseIdx = 0;
+        function advance() {
+            if (phaseIdx < phases.length) {
+                target = phases[phaseIdx].t;
+                phaseIdx++;
+                setTimeout(advance, 250 + Math.random() * 400);
+            }
+        }
+        // Start
+        setProg(0);
+        requestAnimationFrame(tick);
+        setTimeout(advance, 100);
+
+        // Hide when page fully loaded
+        window.addEventListener('load', function() {
+            target = 100;
+            setProg(100);
+            setTimeout(function() {
+                overlay.classList.add('hidden');
+                // Remove from DOM after transition
+                setTimeout(function() { overlay.remove(); }, 600);
+            }, 400);
+        });
+        // Safety: hide after 8s no matter what
+        setTimeout(function() {
+            if (overlay && !overlay.classList.contains('hidden')) {
+                setProg(100);
+                overlay.classList.add('hidden');
+                setTimeout(function() { overlay.remove(); }, 600);
+            }
+        }, 8000);
+    })();
+    // =============================
+
     let chartsLoaded = false;
     let chartsLoading = false;
     let showingAll = false;
