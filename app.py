@@ -2599,8 +2599,74 @@ def _build_html(data: dict) -> str:
 
     H = []
 
-    H.append(f"""<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    H.append(f"""<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>""")
+    H.append("""<!-- CRITICAL: instant loading spinner -->
+    <script>
+    /* Мгновенный показ троббера до загрузки любых ресурсов */
+    (function(){
+        var CIRC = 251.2; /* 2*PI*40 */
+        document.write(
+            '<style>'+
+            '#load-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;'+
+            'z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;'+
+            'transition:opacity .5s,visibility .5s}'+
+            '#load-overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}'+
+            '.load-spinner{position:relative;width:100px;height:100px;margin-bottom:25px}'+
+            '.load-spinner svg{width:100px;height:100px;transform:rotate(-90deg)}'+
+            '.load-spinner .track{fill:none;stroke:#e2e8f0;stroke-width:6}'+
+            '.load-spinner .fill{fill:none;stroke:#00717a;stroke-width:6;stroke-linecap:round;'+
+            'stroke-dasharray:'+CIRC+';stroke-dashoffset:'+CIRC+';transition:stroke-dashoffset .3s}'+
+            '.load-pct{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'+
+            'font-size:22px;font-weight:700;color:#00717a;font-family:Segoe UI,sans-serif}'+
+            '.load-label{font-size:15px;color:#475569;font-weight:500;margin-top:5px}'+
+            '.load-sub{font-size:12px;color:#94a3b8;margin-top:6px}'+
+            '</style>'+
+            '<div id="load-overlay">'+
+            '<div class="load-spinner">'+
+            '<svg viewBox="0 0 100 100">'+
+            '<circle class="track" cx="50" cy="50" r="40"/>'+
+            '<circle class="fill" id="load-fill" cx="50" cy="50" r="40"/>'+
+            '</svg><div class="load-pct" id="load-pct">0%</div></div>'+
+            '<div class="load-label">Опрос объектов мониторинга</div>'+
+            '<div class="load-sub" id="load-sub">Инициализация</div></div>'
+        );
+        /* Мгновенно стартуем анимацию прогресса */
+        var progress = 0, target = 5;
+        var phases = [
+            {t:15,s:'Загрузка статусов сайтов'},{t:35,s:'Сбор метрик доступности'},
+            {t:55,s:'Анализ SSL-сертификатов'},{t:70,s:'Загрузка истории инцидентов'},
+            {t:88,s:'Формирование интерфейса'},{t:100,s:'Готово'}
+        ];
+        var fill = null, pctTxt = null, subTxt = null;
+        function findEl() {
+            if (!fill) { fill = document.getElementById('load-fill'); pctTxt = document.getElementById('load-pct'); subTxt = document.getElementById('load-sub'); }
+        }
+        function setProg(p) {
+            progress = Math.min(100, Math.max(0, p));
+            findEl();
+            if (fill) fill.style.strokeDashoffset = CIRC - (progress/100)*CIRC;
+            if (pctTxt) pctTxt.textContent = Math.round(progress)+'%';
+            for (var i = phases.length-1; i>=0; i--) { if (progress >= phases[i].t) { if (subTxt) subTxt.textContent = phases[i].s; break; } }
+        }
+        function tick() {
+            if (progress < target) { var step = Math.max(0.3, (target-progress)*0.06); setProg(progress+step); }
+            if (progress < 100) requestAnimationFrame(tick);
+        }
+        var phaseIdx = 0;
+        function advance() {
+            if (phaseIdx < phases.length) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
+        }
+        setProg(0); requestAnimationFrame(tick); setTimeout(advance, 100);
+        window.__setLoadProg = setProg;
+        window.__loadTick = tick;
+        /* Safety hide */
+        setTimeout(function(){
+            var o = document.getElementById('load-overlay');
+            if (o && !o.classList.contains('hidden')) { setProg(100); o.classList.add('hidden'); setTimeout(function(){o.remove();},600); }
+        }, 8000);
+    })();
+    </script>""")
+    H.append(f"""<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc;
                 padding: 20px; color: #1e293b; }}
@@ -2658,39 +2724,7 @@ def _build_html(data: dict) -> str:
         .incident-hidden {{ display: none; }}
         .btn-show-all {{ background: #e2e8f0; color: #475569; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; }}
         .btn-show-all:hover {{ background: #cbd5e1; }}
-        /* === LOADING OVERLAY === */
-        #load-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: #ffffff; z-index: 99999; display: flex;
-            flex-direction: column; align-items: center; justify-content: center;
-            transition: opacity 0.5s ease, visibility 0.5s ease; }}
-        #load-overlay.hidden {{ opacity: 0; visibility: hidden; pointer-events: none; }}
-        .load-spinner {{ position: relative; width: 100px; height: 100px; margin-bottom: 25px; }}
-        .load-spinner svg {{ transform: rotate(-90deg); width: 100px; height: 100px; }}
-        .load-spinner .track {{ fill: none; stroke: #e2e8f0; stroke-width: 6; }}
-        .load-spinner .fill {{ fill: none; stroke: #00717a; stroke-width: 6;
-            stroke-linecap: round; stroke-dasharray: 251.2;
-            stroke-dashoffset: 251.2;
-            transition: stroke-dashoffset 0.3s ease; }}
-        .load-pct {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            font-size: 22px; font-weight: 700; color: #00717a; font-family: 'Segoe UI', sans-serif; }}
-        .load-label {{ font-size: 15px; color: #475569; font-weight: 500;
-            margin-top: 5px; letter-spacing: 0.3px; }}
-        .load-sub {{ font-size: 12px; color: #94a3b8; margin-top: 6px; }}
-        .load-dots::after {{ content: ''; animation: loadDots 1.5s infinite; }}
-        @keyframes loadDots {{ 0%{{content:'.'}} 33%{{content:'..'}} 66%{{content:'...'}} 100%{{content:'.'}} }}
     </style></head><body>
-    <!-- Loading overlay -->
-    <div id="load-overlay">
-        <div class="load-spinner">
-            <svg viewBox="0 0 100 100">
-                <circle class="track" cx="50" cy="50" r="40"/>
-                <circle class="fill" id="load-fill" cx="50" cy="50" r="40"/>
-            </svg>
-            <div class="load-pct" id="load-pct">0%</div>
-        </div>
-        <div class="load-label">Опрос объектов мониторинга<span class="load-dots"></span></div>
-        <div class="load-sub" id="load-sub">Инициализация</div>
-    </div>
     <div id="toast" class="toast"></div>
     <div class="container">
         <div style="display:flex; justify-content:space-between;
@@ -2811,74 +2845,18 @@ def _build_html(data: dict) -> str:
 
     dash_js_template = """
     <script>
-    // ===== LOADING PROGRESS =====
+    // ===== FINALIZE LOADING (троббер создан inline в <head>) =====
     (function(){
-        const CIRC = 2 * Math.PI * 40; // circumference for r=40
-        const fill = document.getElementById('load-fill');
-        const pctTxt = document.getElementById('load-pct');
-        const subTxt = document.getElementById('load-sub');
         const overlay = document.getElementById('load-overlay');
-        let progress = 0;
-        let target = 5;
-        let phase = 0;
-        const phases = [
-            { t: 15, sub: 'Загрузка статусов сайтов' },
-            { t: 35, sub: 'Сбор метрик доступности' },
-            { t: 55, sub: 'Анализ SSL-сертификатов' },
-            { t: 70, sub: 'Загрузка истории инцидентов' },
-            { t: 88, sub: 'Формирование интерфейса' },
-            { t: 100, sub: 'Готово' }
-        ];
-        function setProg(p) {
-            progress = Math.min(100, Math.max(0, p));
-            const offset = CIRC - (progress / 100) * CIRC;
-            fill.style.strokeDashoffset = offset;
-            pctTxt.textContent = Math.round(progress) + '%';
-            // phase text
-            for (let i = phases.length - 1; i >= 0; i--) {
-                if (progress >= phases[i].t) { subTxt.textContent = phases[i].sub; break; }
-            }
-        }
-        // Animate toward target smoothly
-        function tick() {
-            if (progress < target) {
-                const step = Math.max(0.3, (target - progress) * 0.06);
-                setProg(progress + step);
-            }
-            if (progress < 100) requestAnimationFrame(tick);
-        }
-        // Advance phases over time
-        let phaseIdx = 0;
-        function advance() {
-            if (phaseIdx < phases.length) {
-                target = phases[phaseIdx].t;
-                phaseIdx++;
-                setTimeout(advance, 250 + Math.random() * 400);
-            }
-        }
-        // Start
-        setProg(0);
-        requestAnimationFrame(tick);
-        setTimeout(advance, 100);
-
-        // Hide when page fully loaded
+        const setProg = window.__setLoadProg || function(){};
+        // Accelerate to 100% when page fully loaded
         window.addEventListener('load', function() {
-            target = 100;
             setProg(100);
             setTimeout(function() {
-                overlay.classList.add('hidden');
-                // Remove from DOM after transition
-                setTimeout(function() { overlay.remove(); }, 600);
-            }, 400);
+                if (overlay) overlay.classList.add('hidden');
+                setTimeout(function() { if (overlay) overlay.remove(); }, 600);
+            }, 300);
         });
-        // Safety: hide after 8s no matter what
-        setTimeout(function() {
-            if (overlay && !overlay.classList.contains('hidden')) {
-                setProg(100);
-                overlay.classList.add('hidden');
-                setTimeout(function() { overlay.remove(); }, 600);
-            }
-        }, 8000);
     })();
     // =============================
 
