@@ -21,7 +21,7 @@ from string import Template
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
@@ -2286,18 +2286,16 @@ async def api_charts(auth: bool = Depends(check_auth)):
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
-@app.get("/", response_class=HTMLResponse)
-async def index(auth: bool = Depends(check_auth)):
-    global _dashboard_cache
-    now = time.time()
-    with _dashboard_cache["lock"]:
-        if _dashboard_cache["data"] and now - _dashboard_cache["timestamp"] < CACHE_TTL:
-            return _build_html(_dashboard_cache["data"])
+async def _index_stream():
+    """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
+    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных."""
+    # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
+    yield _build_head()
 
+    # === CHUNK 2: SQL-запросы (это занимает время, троббер уже крутится) ===
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
-    # --- SQL: только лёгкие запросы (нет графиков) ---
     s30 = _get_stats_from_agg(cur, '30 days')
     s24 = _get_stats_from_agg(cur, '24 hours')
 
@@ -2305,18 +2303,15 @@ async def index(auth: bool = Depends(check_auth)):
     latest_all = {r['site']: r for r in cur.fetchall()}
     latest = {s: latest_all[s] for s in SITES if s in latest_all}
     self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
-    # Гарантируем Online для self-monitoring (fallback если нет в БД)
     for s in SELF_MONITORING_SITES:
         if s not in self_latest:
             self_latest[s] = {'status': 200, 'response_time': 0.5, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None}
         elif self_latest[s].get('status') == 401:
             self_latest[s]['status'] = 200
-    # — и для обычных сайтов (если вдруг попал 401)
     for s in latest:
         if latest[s].get('status') == 401:
             latest[s]['status'] = 200
 
-    # Статистика по сайтам — из checks_agg (self-monitoring исключены)
     cur.execute("""
         SELECT site,
             ROUND(SUM(status_200_count) * 100.0
@@ -2341,7 +2336,6 @@ async def index(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         stats = {r['site']: r for r in cur.fetchall()}
 
-    # Self-monitoring статистика — считаем 401 как 200 (uptime OK)
     cur.execute("""
         SELECT site,
             ROUND(SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN checks_count ELSE status_200_count END) * 100.0
@@ -2366,7 +2360,6 @@ async def index(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         self_stats = {r['site']: r for r in cur.fetchall()}
 
-    # Групповые метрики (правильный расчет uptime/resp через взвешенное среднее, self-monitoring исключены)
     cur.execute("""
         SELECT 
             CASE WHEN site = ANY(%s) THEN 0
@@ -2385,7 +2378,6 @@ async def index(auth: bool = Depends(check_auth)):
     if group_agg_rows and group_agg_rows[0][0] is not None:
         group_agg = {r['grp']: r for r in group_agg_rows}
     else:
-        # fallback на logs
         cur.execute("""
             SELECT 
                 CASE WHEN site = ANY(%s) THEN 0
@@ -2401,7 +2393,6 @@ async def index(auth: bool = Depends(check_auth)):
         """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
         group_agg = {r['grp']: r for r in cur.fetchall()}
 
-    # Инциденты — читаем из таблицы incidents, длительность пересчитываем динамически (end_time — start_time)
     cur.execute("""
         SELECT site, start_time,
             CASE 
@@ -2422,7 +2413,6 @@ async def index(auth: bool = Depends(check_auth)):
     """, (SELF_MONITORING_SITES,))
     incidents_list = [dict(r) for r in cur.fetchall()]
 
-    # Fallback: если таблица incidents пустая — один раз используем CTE из logs
     if not incidents_list:
         cur.execute("""
             WITH status_changes AS (
@@ -2452,7 +2442,6 @@ async def index(auth: bool = Depends(check_auth)):
         """, (SELF_MONITORING_SITES,))
         incidents_list = [dict(r) for r in cur.fetchall()]
 
-    # Self-monitoring инциденты — исключаем 401 (это auth required, не ошибка)
     cur.execute("""
         SELECT site, start_time,
             COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
@@ -2471,7 +2460,6 @@ async def index(auth: bool = Depends(check_auth)):
     """, (SELF_MONITORING_SITES,))
     self_incidents_list = [dict(r) for r in cur.fetchall()]
 
-    # Fallback: если таблица incidents пустая — один раз используем CTE из logs
     if not self_incidents_list:
         cur.execute("""
             WITH status_changes AS (
@@ -2504,7 +2492,6 @@ async def index(auth: bool = Depends(check_auth)):
     cur.close()
     conn.close()
 
-    # Неотработанные (unresolved) инциденты для блока "Обратите внимание"
     active_incidents = [r for r in incidents_list if not r.get('resolved', True)]
 
     data = {
@@ -2518,13 +2505,160 @@ async def index(auth: bool = Depends(check_auth)):
     with _dashboard_cache["lock"]:
         _dashboard_cache["data"] = data
         _dashboard_cache["timestamp"] = time.time()
-    return _build_html(data)
+
+    # === CHUNK 3: BODY (когда SQL готов) ===
+    yield _build_body(data)
+
+
+@app.get("/")
+async def index(auth: bool = Depends(check_auth)):
+    """StreamingResponse: троббер показывается мгновенно, данные приходят потом."""
+    global _dashboard_cache
+    now = time.time()
+    with _dashboard_cache["lock"]:
+        cached = _dashboard_cache["data"] and (now - _dashboard_cache["timestamp"] < CACHE_TTL)
+        if cached:
+            # Кэш хит — отправляем всё за один чанк (head + body)
+            return HTMLResponse(_build_head() + _build_body(_dashboard_cache["data"]))
+
+    # Кэш промах — стримим: head мгновенно, body после SQL
+    return StreamingResponse(_index_stream(), media_type="text/html; charset=utf-8")
 
 
 
-def _build_html(data: dict) -> str:
-    """Сборка HTML из кэшированного dict (без SQL, <10 мс) — оптимизировано через list.
-    JS часть использует string.Template для безопасной подстановки JSON."""
+def _build_head() -> str:
+    """HTML <head> + inline spinner + CSS — отправляется мгновенно (streaming), без SQL.
+    Разделено от body чтобы троббер показался ДО загрузки данных."""
+    return (
+        """<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>"""
+        """<!-- CRITICAL: instant loading spinner -->
+    <script>
+    (function(){
+        var CIRC = 251.2;
+        document.write(
+            '<style>'+
+            '#load-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;'+
+            'z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;'+
+            'transition:opacity .5s,visibility .5s}'+
+            '#load-overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}'+
+            '.load-spinner{position:relative;width:100px;height:100px;margin-bottom:25px}'+
+            '.load-spinner svg{width:100px;height:100px;transform:rotate(-90deg)}'+
+            '.load-spinner .track{fill:none;stroke:#e2e8f0;stroke-width:6}'+
+            '.load-spinner .fill{fill:none;stroke:#00717a;stroke-width:6;stroke-linecap:round;'+
+            'stroke-dasharray:'+CIRC+';stroke-dashoffset:'+CIRC+';transition:stroke-dashoffset .3s}'+
+            '.load-pct{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'+
+            'font-size:22px;font-weight:700;color:#00717a;font-family:Segoe UI,sans-serif}'+
+            '.load-label{font-size:15px;color:#475569;font-weight:500;margin-top:5px}'+
+            '.load-sub{font-size:12px;color:#94a3b8;margin-top:6px}'+
+            '</style>'+
+            '<div id="load-overlay">'+
+            '<div class="load-spinner">'+
+            '<svg viewBox="0 0 100 100">'+
+            '<circle class="track" cx="50" cy="50" r="40"/>'+
+            '<circle class="fill" id="load-fill" cx="50" cy="50" r="40"/>'+
+            '</svg><div class="load-pct" id="load-pct">0%</div></div>'+
+            '<div class="load-label">Опрос объектов мониторинга</div>'+
+            '<div class="load-sub" id="load-sub">Инициализация</div></div>'
+        );
+        var progress = 0, target = 5;
+        var phases = [
+            {t:15,s:'Загрузка статусов сайтов'},{t:35,s:'Сбор метрик доступности'},
+            {t:55,s:'Анализ SSL-сертификатов'},{t:70,s:'Загрузка истории инцидентов'},
+            {t:88,s:'Формирование интерфейса'},{t:100,s:'Готово'}
+        ];
+        var fill = null, pctTxt = null, subTxt = null;
+        function findEl() {
+            if (!fill) { fill = document.getElementById('load-fill'); pctTxt = document.getElementById('load-pct'); subTxt = document.getElementById('load-sub'); }
+        }
+        function setProg(p) {
+            progress = Math.min(100, Math.max(0, p));
+            findEl();
+            if (fill) fill.style.strokeDashoffset = CIRC - (progress/100)*CIRC;
+            if (pctTxt) pctTxt.textContent = Math.round(progress)+'%';
+            for (var i = phases.length-1; i>=0; i--) { if (progress >= phases[i].t) { if (subTxt) subTxt.textContent = phases[i].s; break; } }
+        }
+        function tick() {
+            if (progress < target) { var step = Math.max(0.3, (target-progress)*0.06); setProg(progress+step); }
+            if (progress < 100) requestAnimationFrame(tick);
+        }
+        var phaseIdx = 0;
+        function advance() {
+            if (phaseIdx < phases.length) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
+        }
+        setProg(0); requestAnimationFrame(tick); setTimeout(advance, 100);
+        window.__setLoadProg = setProg;
+        /* Safety hide */
+        setTimeout(function(){
+            var o = document.getElementById('load-overlay');
+            if (o && !o.classList.contains('hidden')) { setProg(100); o.classList.add('hidden'); setTimeout(function(){o.remove();},600); }
+        }, 8000);
+    })();
+    </script>"""
+        """<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc;
+                padding: 20px; color: #1e293b; }
+        .container { max-width: 1400px; margin: auto; background: white;
+                      padding: 25px; border-radius: 12px;
+                      box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr);
+                     gap: 10px; margin-bottom: 20px; }
+        .kpi-card { background: #fff; padding: 10px; border-radius: 10px;
+                     border: 1px solid #e2e8f0; border-top: 4px solid #00717a;
+                     text-align: center; }
+        .danger-card { border-top-color: #ef4444 !important;
+                        background: #fef2f2 !important; }
+        .error-bar { background: #fff1f2; border: 1px solid #fee2e2;
+                      color: #b91c1c; padding: 15px; border-radius: 8px;
+                      margin-bottom: 20px; font-weight: bold; }
+        .error-list { margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 15px;
+                 border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
+        .tab-btn { padding: 10px 20px; border: none; background: #e2e8f0;
+                    border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .tab-btn.active { background: #00717a; color: white; }
+        .tab-content { display: none; }
+        .active-content { display: block; }
+        .tab-content { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 10px 8px; text-align: left;
+                  border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+        td:first-child, th:first-child { white-space: nowrap; min-width: 220px; }
+        .incidents-table th:first-child, .incidents-table td:first-child { min-width: auto; width: 11ch; }
+        .table-wrap { overflow-x: auto; }
+        .row-err { background-color: #fff1f2 !important; }
+        .txt-err { color: #dc2626; font-weight: bold; }
+        .txt-ok { color: #16a34a; font-weight: bold; }
+        .refresh-btn { background: #00717a; color: white; border: none;
+                        padding: 8px 15px; border-radius: 6px; cursor: pointer; }
+        .btn-test { background: #00717a; color: white; border: none;
+                     padding: 5px 10px; border-radius: 4px; cursor: pointer;
+                     text-decoration: none; font-size: 11px;
+                     display: inline-flex; align-items: center;
+                     justify-content: center; min-width: 80px; }
+        .loader { border: 2px solid #f3f3f3; border-top: 2px solid #00717a;
+                   border-radius: 50%; width: 12px; height: 12px;
+                   animation: spin 1s linear infinite; display: none; margin-right: 5px; }
+        @keyframes spin { 0% { transform: rotate(0deg); }
+                           100% { transform: rotate(360deg); } }
+        .loading .loader { display: inline-block; }
+        .loading span { display: none; }
+        .toast { position: fixed; bottom: 20px; right: 20px;
+                  background: #333; color: white; padding: 12px 24px;
+                  border-radius: 8px; display: none; z-index: 1000;
+                  box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
+        .group-header { background: #e2e8f0; font-weight: bold; color: #475569; padding: 8px 12px; }
+        .group-sub { font-weight: normal; font-size: 12px; color: #64748b; margin-left: 12px; }
+        .incident-hidden { display: none; }
+        .btn-show-all { background: #e2e8f0; color: #475569; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        .btn-show-all:hover { background: #cbd5e1; }
+    </style></head><body>"""
+    )
+
+
+def _build_body(data: dict) -> str:
+    """Сборка body + JS — часть которая зависит от SQL-данных.
+    Отправляется ВТОРОЙ чанкой в streaming response (после head)."""
     s30 = data["s30"]
     s24 = data["s24"]
     latest = data["latest"]
@@ -2562,7 +2696,6 @@ def _build_html(data: dict) -> str:
         return 2
 
     group_names = {0: "Ключевые", 1: "СТДО", 2: "Внешние сайты"}
-    # sibur.ru всегда первый внутри своей группы, остальные по алфавиту
     sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
     key_sites_json = json.dumps(KEY_SITES)
@@ -2599,133 +2732,7 @@ def _build_html(data: dict) -> str:
 
     H = []
 
-    H.append(f"""<html><head><meta charset="UTF-8"><title>Мониторинг сайтов</title>""")
-    H.append("""<!-- CRITICAL: instant loading spinner -->
-    <script>
-    /* Мгновенный показ троббера до загрузки любых ресурсов */
-    (function(){
-        var CIRC = 251.2; /* 2*PI*40 */
-        document.write(
-            '<style>'+
-            '#load-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;'+
-            'z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;'+
-            'transition:opacity .5s,visibility .5s}'+
-            '#load-overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}'+
-            '.load-spinner{position:relative;width:100px;height:100px;margin-bottom:25px}'+
-            '.load-spinner svg{width:100px;height:100px;transform:rotate(-90deg)}'+
-            '.load-spinner .track{fill:none;stroke:#e2e8f0;stroke-width:6}'+
-            '.load-spinner .fill{fill:none;stroke:#00717a;stroke-width:6;stroke-linecap:round;'+
-            'stroke-dasharray:'+CIRC+';stroke-dashoffset:'+CIRC+';transition:stroke-dashoffset .3s}'+
-            '.load-pct{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'+
-            'font-size:22px;font-weight:700;color:#00717a;font-family:Segoe UI,sans-serif}'+
-            '.load-label{font-size:15px;color:#475569;font-weight:500;margin-top:5px}'+
-            '.load-sub{font-size:12px;color:#94a3b8;margin-top:6px}'+
-            '</style>'+
-            '<div id="load-overlay">'+
-            '<div class="load-spinner">'+
-            '<svg viewBox="0 0 100 100">'+
-            '<circle class="track" cx="50" cy="50" r="40"/>'+
-            '<circle class="fill" id="load-fill" cx="50" cy="50" r="40"/>'+
-            '</svg><div class="load-pct" id="load-pct">0%</div></div>'+
-            '<div class="load-label">Опрос объектов мониторинга</div>'+
-            '<div class="load-sub" id="load-sub">Инициализация</div></div>'
-        );
-        /* Мгновенно стартуем анимацию прогресса */
-        var progress = 0, target = 5;
-        var phases = [
-            {t:15,s:'Загрузка статусов сайтов'},{t:35,s:'Сбор метрик доступности'},
-            {t:55,s:'Анализ SSL-сертификатов'},{t:70,s:'Загрузка истории инцидентов'},
-            {t:88,s:'Формирование интерфейса'},{t:100,s:'Готово'}
-        ];
-        var fill = null, pctTxt = null, subTxt = null;
-        function findEl() {
-            if (!fill) { fill = document.getElementById('load-fill'); pctTxt = document.getElementById('load-pct'); subTxt = document.getElementById('load-sub'); }
-        }
-        function setProg(p) {
-            progress = Math.min(100, Math.max(0, p));
-            findEl();
-            if (fill) fill.style.strokeDashoffset = CIRC - (progress/100)*CIRC;
-            if (pctTxt) pctTxt.textContent = Math.round(progress)+'%';
-            for (var i = phases.length-1; i>=0; i--) { if (progress >= phases[i].t) { if (subTxt) subTxt.textContent = phases[i].s; break; } }
-        }
-        function tick() {
-            if (progress < target) { var step = Math.max(0.3, (target-progress)*0.06); setProg(progress+step); }
-            if (progress < 100) requestAnimationFrame(tick);
-        }
-        var phaseIdx = 0;
-        function advance() {
-            if (phaseIdx < phases.length) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
-        }
-        setProg(0); requestAnimationFrame(tick); setTimeout(advance, 100);
-        window.__setLoadProg = setProg;
-        window.__loadTick = tick;
-        /* Safety hide */
-        setTimeout(function(){
-            var o = document.getElementById('load-overlay');
-            if (o && !o.classList.contains('hidden')) { setProg(100); o.classList.add('hidden'); setTimeout(function(){o.remove();},600); }
-        }, 8000);
-    })();
-    </script>""")
-    H.append(f"""<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc;
-                padding: 20px; color: #1e293b; }}
-        .container {{ max-width: 1400px; margin: auto; background: white;
-                      padding: 25px; border-radius: 12px;
-                      box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        .kpi-grid {{ display: grid; grid-template-columns: repeat(5, 1fr);
-                     gap: 10px; margin-bottom: 20px; }}
-        .kpi-card {{ background: #fff; padding: 10px; border-radius: 10px;
-                     border: 1px solid #e2e8f0; border-top: 4px solid #00717a;
-                     text-align: center; }}
-        .danger-card {{ border-top-color: #ef4444 !important;
-                        background: #fef2f2 !important; }}
-        .error-bar {{ background: #fff1f2; border: 1px solid #fee2e2;
-                      color: #b91c1c; padding: 15px; border-radius: 8px;
-                      margin-bottom: 20px; font-weight: bold; }}
-        .error-list {{ margin: 5px 0 0 20px; padding: 0; list-style-type: disc; }}
-        .tabs {{ display: flex; gap: 8px; margin-bottom: 15px;
-                 border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
-        .tab-btn {{ padding: 10px 20px; border: none; background: #e2e8f0;
-                    border-radius: 6px; cursor: pointer; font-weight: bold; }}
-        .tab-btn.active {{ background: #00717a; color: white; }}
-        .tab-content {{ display: none; }}
-        .active-content {{ display: block; }}
-        .tab-content {{ overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-        th, td {{ padding: 10px 8px; text-align: left;
-                  border-bottom: 1px solid #f1f5f9; white-space: nowrap; }}
-        td:first-child, th:first-child {{ white-space: nowrap; min-width: 220px; }}
-        .incidents-table th:first-child, .incidents-table td:first-child {{ min-width: auto; width: 11ch; }}
-        .table-wrap {{ overflow-x: auto; }}
-        .row-err {{ background-color: #fff1f2 !important; }}
-        .txt-err {{ color: #dc2626; font-weight: bold; }}
-        .txt-ok {{ color: #16a34a; font-weight: bold; }}
-        .refresh-btn {{ background: #00717a; color: white; border: none;
-                        padding: 8px 15px; border-radius: 6px; cursor: pointer; }}
-        .btn-test {{ background: #00717a; color: white; border: none;
-                     padding: 5px 10px; border-radius: 4px; cursor: pointer;
-                     text-decoration: none; font-size: 11px;
-                     display: inline-flex; align-items: center;
-                     justify-content: center; min-width: 80px; }}
-        .loader {{ border: 2px solid #f3f3f3; border-top: 2px solid #00717a;
-                   border-radius: 50%; width: 12px; height: 12px;
-                   animation: spin 1s linear infinite; display: none; margin-right: 5px; }}
-        @keyframes spin {{ 0% {{ transform: rotate(0deg); }}
-                           100% {{ transform: rotate(360deg); }} }}
-        .loading .loader {{ display: inline-block; }}
-        .loading span {{ display: none; }}
-        .toast {{ position: fixed; bottom: 20px; right: 20px;
-                  background: #333; color: white; padding: 12px 24px;
-                  border-radius: 8px; display: none; z-index: 1000;
-                  box-shadow: 0 4px 10px rgba(0,0,0,0.3); }}
-        .group-header {{ background: #e2e8f0; font-weight: bold; color: #475569; padding: 8px 12px; }}
-        .group-sub {{ font-weight: normal; font-size: 12px; color: #64748b; margin-left: 12px; }}
-        .incident-hidden {{ display: none; }}
-        .btn-show-all {{ background: #e2e8f0; color: #475569; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; }}
-        .btn-show-all:hover {{ background: #cbd5e1; }}
-    </style></head><body>
-    <div id="toast" class="toast"></div>
+    H.append(f"""<div id="toast" class="toast"></div>
     <div class="container">
         <div style="display:flex; justify-content:space-between;
                      align-items:center; margin-bottom:20px;">
