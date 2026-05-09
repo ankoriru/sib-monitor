@@ -241,7 +241,7 @@ def load_active_sites():
         conn.close()
         if rows:
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
-            thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            thresholds = {r[0]: (r[2] if r[2] is not None else 1) for r in rows if r[0] not in SELF_MONITORING_SITES}
             key = [r[0] for r in rows if r[1] == 'key']
             stdo = [r[0] for r in rows if r[1] == 'stdo']
             ext = [r[0] for r in rows if r[1] not in ('key', 'stdo') and r[0] not in SELF_MONITORING_SITES]
@@ -253,7 +253,7 @@ def load_active_sites():
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
-    thresholds = {s: 5 for s in all_sites}
+    thresholds = {s: 1 for s in all_sites}
     return all_sites, key, stdo, ext, thresholds
 
 
@@ -466,7 +466,7 @@ def init_db():
             site TEXT PRIMARY KEY,
             site_group TEXT DEFAULT 'external',
             is_active BOOLEAN DEFAULT TRUE,
-            alert_threshold INTEGER DEFAULT 5,
+            alert_threshold INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -522,11 +522,11 @@ def init_db():
     for s in SELF_MONITORING_SITES:
         cur.execute("""
             INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
-            VALUES (%s, 'self', 10, TRUE)
+            VALUES (%s, 'self', 1, TRUE)
             ON CONFLICT (site) DO UPDATE SET
                 site_group = 'self',
                 is_active = TRUE,
-                alert_threshold = 10
+                alert_threshold = 1
         """, (s,))
         if cur.rowcount > 0:
             print(f"[INIT] Added/updated self-monitoring site: {s}")
@@ -1092,87 +1092,86 @@ def _get_ssl_whois_data(site, latest_data):
     )
 
 
+def _send_screenshot_async(site, caption):
+    """Скриншот + отправка в ТГ в фоновом потоке. НЕ блокирует check_worker."""
+    def _shoot():
+        try:
+            path = take_screenshot_fast(site)
+            if path:
+                send_tg_msg(caption, path)
+        except Exception as e:
+            print(f"[SCREEN BG ERR] {site}: {e}")
+    threading.Thread(target=_shoot, daemon=True).start()
+
+
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                          last_status, fail_count, last_latency_map, thresholds, first_fail_time):
-    """Обработка результата проверки одного сайта.
-    State machine: last_status + fail_count определяют переходы.
-    При восстановлении: сразу сбрасываем состояние — никаких отложенных reset."""
+    """TG-алерт МГНОВЕННО при первом фейле. Скриншот в фоне — не блокирует worker."""
     try:
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
 
         if curr_status != 200:
-            # ===== ВЕТКА: сайт НЕДОСТУПЕН (включая 701 Content Mismatch) =====
+            was_up = last_status.get(site, 200) == 200
             fail_count[site] = fail_count.get(site, 0) + 1
 
-            # Фиксируем время первого фейла для корректного расчёта длительности инцидента
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
 
-            alert_threshold = thresholds.get(site, 5)
-            print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
+            alert_threshold = thresholds.get(site, 1)
 
-            if fail_count[site] >= alert_threshold and last_status.get(site, 200) == 200:
-                # Порог превышен И сайт считался UP → создаём инцидент
-                incident_start = first_fail_time.get(site)
-                if not incident_start:
-                    incident_start = datetime.datetime.now()
-                print(f"[INCIDENT START] {site} (actual start: {incident_start})")
+            if fail_count[site] == 1 and was_up:
+                # МГНОВЕННЫЙ алерт при первом фейле — без скриншота
+                print(f"[INSTANT ALERT] {site} fail=1, sending TG NOW")
+                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
+                print(f"[INSTANT ALERT RESULT] {site} {'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
+                last_status[site] = curr_status
+                _invalidate_dashboard_cache()
+
+            if fail_count[site] >= alert_threshold and was_up:
+                incident_start = first_fail_time.get(site) or datetime.datetime.now()
+                print(f"[INCIDENT START] {site} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
-                print(f"[ALERT TRIGGER] {site} fail_count={fail_count[site]} threshold={alert_threshold} status={curr_status}")
-                print(f"[ALERT TG] Calling send_tg_msg for DOWN: {site}")
-                shot_path = take_screenshot_fast(site)
-                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})", shot_path)
-                print(f"[ALERT RESULT] {site} send_tg_msg={'OK' if ok else 'FAIL'}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > alert_threshold:
-                # Продолжающийся инцидент — обновляем max_status
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
-                if fail_count[site] >= 2:
-                    batch_buffer.append(
-                        (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid)
-                    )
+                if fail_count[site] >= 1:
+                    batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
-            # ===== ВЕТКА: сайт ДОСТУПЕН (status=200) =====
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
-            # Закрываем инцидент если порог был превышен
-            if fail_count.get(site, 0) >= thresholds.get(site, 5):
+            fc = fail_count.get(site, 0)
+            if fc >= thresholds.get(site, 1):
                 _db_incident_resolve(site)
 
-            # UP-алерт: отправляем если сайт восстановился из DOWN-состояния
             if last_status.get(site, 200) != 200:
-                # Длительность = время от первого фейла до сейчас (приблизительно fail_count минут)
-                duration = fail_count.get(site, 0)
-                print(f"[ALERT TRIGGER] {site} UP after {duration} min downtime")
-                shot_path_up = take_screenshot_fast(site)
-                print(f"[ALERT TG] Calling send_tg_msg for UP: {site}")
-                ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
+                duration = fc
+                print(f"[ALERT TRIGGER] {site} UP after {duration} min")
+                ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 Скриншот при восстановлении: {site}")
                 _invalidate_dashboard_cache()
 
-            # СБРОС СОСТОЯНИЯ: немедленно, без отложенных проверок
             last_status[site] = 200
             fail_count[site] = 0
             first_fail_time.pop(site, None)
 
             if resp_time > 20 and not last_latency_map.get(site, False):
-                print(f"[ALERT TG] Calling send_tg_msg for LATENCY: {site}")
                 ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = True
             elif resp_time < 10 and last_latency_map.get(site, False):
-                print(f"[ALERT TG] Calling send_tg_msg for SPEED RESTORED: {site}")
-                ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОСТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = False
     except Exception as e:
         print(f"[ERR] {site}: {e}")
@@ -1180,27 +1179,29 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
 def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                     last_status, fail_count, last_latency_map, first_fail_time):
-    """Обработка self-monitoring: алерты с фиксированным порогом 10 мин, помечены [SELF-MONITORING]"""
+    """Self-monitoring: мгновенный алерт при первом фейле. Скриншот в фоне."""
     try:
-        SM_THRESHOLD = 10
+        SM_THRESHOLD = 1
         if curr_status != 200:
-            # ===== ВЕТКА: self-monitoring НЕДОСТУПЕН =====
+            was_up = last_status.get(site, 200) == 200
             fail_count[site] = fail_count.get(site, 0) + 1
 
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[SM FIRST FAIL] {site} at {first_fail_time[site]}")
 
-            if fail_count[site] >= SM_THRESHOLD and last_status.get(site, 200) == 200:
-                incident_start = first_fail_time.get(site)
-                if not incident_start:
-                    incident_start = datetime.datetime.now()
-                print(f"[SM INCIDENT START] {site} (actual start: {incident_start})")
+            if fail_count[site] == 1 and was_up:
+                # МГНОВЕННЫЙ алерт — без скриншота
+                print(f"[SM INSTANT ALERT] {site}")
+                ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})")
+                print(f"[SM INSTANT RESULT] {'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 [SM] Скриншот при падении: {site}")
+                last_status[site] = curr_status
+                _invalidate_dashboard_cache()
+
+            if fail_count[site] >= SM_THRESHOLD and was_up:
+                incident_start = first_fail_time.get(site) or datetime.datetime.now()
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
-                print(f"[SM ALERT] {site} fail={fail_count[site]} thr={SM_THRESHOLD}")
-                shot_path = take_screenshot_fast(site)
-                ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})", shot_path)
-                print(f"[SM ALERT RESULT] {'OK' if ok else 'FAIL'}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > SM_THRESHOLD:
@@ -1211,24 +1212,23 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
-            # ===== ВЕТКА: self-monitoring ДОСТУПЕН =====
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
 
-            if fail_count.get(site, 0) >= SM_THRESHOLD:
+            fc = fail_count.get(site, 0)
+            if fc >= SM_THRESHOLD:
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
-                duration = fail_count.get(site, 0)
+                duration = fc
                 print(f"[SM ALERT] {site} UP after {duration} min")
-                shot_path_up = take_screenshot_fast(site)
-                ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)", shot_path_up)
+                ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)")
                 print(f"[SM ALERT RESULT] UP {'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 [SM] Скриншот при восстановлении: {site}")
                 _invalidate_dashboard_cache()
 
-            # Немедленный сброс состояния
             last_status[site] = 200
             fail_count[site] = 0
             first_fail_time.pop(site, None)
@@ -1264,7 +1264,7 @@ def check_worker():
             SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
             # Защита: если thresholds пустой (например, БД пустая), fallback на 5
             if not thresholds and SITES:
-                thresholds = {s: 5 for s in SITES}
+                thresholds = {s: 1 for s in SITES}
                 print(f"[WORKER] thresholds empty, fallback to 5 for all {len(SITES)} sites")
             # Инициализируем состояние для новых сайтов
             for site in SITES:
