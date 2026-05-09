@@ -241,7 +241,7 @@ def load_active_sites():
         conn.close()
         if rows:
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
-            thresholds = {r[0]: (r[2] if r[2] is not None else 1) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
             key = [r[0] for r in rows if r[1] == 'key']
             stdo = [r[0] for r in rows if r[1] == 'stdo']
             ext = [r[0] for r in rows if r[1] not in ('key', 'stdo') and r[0] not in SELF_MONITORING_SITES]
@@ -253,7 +253,7 @@ def load_active_sites():
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
-    thresholds = {s: 1 for s in all_sites}
+    thresholds = {s: 5 for s in all_sites}
     return all_sites, key, stdo, ext, thresholds
 
 
@@ -466,7 +466,7 @@ def init_db():
             site TEXT PRIMARY KEY,
             site_group TEXT DEFAULT 'external',
             is_active BOOLEAN DEFAULT TRUE,
-            alert_threshold INTEGER DEFAULT 1,
+            alert_threshold INTEGER DEFAULT 5,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -522,11 +522,11 @@ def init_db():
     for s in SELF_MONITORING_SITES:
         cur.execute("""
             INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
-            VALUES (%s, 'self', 1, TRUE)
+            VALUES (%s, 'self', 10, TRUE)
             ON CONFLICT (site) DO UPDATE SET
                 site_group = 'self',
                 is_active = TRUE,
-                alert_threshold = 1
+                alert_threshold = 10
         """, (s,))
         if cur.rowcount > 0:
             print(f"[INIT] Added/updated self-monitoring site: {s}")
@@ -1106,7 +1106,9 @@ def _send_screenshot_async(site, caption):
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                          last_status, fail_count, last_latency_map, thresholds, first_fail_time):
-    """TG-алерт МГНОВЕННО при первом фейле. Скриншот в фоне — не блокирует worker."""
+    """Алерт + инцидент только при превышении порога (alert_threshold, default 5 мин).
+    TG-алерт и _db_incident_start — при fail_count >= threshold.
+    Скриншот в фоне — не блокирует worker."""
     try:
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
@@ -1120,28 +1122,25 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
 
-            alert_threshold = thresholds.get(site, 1)
-
-            if fail_count[site] == 1 and was_up:
-                # МГНОВЕННЫЙ алерт при первом фейле — без скриншота
-                print(f"[INSTANT ALERT] {site} fail=1, sending TG NOW")
-                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
-                print(f"[INSTANT ALERT RESULT] {site} {'OK' if ok else 'FAIL'}")
-                _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
-                last_status[site] = curr_status
-                _invalidate_dashboard_cache()
+            alert_threshold = thresholds.get(site, 5)
+            print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= alert_threshold and was_up:
+                # Порог превышен — создаём инцидент + алерт
                 incident_start = first_fail_time.get(site) or datetime.datetime.now()
                 print(f"[INCIDENT START] {site} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
+                print(f"[ALERT TRIGGER] {site} fail={fail_count[site]} thr={alert_threshold}")
+                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
+                print(f"[ALERT RESULT] {site} DOWN send_tg_msg={'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > alert_threshold:
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
-                if fail_count[site] >= 1:
+                if fail_count[site] >= 2:
                     batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
@@ -1152,7 +1151,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                     flush_batch()
 
             fc = fail_count.get(site, 0)
-            if fc >= thresholds.get(site, 1):
+            if fc >= thresholds.get(site, 5):
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
@@ -1179,9 +1178,10 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
 def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                     last_status, fail_count, last_latency_map, first_fail_time):
-    """Self-monitoring: мгновенный алерт при первом фейле. Скриншот в фоне."""
+    """Self-monitoring: алерт + инцидент только при пороге 10 мин.
+    Скриншот в фоне — не блокирует worker."""
     try:
-        SM_THRESHOLD = 1
+        SM_THRESHOLD = 10
         if curr_status != 200:
             was_up = last_status.get(site, 200) == 200
             fail_count[site] = fail_count.get(site, 0) + 1
@@ -1190,18 +1190,17 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[SM FIRST FAIL] {site} at {first_fail_time[site]}")
 
-            if fail_count[site] == 1 and was_up:
-                # МГНОВЕННЫЙ алерт — без скриншота
-                print(f"[SM INSTANT ALERT] {site}")
-                ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})")
-                print(f"[SM INSTANT RESULT] {'OK' if ok else 'FAIL'}")
-                _send_screenshot_async(site, f"📸 [SM] Скриншот при падении: {site}")
-                last_status[site] = curr_status
-                _invalidate_dashboard_cache()
+            print(f"[SM ALERT CHECK] {site} fail={fail_count[site]} thr={SM_THRESHOLD} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= SM_THRESHOLD and was_up:
+                # Порог 10 мин превышен — инцидент + алерт
                 incident_start = first_fail_time.get(site) or datetime.datetime.now()
+                print(f"[SM INCIDENT START] {site} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
+                print(f"[SM ALERT TRIGGER] {site} fail={fail_count[site]} thr={SM_THRESHOLD}")
+                ok = send_tg_msg(f"🚨 [SELF-MONITORING] DOWN: {site} (Код: {curr_status})")
+                print(f"[SM ALERT RESULT] DOWN {'OK' if ok else 'FAIL'}")
+                _send_screenshot_async(site, f"📸 [SM] Скриншот при падении: {site}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > SM_THRESHOLD:
@@ -1264,7 +1263,7 @@ def check_worker():
             SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
             # Защита: если thresholds пустой (например, БД пустая), fallback на 5
             if not thresholds and SITES:
-                thresholds = {s: 1 for s in SITES}
+                thresholds = {s: 5 for s in SITES}
                 print(f"[WORKER] thresholds empty, fallback to 5 for all {len(SITES)} sites")
             # Инициализируем состояние для новых сайтов
             for site in SITES:
