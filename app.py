@@ -1122,6 +1122,20 @@ def _ensure_screenshot_thread():
         _screenshot_thread.start()
         print("[SCREEN QUEUE] worker thread started")
 
+def _fmt_downtime(down_sec):
+    """Форматирует время простоя: '—' если 0, 'X мин' если <60, 'X ч Y мин' если >=60."""
+    if not down_sec or down_sec <= 0:
+        return "—"
+    mins = int(down_sec / 60)
+    if mins < 60:
+        return f"{mins} мин"
+    hours = mins // 60
+    rem_mins = mins % 60
+    if rem_mins == 0:
+        return f"{hours} ч"
+    return f"{hours} ч {rem_mins} мин"
+
+
 def _send_screenshot_async(site, caption):
     """Добавляет скриншот в очередь. Один поток обрабатывает последовательно — никаких race condition."""
     _ensure_screenshot_thread()
@@ -1733,7 +1747,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         <div id="self-loading" class="loading">Загрузка данных self-monitoring...</div>
         <div id="self-content" style="display:none;">
             <h3 style="color:#00717a;margin-top:0;">Self Monitoring</h3>
-            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th></tr></thead><tbody id="self-tbody"></tbody></table>
+            <table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Простой 30д</th><th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th></tr></thead><tbody id="self-tbody"></tbody></table>
             <h4 style="color:#475569;margin-top:25px;">📈 График</h4>
             <div id="self-chart-container" style="max-width:600px;"><div style="text-align:center;padding:30px;color:#999;">Загрузка графика...</div></div>
             <h4 style="color:#475569;margin-top:25px;">📋 Инциденты</h4>
@@ -1807,6 +1821,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
                 <td><strong>${s.site}</strong></td>
                 <td><span class="${isOnline ? 'txt-ok' : 'txt-err'}">${isOnline ? 'Online' : 'Offline'}</span></td>
                 <td>${s.upt}%</td>
+                <td>${(() => { const m = s.down_min || 0; if (m <= 0) return '—'; if (m < 60) return m + ' мин'; const h = Math.floor(m / 60), r = m % 60; return r === 0 ? h + ' ч' : h + ' ч ' + r + ' мин'; })()}</td>
                 <td>${s.response_time}с</td>
                 <td class="${(s.ssl_days >= 0 && s.ssl_days <= 20) ? 'txt-err' : ''}">${s.ssl_days}д</td>
                 <td class="${s.ssl_chain_valid === false ? 'txt-err' : (s.ssl_chain_valid === true ? 'txt-ok' : '')}">${s.ssl_chain_valid === true ? '✅' : (s.ssl_chain_valid === false ? '❌' : '—')}</td>
@@ -2194,6 +2209,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
                 'status': lr.get('status', 0),
                 'response_time': round(float(lr.get('response_time', 0) or 0), 2),
                 'upt': float(sr.get('upt', 0) or 0),
+                'down_min': round(int(sr.get('down_sec', 0) or 0) / 60),
                 'ssl_days': lr.get('ssl_days', -1),
                 'domain_days': lr.get('domain_days', -1),
                 'ssl_chain_valid': lr.get('ssl_chain_valid')
@@ -2795,7 +2811,7 @@ def _build_body(data: dict) -> str:
             <button class="tab-btn" onclick="location.href='/admin/page'">Управление</button>
         </div>
         <div id="t1" class="tab-content active-content">
-            <div class="table-wrap"><table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th>
+            <div class="table-wrap"><table><thead><tr><th>Сайт</th><th>Статус</th><th>Uptime 30д</th><th>Простой 30д</th>
             <th>Ответ</th><th>SSL</th><th>Цепочка SSL</th><th>Домен</th><th>Тест</th></tr></thead><tbody>
     """)
 
@@ -2805,7 +2821,7 @@ def _build_body(data: dict) -> str:
         if g != current_group:
             st = group_stats.get(g, {'online': 0, 'total': 0, 'upt': 0, 'resp': 0})
             g_sub = f'<span class="group-sub">Online: {st["online"]}/{st["total"]} | Uptime: {st["upt"]}% | Avg Ответ: {st["resp"]}с</span>'
-            H.append(f'<tr><td colspan="8" class="group-header">{group_names[g]}{g_sub}</td></tr>')
+            H.append(f'<tr><td colspan="9" class="group-header">{group_names[g]}{g_sub}</td></tr>')
             current_group = g
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
@@ -2818,7 +2834,7 @@ def _build_body(data: dict) -> str:
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
                 {'Online' if v['status']==200 else ('Content Mismatch' if v['status']==701 else 'Offline')}</span></td>
-            <td>{st30['upt']}%</td><td>{round(v['response_time'], 2)}с</td>
+            <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
                 {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
@@ -3009,7 +3025,7 @@ def _build_body(data: dict) -> str:
         if (btn) btn.style.display = 'none';
     }
 
-    setInterval(() => { location.reload(); }, 120000);
+    setInterval(() => { location.reload(); }, 600000);
     </script></body></html>"""
 
     dash_js = Template(dash_js_template).substitute(js_vars)
