@@ -1092,16 +1092,41 @@ def _get_ssl_whois_data(site, latest_data):
     )
 
 
-def _send_screenshot_async(site, caption):
-    """Скриншот + отправка в ТГ в фоновом потоке. НЕ блокирует check_worker."""
-    def _shoot():
+# ===== SCREENSHOT QUEUE (singleton, один фоновый поток) =====
+_screenshot_queue = queue.Queue()
+_screenshot_thread = None
+
+def _screenshot_worker():
+    """Фоновый поток: обрабатывает скриншоты ПО ОДНОМУ — без race condition."""
+    while True:
+        try:
+            site, caption = _screenshot_queue.get(timeout=30)
+        except queue.Empty:
+            continue
         try:
             path = take_screenshot_fast(site)
             if path:
                 send_tg_msg(caption, path)
+            else:
+                print(f"[SCREEN QUEUE] {site}: screenshot failed, skipping TG")
         except Exception as e:
-            print(f"[SCREEN BG ERR] {site}: {e}")
-    threading.Thread(target=_shoot, daemon=True).start()
+            print(f"[SCREEN QUEUE ERR] {site}: {e}")
+        finally:
+            _screenshot_queue.task_done()
+
+def _ensure_screenshot_thread():
+    """Запускает фоновый поток если ещё не запущен."""
+    global _screenshot_thread
+    if _screenshot_thread is None or not _screenshot_thread.is_alive():
+        _screenshot_thread = threading.Thread(target=_screenshot_worker, daemon=True)
+        _screenshot_thread.start()
+        print("[SCREEN QUEUE] worker thread started")
+
+def _send_screenshot_async(site, caption):
+    """Добавляет скриншот в очередь. Один поток обрабатывает последовательно — никаких race condition."""
+    _ensure_screenshot_thread()
+    _screenshot_queue.put((site, caption))
+    print(f"[SCREEN QUEUE] {site} added (queue size: {_screenshot_queue.qsize()})")
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
