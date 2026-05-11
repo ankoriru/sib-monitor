@@ -215,7 +215,7 @@ def admin_check_auth(request: Request, response: Response, admin_session: str = 
                 response.set_cookie(
                     key="admin_session",
                     value="authenticated_admin",
-                    max_age=86400,
+                    max_age=2592000,
                     httponly=True,
                     secure=True,
                     samesite="lax"
@@ -1601,7 +1601,7 @@ async def admin_auth(request: Request, response: Response):
             response.set_cookie(
                 key="admin_session",
                 value="authenticated_admin",
-                max_age=86400,
+                max_age=2592000,
                 httponly=True,
                 secure=True,
                 samesite="lax"
