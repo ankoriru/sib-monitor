@@ -616,7 +616,7 @@ def _backfill_incidents():
                 INSERT INTO incidents (site, start_time, end_time, duration_min,
                                        max_status, description, resolved, ssl_chain_valid)
                 SELECT site, start_time, end_time,
-                       CEIL(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
+                       FLOOR(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
                        max_status, description, TRUE, NULL
                 FROM incident_summary
                 ORDER BY start_time
@@ -958,7 +958,7 @@ def _db_incident_resolve(site):
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                duration_min = FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
                 resolved = TRUE
             WHERE site = %s AND resolved = FALSE
         """, (site,))
@@ -1463,7 +1463,7 @@ async def startup_event():
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                duration_min = FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
                 resolved = TRUE
             WHERE resolved = FALSE
               AND site IN (
@@ -2096,8 +2096,8 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
         cur.execute("""
             SELECT site, start_time,
                 CASE 
-                    WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
-                    ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+                    WHEN resolved = TRUE THEN GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                    ELSE FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
                 END as dur,
                 max_status,
                 CASE WHEN max_status = 0 THEN 'Timeout'
@@ -2395,8 +2395,8 @@ async def _index_stream():
     cur.execute("""
         SELECT site, start_time,
             CASE 
-                WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
-                ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+                WHEN resolved = TRUE THEN GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                ELSE FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
             END as dur,
             max_status, resolved,
             CASE WHEN max_status = 0 THEN 'Timeout'
@@ -2443,7 +2443,7 @@ async def _index_stream():
 
     cur.execute("""
         SELECT site, start_time,
-            COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+            COALESCE(duration_min, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
             max_status,
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
@@ -2855,13 +2855,11 @@ def _build_body(data: dict) -> str:
     (function(){
         const overlay = document.getElementById('load-overlay');
         const setProg = window.__setLoadProg || function(){};
-        // Accelerate to 100% when page fully loaded
-        window.addEventListener('load', function() {
-            setProg(100);
-            setTimeout(function() {
-                if (overlay) overlay.classList.add('hidden');
-                setTimeout(function() { if (overlay) overlay.remove(); }, 600);
-            }, 300);
+        // Контент загружен — мгновенно скрываем троббер, не ждем window.load
+        setProg(100);
+        requestAnimationFrame(function(){
+            if (overlay) overlay.classList.add('hidden');
+            setTimeout(function(){ if (overlay) overlay.remove(); }, 500);
         });
     })();
     // =============================
