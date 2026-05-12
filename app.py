@@ -402,6 +402,8 @@ def init_db():
         cur.execute("ALTER TABLE checks_agg ADD COLUMN last_ssl_chain_valid BOOLEAN")
     if not _column_exists(cur, 'checks_agg', 'down_sec'):
         cur.execute("ALTER TABLE checks_agg ADD COLUMN down_sec INTEGER DEFAULT 0")
+        cur.execute("UPDATE checks_agg SET down_sec = (checks_count - status_200_count) * 60 WHERE down_sec IS NULL OR down_sec = 0")
+        print(f"[INIT] Backfilled down_sec: {cur.rowcount} rows")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
     # Материализованное представление — пересоздаём если нет ssl_chain_valid
@@ -547,7 +549,7 @@ def backfill_checks_agg():
         if cur.fetchone()[0] == 0:
             print("Backfill checks_agg из logs...")
             cur.execute("""
-                INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
+                INSERT INTO checks_agg (site, bucket, checks_count, status_200_count, down_sec,
                                         avg_response_time, min_response_time, max_response_time,
                                         last_ssl_days, last_domain_days, last_ssl_chain_valid)
                 SELECT
@@ -556,6 +558,7 @@ def backfill_checks_agg():
                         + INTERVAL '5 min' * (EXTRACT(MINUTE FROM timestamp)::int / 5),
                     COUNT(*),
                     COUNT(*) FILTER (WHERE status = 200),
+                    (COUNT(*) - COUNT(*) FILTER (WHERE status = 200)) * 60,
                     AVG(response_time),
                     MIN(response_time),
                     MAX(response_time),
