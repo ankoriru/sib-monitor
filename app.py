@@ -400,6 +400,8 @@ def init_db():
     """)
     if not _column_exists(cur, 'checks_agg', 'last_ssl_chain_valid'):
         cur.execute("ALTER TABLE checks_agg ADD COLUMN last_ssl_chain_valid BOOLEAN")
+    if not _column_exists(cur, 'checks_agg', 'down_sec'):
+        cur.execute("ALTER TABLE checks_agg ADD COLUMN down_sec INTEGER DEFAULT 0")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
     # Материализованное представление — пересоздаём если нет ssl_chain_valid
@@ -853,14 +855,17 @@ def _update_checks_agg(cur, batch_data):
         if ssl_chain_valid is not None:
             a['ssl_chain'] = ssl_chain_valid
     for (site, bucket), a in agg.items():
+        failed = a['cnt'] - a['ok']
+        down_sec = failed * 60  # каждая проверка раз в 60 сек
         cur.execute("""
-            INSERT INTO checks_agg (site, bucket, checks_count, status_200_count,
+            INSERT INTO checks_agg (site, bucket, checks_count, status_200_count, down_sec,
                                     avg_response_time, min_response_time, max_response_time,
                                     last_ssl_days, last_domain_days, last_ssl_chain_valid)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (site, bucket) DO UPDATE SET
                 checks_count = checks_agg.checks_count + EXCLUDED.checks_count,
                 status_200_count = checks_agg.status_200_count + EXCLUDED.status_200_count,
+                down_sec = checks_agg.down_sec + EXCLUDED.down_sec,
                 avg_response_time = (checks_agg.avg_response_time * checks_agg.checks_count
                                      + EXCLUDED.avg_response_time * EXCLUDED.checks_count)
                                     / (checks_agg.checks_count + EXCLUDED.checks_count),
@@ -869,7 +874,7 @@ def _update_checks_agg(cur, batch_data):
                 last_ssl_days = COALESCE(EXCLUDED.last_ssl_days, checks_agg.last_ssl_days),
                 last_domain_days = COALESCE(EXCLUDED.last_domain_days, checks_agg.last_domain_days),
                 last_ssl_chain_valid = COALESCE(EXCLUDED.last_ssl_chain_valid, checks_agg.last_ssl_chain_valid)
-        """, (site, bucket, a['cnt'], a['ok'],
+        """, (site, bucket, a['cnt'], a['ok'], down_sec,
               a['r_sum'] / a['cnt'], a['r_min'], a['r_max'], a['ssl'], a['dom'], a['ssl_chain']))
 
 
@@ -2114,7 +2119,7 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
             SELECT site,
                 ROUND(SUM(status_200_count) * 100.0
                       / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-                SUM(checks_count - status_200_count) * 5 as down_sec
+                COALESCE(SUM(down_sec), 0) as down_sec
             FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
               AND site = ANY(%s)
             GROUP BY site
@@ -2356,7 +2361,7 @@ async def _index_stream():
         SELECT site,
             ROUND(SUM(status_200_count) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            SUM(checks_count - status_200_count) * 5 as down_sec
+            COALESCE(SUM(down_sec), 0) as down_sec
         FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
           AND site <> ALL(%s)
         GROUP BY site
@@ -2380,7 +2385,7 @@ async def _index_stream():
         SELECT site,
             ROUND(SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN checks_count ELSE status_200_count END) * 100.0
                   / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN 0 ELSE checks_count - status_200_count END) * 5 as down_sec
+            COALESCE(SUM(down_sec), 0) as down_sec
         FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
           AND site = ANY(%s)
         GROUP BY site
