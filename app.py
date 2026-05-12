@@ -402,8 +402,8 @@ def init_db():
         cur.execute("ALTER TABLE checks_agg ADD COLUMN last_ssl_chain_valid BOOLEAN")
     if not _column_exists(cur, 'checks_agg', 'down_sec'):
         cur.execute("ALTER TABLE checks_agg ADD COLUMN down_sec INTEGER DEFAULT 0")
-    cur.execute("UPDATE checks_agg SET down_sec = (checks_count - status_200_count) * 60 WHERE down_sec = 0 AND checks_count > status_200_count")
-    if cur.rowcount > 0:
+        # Backfill для существующих записей — одноразовый, при создании столбца
+        cur.execute("UPDATE checks_agg SET down_sec = (checks_count - status_200_count) * 60 WHERE down_sec = 0 AND checks_count > status_200_count")
         print(f"[INIT] Backfilled down_sec: {cur.rowcount} rows")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
@@ -535,6 +535,15 @@ def init_db():
         """, (s,))
         if cur.rowcount > 0:
             print(f"[INIT] Added/updated self-monitoring site: {s}")
+
+    # Таблица миграций
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
 
     conn.commit()
     cur.close()
@@ -1484,22 +1493,25 @@ async def startup_event():
     # Неблокирующий запуск тяжёлых операций в отдельных потоках
     print("[STARTUP] Starting init_db, backfill, workers...")
     await asyncio.to_thread(init_db)
-    # Cleanup self-monitoring ДО backfill — иначе старые данные попадут в incidents
+    # Cleanup self-monitoring — одноразовый (после миграции self-monitoring в отдельную группу)
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("DELETE FROM incidents WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        cur.execute("DELETE FROM checks_agg WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        cur.execute("DELETE FROM logs WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
-        for s in SELF_MONITORING_SITES:
-            cur.execute("""
-                INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
-                VALUES (%s, 200, 0.5, -1, -1, NULL, NOW())
-            """, (s,))
-        conn.commit()
+        cur.execute("SELECT value FROM app_meta WHERE key = 'sm_cleanup_v1'")
+        if not cur.fetchone():
+            cur.execute("DELETE FROM incidents WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+            cur.execute("DELETE FROM checks_agg WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+            cur.execute("DELETE FROM logs WHERE site = ANY(%s)", (SELF_MONITORING_SITES,))
+            for s in SELF_MONITORING_SITES:
+                cur.execute("""
+                    INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                    VALUES (%s, 200, 0.5, -1, -1, NULL, NOW())
+                """, (s,))
+            cur.execute("INSERT INTO app_meta (key, value) VALUES ('sm_cleanup_v1', 'done') ON CONFLICT (key) DO NOTHING")
+            conn.commit()
+            print("[STARTUP] Self-monitoring cleanup done (one-time)")
         cur.close()
         conn.close()
-        print("[STARTUP] Self-monitoring old data cleaned")
     except Exception as e:
         print(f"[STARTUP WARN] Self-monitoring cleanup: {e}")
     await asyncio.to_thread(backfill_checks_agg)
