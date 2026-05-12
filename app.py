@@ -402,7 +402,8 @@ def init_db():
         cur.execute("ALTER TABLE checks_agg ADD COLUMN last_ssl_chain_valid BOOLEAN")
     if not _column_exists(cur, 'checks_agg', 'down_sec'):
         cur.execute("ALTER TABLE checks_agg ADD COLUMN down_sec INTEGER DEFAULT 0")
-        cur.execute("UPDATE checks_agg SET down_sec = (checks_count - status_200_count) * 60 WHERE down_sec IS NULL OR down_sec = 0")
+    cur.execute("UPDATE checks_agg SET down_sec = (checks_count - status_200_count) * 60 WHERE down_sec = 0 AND checks_count > status_200_count")
+    if cur.rowcount > 0:
         print(f"[INIT] Backfilled down_sec: {cur.rowcount} rows")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
@@ -621,7 +622,7 @@ def _backfill_incidents():
                 INSERT INTO incidents (site, start_time, end_time, duration_min,
                                        max_status, description, resolved, ssl_chain_valid)
                 SELECT site, start_time, end_time,
-                       FLOOR(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
+                       CEIL(EXTRACT(EPOCH FROM (end_time - start_time))/60)::INT,
                        max_status, description, TRUE, NULL
                 FROM incident_summary
                 ORDER BY start_time
@@ -966,7 +967,7 @@ def _db_incident_resolve(site):
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                duration_min = GREATEST(1, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
                 resolved = TRUE
             WHERE site = %s AND resolved = FALSE
         """, (site,))
@@ -1510,7 +1511,7 @@ async def startup_event():
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT,
+                duration_min = GREATEST(1, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
                 resolved = TRUE
             WHERE resolved = FALSE
               AND site IN (
@@ -2144,8 +2145,8 @@ async def api_self_monitoring(auth: bool = Depends(check_auth)):
         cur.execute("""
             SELECT site, start_time,
                 CASE 
-                    WHEN resolved = TRUE THEN GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
-                    ELSE FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+                    WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                    ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
                 END as dur,
                 max_status,
                 CASE WHEN max_status = 0 THEN 'Timeout'
@@ -2444,8 +2445,8 @@ async def _index_stream():
     cur.execute("""
         SELECT site, start_time,
             CASE 
-                WHEN resolved = TRUE THEN GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
-                ELSE FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
+                WHEN resolved = TRUE THEN GREATEST(1, CEIL(EXTRACT(EPOCH FROM (COALESCE(end_time, NOW()) - start_time))/60)::INT)
+                ELSE CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT
             END as dur,
             max_status, resolved,
             CASE WHEN max_status = 0 THEN 'Timeout'
@@ -2492,7 +2493,7 @@ async def _index_stream():
 
     cur.execute("""
         SELECT site, start_time,
-            COALESCE(duration_min, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
+            COALESCE(duration_min, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT) as dur,
             max_status,
             CASE WHEN max_status = 0 THEN 'Timeout'
                  WHEN max_status = 502 THEN 'Bad Gateway'
