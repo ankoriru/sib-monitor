@@ -1870,7 +1870,8 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     </div>
     <div id="toast" class="toast"></div>
     <script>
-    function adminTab(btn, n) {
+    document.addEventListener('DOMContentLoaded', function() {
+    window.adminTab = function(btn, n) {
         console.log('adminTab clicked:', n);
         var i, x = document.getElementsByClassName('tab-content'),
             b = document.getElementsByClassName('tab-btn');
@@ -1885,7 +1886,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
     }
-    async function loadSettings() {
+    window.loadSettings = async function() {
         try {
             var r = await fetch('/api/settings');
             var d = await r.json();
@@ -1898,7 +1899,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             }
         } catch(e) { console.error('loadSettings error:', e); }
     }
-    async function saveSettings() {
+    window.saveSettings = async function() {
         var msg = document.getElementById('settings-msg');
         msg.textContent = 'Сохранение...';
         var settings = [
@@ -1925,7 +1926,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             console.error('saveSettings error:', e);
         }
     }
-    function loadSelfMonitoring() {
+    window.loadSelfMonitoring = async function() {
         const loading = document.getElementById('self-loading');
         const content = document.getElementById('self-content');
         loading.style.display = 'block';
@@ -1946,7 +1947,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             loading.innerText = 'Ошибка связи с сервером';
         }
     }
-    async function loadDocs() {
+    window.loadDocs = async function() {
         const loading = document.getElementById('docs-loading');
         const content = document.getElementById('docs-content');
         loading.style.display = 'block';
@@ -2035,7 +2036,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             });
         }
     }
-    async function addSite() {
+    window.addSite = async function() {
         const site = document.getElementById('newSite').value.trim();
         const group = document.getElementById('newGroup').value;
         const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
@@ -2052,7 +2053,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     function cancelEdit(site) {
         document.getElementById('edit-' + site).style.display = 'none';
     }
-    async function saveRow(site) {
+    window.saveRow = async function(site) {
         const group = document.getElementById('grp-' + site).value;
         const threshold = parseInt(document.getElementById('thr-' + site).value);
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {
@@ -2069,7 +2070,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
-    async function deleteSite(site) {
+    window.deleteSite = async function(site) {
         if (!confirm('Удалить ' + site + ' окончательно?')) return;
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {method:'DELETE'});
         const data = await r.json();
@@ -2080,6 +2081,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
         setTimeout(() => { t.style.display = 'none'; }, 3000);
     }
+    });
     </script></body></html>""")
     return HTMLResponse("".join(H))
 
