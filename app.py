@@ -47,7 +47,7 @@ SELF_MONITORING_SITES = [
 
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
-CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур", re.IGNORECASE)
+CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login", re.IGNORECASE)
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
