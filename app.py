@@ -1881,7 +1881,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
     }
-    async async function loadSettings() {
+    async function loadSettings() {
         try {
             var r = await fetch('/api/settings');
             var d = await r.json();
