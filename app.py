@@ -49,6 +49,10 @@ SELF_MONITORING_SITES = [
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
 CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login", re.IGNORECASE)
 
+# Глобальный кэш для динамического content match (обновляется из БД)
+_content_match_pattern = None
+_content_match_regex = CONTENT_MATCH_KEYWORDS
+
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
 if os.getenv("SELF_SIGNED_SITES"):
@@ -256,6 +260,27 @@ def load_active_sites():
     thresholds = {s: 5 for s in all_sites}
     return all_sites, key, stdo, ext, thresholds
 
+
+
+def load_settings():
+    """Читает настройки приложения из БД. Fallback на дефолты."""
+    defaults = {
+        'content_match_pattern': 'sibur|сибур|логин|пароль|login',
+        'category_key_label': 'Ключевые',
+        'category_stdo_label': 'СТДО',
+        'category_external_label': 'Внешние сайты'
+    }
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM app_settings")
+        for row in cur.fetchall():
+            defaults[row[0]] = row[1]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] Failed to load settings: {e}")
+    return defaults
 
 def should_verify(site: str) -> bool:
     """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
@@ -545,6 +570,25 @@ def init_db():
         )
     """)
 
+    # Таблица настроек приложения
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        INSERT INTO app_settings (key, value) VALUES
+            ('content_match_pattern', 'sibur|сибур|логин|пароль|login'),
+            ('category_key_label', 'Ключевые'),
+            ('category_stdo_label', 'СТДО'),
+            ('category_external_label', 'Внешние сайты')
+        ON CONFLICT (key) DO NOTHING
+    """)
+    if cur.rowcount > 0:
+        print(f"[INIT] Seeded app_settings: {cur.rowcount} defaults")
+
     conn.commit()
     cur.close()
     conn.close()
@@ -798,7 +842,7 @@ async def check_single_site(session, site, semaphore):
                 if curr_status == 200 and site in KEY_SITES:
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=3)
-                        if not CONTENT_MATCH_KEYWORDS.search(text):
+                        if not _content_match_regex.search(text):
                             curr_status = 701
                             print(f"[CONTENT MISMATCH] {site}")
                     except Exception:
@@ -1318,6 +1362,17 @@ def check_worker():
         try:
             # Обновляем список сайтов из БД каждый цикл
             SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
+            # Обновляем настройки (content match pattern)
+            global _content_match_pattern, _content_match_regex
+            settings = load_settings()
+            new_pattern = settings.get('content_match_pattern', 'sibur|сибур')
+            if new_pattern != _content_match_pattern:
+                try:
+                    _content_match_regex = re.compile(new_pattern, re.IGNORECASE)
+                    _content_match_pattern = new_pattern
+                    print(f"[WORKER] Content match updated: {new_pattern}")
+                except re.error as e:
+                    print(f"[WORKER] Invalid content match pattern: {e}")
             # Защита: если thresholds пустой (например, БД пустая), fallback на 5
             if not thresholds and SITES:
                 thresholds = {s: 5 for s in SITES}
@@ -1712,6 +1767,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         </div>
         <div class="tabs">
             <button class="tab-btn active" onclick="adminTab(event, 'sites-tab')">Сайты</button>
+            <button class="tab-btn" onclick="adminTab(event, 'settings-tab')">Настройки</button>
             <button class="tab-btn" onclick="adminTab(event, 'self-tab')">Self Monitoring</button>
             <button class="tab-btn" onclick="adminTab(event, 'docs-tab')">Описание</button>
         </div>
@@ -1764,6 +1820,37 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         </tr>""")
 
     H.append("""</tbody></table></div>
+    <div id="settings-tab" class="tab-content">
+        <h3 style="color:#00717a;margin-top:0;">Настройки приложения</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;max-width:800px;">
+            <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
+                <h4 style="margin-top:0;color:#475569;">Content Match (regex)</h4>
+                <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Паттерн проверки контента для ключевых сайтов. Если контент не содержит совпадений, сайт считается DOWN (701).</p>
+                <input type="text" id="setting-pattern" placeholder="sibur|сибур|логин" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;box-sizing:border-box;">
+            </div>
+            <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
+                <h4 style="margin-top:0;color:#475569;">Названия категорий</h4>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                    <div>
+                        <label style="font-size:11px;color:#64748b;">Ключевые</label>
+                        <input type="text" id="setting-key-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;color:#64748b;">СТДО</label>
+                        <input type="text" id="setting-stdo-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;color:#64748b;">Внешние</label>
+                        <input type="text" id="setting-ext-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top:15px;">
+            <button class="btn btn-primary" onclick="saveSettings()">Сохранить настройки</button>
+            <span id="settings-msg" style="font-size:13px;margin-left:10px;"></span>
+        </div>
+    </div>
     <div id="self-tab" class="tab-content">
         <div id="self-loading" class="loading">Загрузка данных self-monitoring...</div>
         <div id="self-content" style="display:none;">
@@ -1790,10 +1877,51 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         for(i = 0; i < b.length; i++) b[i].className = 'tab-btn';
         document.getElementById(n).className = 'tab-content active-content';
         e.currentTarget.className += ' active';
+        if (n === 'settings-tab') loadSettings();
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
     }
-    async function loadSelfMonitoring() {
+    async async function loadSettings() {
+        try {
+            var r = await fetch('/api/settings');
+            var d = await r.json();
+            if (d.status === 'ok' && d.settings) {
+                var s = d.settings;
+                document.getElementById('setting-pattern').value = s['content_match_pattern'] || '';
+                document.getElementById('setting-key-label').value = s['category_key_label'] || '';
+                document.getElementById('setting-stdo-label').value = s['category_stdo_label'] || '';
+                document.getElementById('setting-ext-label').value = s['category_external_label'] || '';
+            }
+        } catch(e) { console.error('loadSettings error:', e); }
+    }
+    async function saveSettings() {
+        var msg = document.getElementById('settings-msg');
+        msg.textContent = 'Сохранение...';
+        var settings = [
+            {key: 'content_match_pattern', value: document.getElementById('setting-pattern').value.trim()},
+            {key: 'category_key_label', value: document.getElementById('setting-key-label').value.trim()},
+            {key: 'category_stdo_label', value: document.getElementById('setting-stdo-label').value.trim()},
+            {key: 'category_external_label', value: document.getElementById('setting-ext-label').value.trim()}
+        ];
+        try {
+            for (var i = 0; i < settings.length; i++) {
+                var s = settings[i];
+                if (!s.value) { msg.textContent = 'Все поля обязательны'; return; }
+                var r = await fetch('/api/settings/' + s.key, {
+                    method: 'PUT', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({value: s.value})
+                });
+                var d = await r.json();
+                if (d.status !== 'ok') { msg.textContent = 'Ошибка: ' + d.msg; return; }
+            }
+            msg.textContent = 'Настройки сохранены';
+            setTimeout(function(){ msg.textContent = ''; }, 3000);
+        } catch(e) {
+            msg.textContent = 'Ошибка сети';
+            console.error('saveSettings error:', e);
+        }
+    }
+    function loadSelfMonitoring() {
         const loading = document.getElementById('self-loading');
         const content = document.getElementById('self-content');
         loading.style.display = 'block';
@@ -1950,6 +2078,82 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     }
     </script></body></html>""")
     return HTMLResponse("".join(H))
+
+
+
+# ============================================================================
+# API: Настройки приложения (content match, названия категорий)
+# ============================================================================
+@app.get("/api/settings")
+async def get_settings(auth: bool = Depends(check_auth)):
+    """Получить все настройки приложения"""
+    try:
+        return {"status": "ok", "settings": load_settings()}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.put("/api/settings/{key}")
+async def update_setting(key: str, request: Request, auth: bool = Depends(check_auth)):
+    """Обновить одну настройку (content_match_pattern, category_*_label)"""
+    try:
+        data = await request.json()
+        value = data.get("value", "").strip()
+        allowed_keys = {
+            'content_match_pattern',
+            'category_key_label',
+            'category_stdo_label',
+            'category_external_label'
+        }
+        if key not in allowed_keys:
+            return JSONResponse({"status": "error", "msg": f"Unknown key. Allowed: {allowed_keys}"}, status_code=400)
+        if not value:
+            return JSONResponse({"status": "error", "msg": "value required"}, status_code=400)
+        if key == 'content_match_pattern':
+            try:
+                re.compile(value, re.IGNORECASE)
+            except re.error as e:
+                return JSONResponse({"status": "error", "msg": f"Invalid regex: {e}"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO app_settings (key, value, updated_at) VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """, (key, value))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "msg": f"Setting '{key}' updated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.get("/api/categories")
+async def get_categories(auth: bool = Depends(check_auth)):
+    """Получить сайты по категориям с динамическими названиями"""
+    try:
+        settings = load_settings()
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("""
+            SELECT site, site_group, is_active, alert_threshold
+            FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        categories = {
+            'key': {'label': settings.get('category_key_label', 'Ключевые'), 'sites': []},
+            'stdo': {'label': settings.get('category_stdo_label', 'СТДО'), 'sites': []},
+            'external': {'label': settings.get('category_external_label', 'Внешние сайты'), 'sites': []}
+        }
+        for r in rows:
+            g = r['site_group']
+            if g in categories:
+                categories[g]['sites'].append(dict(r))
+        return {"status": "ok", "categories": categories}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
 @app.get("/health")
