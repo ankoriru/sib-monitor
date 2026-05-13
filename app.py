@@ -2966,7 +2966,12 @@ def _build_body(data: dict) -> str:
             return 1
         return 2
 
-    group_names = {0: "Ключевые", 1: "СТДО", 2: "Внешние сайты"}
+    settings = load_settings()
+    group_names = {
+        0: settings.get('category_key_label', 'Ключевые'),
+        1: settings.get('category_stdo_label', 'СТДО'),
+        2: settings.get('category_external_label', 'Внешние сайты')
+    }
     sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
     key_sites_json = json.dumps(KEY_SITES)
