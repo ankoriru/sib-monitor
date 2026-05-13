@@ -2046,7 +2046,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
-    function editRow(site) {
+    window.editRow = function(site) {
         const form = document.getElementById('edit-' + site);
         form.style.display = form.style.display === 'none' ? 'flex' : 'none';
     }
@@ -2064,7 +2064,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
-    async function toggleSite(site) {
+    window.toggleSite = async function(site) {
         const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle', {method:'POST'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
