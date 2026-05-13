@@ -1766,10 +1766,10 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             <button class="btn btn-gray" onclick="location.href='/'">← Назад</button>
         </div>
         <div class="tabs">
-            <button class="tab-btn active" onclick="adminTab(event, 'sites-tab')">Сайты</button>
-            <button class="tab-btn" onclick="adminTab(event, 'settings-tab')">Настройки</button>
-            <button class="tab-btn" onclick="adminTab(event, 'self-tab')">Self Monitoring</button>
-            <button class="tab-btn" onclick="adminTab(event, 'docs-tab')">Описание</button>
+            <button class="tab-btn active" onclick="adminTab(this, 'sites-tab')">Сайты</button>
+            <button class="tab-btn" onclick="adminTab(this, 'settings-tab')">Настройки</button>
+            <button class="tab-btn" onclick="adminTab(this, 'self-tab')">Self Monitoring</button>
+            <button class="tab-btn" onclick="adminTab(this, 'docs-tab')">Описание</button>
         </div>
         <div id="sites-tab" class="tab-content active-content">
         <div class="add-form">
@@ -1870,13 +1870,17 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     </div>
     <div id="toast" class="toast"></div>
     <script>
-    function adminTab(e, n) {
+    function adminTab(btn, n) {
+        console.log('adminTab clicked:', n);
         var i, x = document.getElementsByClassName('tab-content'),
             b = document.getElementsByClassName('tab-btn');
-        for(i = 0; i < x.length; i++) x[i].className = 'tab-content';
-        for(i = 0; i < b.length; i++) b[i].className = 'tab-btn';
-        document.getElementById(n).className = 'tab-content active-content';
-        e.currentTarget.className += ' active';
+        for(i = 0; i < x.length; i++) x[i].classList.remove('active-content');
+        for(i = 0; i < b.length; i++) b[i].classList.remove('active');
+        var target = document.getElementById(n);
+        if (!target) { console.error('Tab not found:', n); return; }
+        target.classList.add('active-content');
+        btn.classList.add('active');
+        console.log('Tab activated:', n);
         if (n === 'settings-tab') loadSettings();
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
