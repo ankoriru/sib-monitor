@@ -623,15 +623,6 @@ def init_db():
     if cur.rowcount > 0:
         print(f"[INIT] Seeded app_settings: {cur.rowcount} defaults")
 
-    # Миграция: transportorder.sibur.ru → key
-    cur.execute("SELECT value FROM app_meta WHERE key = 'transportorder_key'")
-    if not cur.fetchone():
-        cur.execute("UPDATE monitored_sites SET site_group = 'key' WHERE site = 'transportorder.sibur.ru'")
-        if cur.rowcount > 0:
-            print(f"[INIT] Moved transportorder.sibur.ru to 'key' category")
-        cur.execute("INSERT INTO app_meta (key, value) VALUES ('transportorder_key', 'done') ON CONFLICT (key) DO NOTHING")
-        conn.commit()
-
     conn.commit()
     cur.close()
     conn.close()
@@ -882,21 +873,11 @@ async def check_single_site(session, site, semaphore):
                 curr_status = resp.status
                 resp_time = time.time() - start
                 # Content match для сайтов с включенным content match в их категории
-                print(f"[CM DEBUG] {site}: status={curr_status} in_cm={site in _cm_sites_set}")
                 if site in _cm_sites_set and curr_status in (200, 401):
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=10)
                         text_lower = text.lower()
                         match_found = _content_match_regex.search(text_lower)
-                        preview_start = text_lower.find('sibur')
-                        if preview_start == -1:
-                            preview_start = text_lower.find('login')
-                        if preview_start == -1:
-                            preview_start = text_lower.find('auth')
-                        if preview_start == -1:
-                            preview_start = 0
-                        text_preview = text_lower[preview_start:preview_start+200]
-                        print(f"[CM DEBUG] {site}: match={bool(match_found)} preview={text_preview[:150]}")
                         if match_found:
                             curr_status = 200
                             print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
@@ -1434,10 +1415,7 @@ def check_worker():
             global _cm_sites_set
             _cm_sites_set = set()
             for cat_id in cm_cats:
-                cat_sites = _categories.get(cat_id, [])
-                print(f"[CM INIT] category '{cat_id}' has {len(cat_sites)} sites: {cat_sites[:5]}")
-                _cm_sites_set.update(cat_sites)
-            print(f"[CM INIT] Total _cm_sites_set size: {len(_cm_sites_set)}, sites: {sorted(list(_cm_sites_set))[:10]}")
+                _cm_sites_set.update(_categories.get(cat_id, []))
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1641,16 +1619,6 @@ async def startup_event():
             cur.execute("INSERT INTO app_meta (key, value) VALUES ('sm_cleanup_v1', 'done') ON CONFLICT (key) DO NOTHING")
             conn.commit()
             print("[STARTUP] Self-monitoring cleanup done (one-time)")
-        # Одноразовое обновление content match паттерна (v2)
-        cur.execute("SELECT value FROM app_meta WHERE key = 'cm_pattern_v2'")
-        if not cur.fetchone():
-            cur.execute("""
-                INSERT INTO app_settings (key, value) VALUES ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization')
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """)
-            cur.execute("INSERT INTO app_meta (key, value) VALUES ('cm_pattern_v2', 'done') ON CONFLICT (key) DO NOTHING")
-            conn.commit()
-            print("[STARTUP] Content match pattern updated to v2")
         cur.close()
         conn.close()
     except Exception as e:
