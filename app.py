@@ -52,6 +52,8 @@ CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|l
 # Глобальный кэш для динамического content match (обновляется из БД)
 _content_match_pattern = None
 _content_match_regex = CONTENT_MATCH_KEYWORDS
+# Глобальный набор сайтов с content match (заполняется в check_worker)
+_cm_sites_set = set()
 
 # --- SEC-1: Whitelist для self-signed сертификатов ---
 SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
@@ -241,15 +243,24 @@ def load_active_sites():
         cur = conn.cursor()
         cur.execute("SELECT site, site_group, alert_threshold FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
         rows = cur.fetchall()
+        # Load dynamic categories from DB
+        cur.execute("SELECT id, label, content_match_enabled FROM site_categories ORDER BY sort_order")
+        cat_rows = cur.fetchall()
         cur.close()
         conn.close()
         if rows:
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
             thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
-            key = [r[0] for r in rows if r[1] == 'key']
-            stdo = [r[0] for r in rows if r[1] == 'stdo']
-            ext = [r[0] for r in rows if r[1] not in ('key', 'stdo') and r[0] not in SELF_MONITORING_SITES]
-            return sites, key, stdo, ext, thresholds
+            # Build dynamic categories dict
+            categories = {}
+            cat_ids = [c[0] for c in cat_rows]
+            for cat_id in cat_ids:
+                categories[cat_id] = [r[0] for r in rows if r[1] == cat_id and r[0] not in SELF_MONITORING_SITES]
+            # Sites with unknown category go to 'external'
+            for r in rows:
+                if r[1] not in cat_ids and r[0] not in SELF_MONITORING_SITES:
+                    categories.setdefault('external', []).append(r[0])
+            return sites, categories, thresholds
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
     # Fallback
@@ -500,6 +511,28 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Таблица категорий сайтов (динамические)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS site_categories (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            content_match_enabled BOOLEAN DEFAULT FALSE,
+            sort_order INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Seed default categories if empty
+    cur.execute("SELECT COUNT(*) FROM site_categories")
+    if cur.fetchone()[0] == 0:
+        cur.execute("""
+            INSERT INTO site_categories (id, label, content_match_enabled, sort_order) VALUES
+                ('key', 'Ключевые', TRUE, 0),
+                ('stdo', 'СТДО', FALSE, 1),
+                ('external', 'Внешние сайты', FALSE, 2)
+            ON CONFLICT (id) DO NOTHING
+        """)
+        print("[INIT] Seeded site_categories")
+
     # Заполняем дефолтными сайтами если таблица пустая
     cur.execute("SELECT COUNT(*) FROM monitored_sites")
     if cur.fetchone()[0] == 0:
@@ -838,17 +871,20 @@ async def check_single_site(session, site, semaphore):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
-                # Content match для Ключевых сайтов (200 или 401 — страница авторизации)
-                if site in KEY_SITES and curr_status in (200, 401):
+                # Content match для сайтов с включенным content match в их категории
+                print(f"[CM DEBUG] {site}: status={curr_status} in_cm={site in _cm_sites_set} cm_set_size={len(_cm_sites_set)} regex={_content_match_regex.pattern[:50]}")
+                if site in _cm_sites_set and curr_status in (200, 401):
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=3)
                         text_preview = text[:500].replace('\n', ' ').replace('\r', '')
-                        if _content_match_regex.search(text):
+                        match_found = _content_match_regex.search(text)
+                        print(f"[CM DEBUG] {site}: text_preview={text_preview[:200]} match={bool(match_found)}")
+                        if match_found:
                             curr_status = 200
                             print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
                         else:
                             curr_status = 701
-                            print(f"[CONTENT MISMATCH] {site} — text preview: {text_preview}")
+                            print(f"[CONTENT MISMATCH] {site} — no match in preview")
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
@@ -1365,7 +1401,25 @@ def check_worker():
         t_start = time.time()
         try:
             # Обновляем список сайтов из БД каждый цикл
-            SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES, thresholds = load_active_sites()
+            SITES, _categories, thresholds = load_active_sites()
+            # Build legacy vars for backward compat
+            KEY_SITES = _categories.get('key', [])
+            STDO_SITES = _categories.get('stdo', [])
+            EXTERNAL_SITES = _categories.get('external', [])
+            # Build content match set: all sites from categories with content_match_enabled
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM site_categories WHERE content_match_enabled = TRUE")
+            cm_cats = [r[0] for r in cur.fetchall()]
+            cur.close()
+            conn.close()
+            global _cm_sites_set
+            _cm_sites_set = set()
+            for cat_id in cm_cats:
+                cat_sites = _categories.get(cat_id, [])
+                print(f"[CM INIT] category '{cat_id}' has {len(cat_sites)} sites: {cat_sites[:5]}")
+                _cm_sites_set.update(cat_sites)
+            print(f"[CM INIT] Total _cm_sites_set size: {len(_cm_sites_set)}, sites: {sorted(list(_cm_sites_set))[:10]}")
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1843,19 +1897,18 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
                 <input type="text" id="setting-pattern" placeholder="sibur|сибур|логин" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;box-sizing:border-box;">
             </div>
             <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
-                <h4 style="margin-top:0;color:#475569;">Названия категорий</h4>
-                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
-                    <div>
-                        <label style="font-size:11px;color:#64748b;">Ключевые</label>
-                        <input type="text" id="setting-key-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
-                    </div>
-                    <div>
-                        <label style="font-size:11px;color:#64748b;">СТДО</label>
-                        <input type="text" id="setting-stdo-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
-                    </div>
-                    <div>
-                        <label style="font-size:11px;color:#64748b;">Внешние</label>
-                        <input type="text" id="setting-ext-label" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;">
+                <h4 style="margin-top:0;color:#475569;">Категории сайтов</h4>
+                <table style="font-size:12px;margin-bottom:10px;">
+                    <thead><tr><th>ID</th><th>Название</th><th>Content Match</th><th>Порядок</th><th></th></tr></thead>
+                    <tbody id="category-list"></tbody>
+                </table>
+                <div style="border-top:1px solid #e2e8f0;padding-top:10px;">
+                    <h5 style="margin:0 0 8px;color:#475569;">Новая категория</h5>
+                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;align-items:end;">
+                        <div><label style="font-size:11px;color:#64748b;">ID (a-z_)</label><input type="text" id="new-cat-id" placeholder="partner" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;"></div>
+                        <div><label style="font-size:11px;color:#64748b;">Название</label><input type="text" id="new-cat-label" placeholder="Партнерские" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;box-sizing:border-box;"></div>
+                        <div><label style="font-size:11px;color:#64748b;"><input type="checkbox" id="new-cat-cm"> Content Match</label></div>
+                        <div><button onclick="createCategory()" class="btn" style="font-size:12px;padding:6px 12px;">Добавить</button></div>
                     </div>
                 </div>
             </div>
@@ -1902,36 +1955,97 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     }
     window.loadSettings = async function() {
         try {
+            // Load content match pattern
             var r = await fetch('/api/settings');
             var d = await r.json();
             if (d.status === 'ok' && d.settings) {
-                var s = d.settings;
-                document.getElementById('setting-pattern').value = s['content_match_pattern'] || '';
-                document.getElementById('setting-key-label').value = s['category_key_label'] || '';
-                document.getElementById('setting-stdo-label').value = s['category_stdo_label'] || '';
-                document.getElementById('setting-ext-label').value = s['category_external_label'] || '';
+                document.getElementById('setting-pattern').value = d.settings['content_match_pattern'] || '';
+            }
+            // Load dynamic categories
+            var cr = await fetch('/api/site-categories');
+            var cd = await cr.json();
+            if (cd.status === 'ok' && cd.categories) {
+                window._categories = cd.categories;
+                renderCategoryList(cd.categories);
             }
         } catch(e) { console.error('loadSettings error:', e); }
+    }
+    function renderCategoryList(cats) {
+        var tbody = document.getElementById('category-list');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        for (var i = 0; i < cats.length; i++) {
+            var c = cats[i];
+            tbody.innerHTML += '<tr>' +
+                '<td>' + c.id + '</td>' +
+                '<td><input type="text" id="cat-label-' + c.id + '" value="' + c.label + '" style="width:100%;padding:4px;border:1px solid #cbd5e1;border-radius:4px;"></td>' +
+                '<td><input type="checkbox" id="cat-cm-' + c.id + '" ' + (c.content_match_enabled ? 'checked' : '') + '></td>' +
+                '<td><input type="number" id="cat-sort-' + c.id + '" value="' + c.sort_order + '" style="width:60px;padding:4px;"></td>' +
+                '<td><button onclick="saveCategory(\\'' + c.id + '\\')" class="btn" style="font-size:11px;padding:4px 8px;">Сохранить</button></td>' +
+            '</tr>';
+        }
+    }
+    window.saveCategory = async function(catId) {
+        var label = document.getElementById('cat-label-' + catId).value.trim();
+        var cm = document.getElementById('cat-cm-' + catId).checked;
+        var sort = parseInt(document.getElementById('cat-sort-' + catId).value) || 0;
+        if (!label) { alert('Название обязательно'); return; }
+        try {
+            var r = await fetch('/api/site-categories/' + catId, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({label: label, content_match_enabled: cm, sort_order: sort})
+            });
+            var d = await r.json();
+            alert(d.status === 'ok' ? 'Сохранено' : 'Ошибка: ' + d.msg);
+        } catch(e) { alert('Ошибка сети'); }
+    }
+    window.createCategory = async function() {
+        var id = document.getElementById('new-cat-id').value.trim().toLowerCase();
+        var label = document.getElementById('new-cat-label').value.trim();
+        var cm = document.getElementById('new-cat-cm').checked;
+        if (!id || !label) { alert('ID и название обязательны'); return; }
+        if (!/^[a-z0-9_]+$/.test(id)) { alert('ID: только a-z, 0-9, _'); return; }
+        try {
+            var r = await fetch('/api/site-categories', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: id, label: label, content_match_enabled: cm})
+            });
+            var d = await r.json();
+            if (d.status === 'ok') {
+                alert('Категория создана');
+                document.getElementById('new-cat-id').value = '';
+                document.getElementById('new-cat-label').value = '';
+                loadSettings();
+            } else {
+                alert('Ошибка: ' + d.msg);
+            }
+        } catch(e) { alert('Ошибка сети'); }
     }
     window.saveSettings = async function() {
         var msg = document.getElementById('settings-msg');
         msg.textContent = 'Сохранение...';
-        var settings = [
-            {key: 'content_match_pattern', value: document.getElementById('setting-pattern').value.trim()},
-            {key: 'category_key_label', value: document.getElementById('setting-key-label').value.trim()},
-            {key: 'category_stdo_label', value: document.getElementById('setting-stdo-label').value.trim()},
-            {key: 'category_external_label', value: document.getElementById('setting-ext-label').value.trim()}
-        ];
+        var pattern = document.getElementById('setting-pattern').value.trim();
+        if (!pattern) { msg.textContent = 'Паттерн обязателен'; return; }
         try {
-            for (var i = 0; i < settings.length; i++) {
-                var s = settings[i];
-                if (!s.value) { msg.textContent = 'Все поля обязательны'; return; }
-                var r = await fetch('/api/settings/' + s.key, {
-                    method: 'PUT', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({value: s.value})
-                });
-                var d = await r.json();
-                if (d.status !== 'ok') { msg.textContent = 'Ошибка: ' + d.msg; return; }
+            var r = await fetch('/api/settings/content_match_pattern', {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({value: pattern})
+            });
+            var d = await r.json();
+            if (d.status !== 'ok') { msg.textContent = 'Ошибка: ' + d.msg; return; }
+            // Save category changes
+            if (window._categories) {
+                for (var i = 0; i < window._categories.length; i++) {
+                    var c = window._categories[i];
+                    var label = document.getElementById('cat-label-' + c.id).value.trim();
+                    var cm = document.getElementById('cat-cm-' + c.id).checked;
+                    var sort = parseInt(document.getElementById('cat-sort-' + c.id).value) || 0;
+                    if (!label) continue;
+                    var cr = await fetch('/api/site-categories/' + c.id, {
+                        method: 'PUT', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({label: label, content_match_enabled: cm, sort_order: sort})
+                    });
+                }
             }
             msg.textContent = 'Настройки сохранены';
             setTimeout(function(){ msg.textContent = ''; }, 3000);
@@ -2150,28 +2264,123 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(check_
 
 @app.get("/api/categories")
 async def get_categories(auth: bool = Depends(check_auth)):
-    """Получить сайты по категориям с динамическими названиями"""
+    """Получить сайты по категориям (динамические из БД)"""
     try:
-        settings = load_settings()
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("SELECT id, label, content_match_enabled, sort_order FROM site_categories ORDER BY sort_order")
+        cat_rows = cur.fetchall()
         cur.execute("""
             SELECT site, site_group, is_active, alert_threshold
             FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site
         """)
-        rows = cur.fetchall()
+        site_rows = cur.fetchall()
         cur.close()
         conn.close()
-        categories = {
-            'key': {'label': settings.get('category_key_label', 'Ключевые'), 'sites': []},
-            'stdo': {'label': settings.get('category_stdo_label', 'СТДО'), 'sites': []},
-            'external': {'label': settings.get('category_external_label', 'Внешние сайты'), 'sites': []}
-        }
-        for r in rows:
+        categories = {}
+        for c in cat_rows:
+            categories[c['id']] = {
+                'label': c['label'],
+                'content_match_enabled': c['content_match_enabled'],
+                'sort_order': c['sort_order'],
+                'sites': []
+            }
+        for r in site_rows:
             g = r['site_group']
             if g in categories:
                 categories[g]['sites'].append(dict(r))
+            else:
+                categories.setdefault('external', {}).setdefault('sites', []).append(dict(r))
         return {"status": "ok", "categories": categories}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.get("/api/site-categories")
+async def list_site_categories(auth: bool = Depends(check_auth)):
+    """Получить список категорий сайтов"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("SELECT id, label, content_match_enabled, sort_order FROM site_categories ORDER BY sort_order")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "categories": [dict(r) for r in rows]}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.post("/api/site-categories")
+async def create_site_category(request: Request, auth: bool = Depends(check_auth)):
+    """Создать новую категорию сайтов"""
+    try:
+        data = await request.json()
+        cat_id = data.get("id", "").strip().lower()
+        label = data.get("label", "").strip()
+        cm_enabled = data.get("content_match_enabled", False)
+        sort_order = data.get("sort_order", 99)
+        if not cat_id or not label:
+            return JSONResponse({"status": "error", "msg": "id and label required"}, status_code=400)
+        if not re.match(r'^[a-z0-9_]+$', cat_id):
+            return JSONResponse({"status": "error", "msg": "id must be lowercase alphanumeric with underscores"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO site_categories (id, label, content_match_enabled, sort_order)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label,
+                content_match_enabled = EXCLUDED.content_match_enabled,
+                sort_order = EXCLUDED.sort_order
+        """, (cat_id, label, cm_enabled, sort_order))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "msg": f"Category '{label}' created/updated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.put("/api/site-categories/{cat_id}")
+async def update_site_category(cat_id: str, request: Request, auth: bool = Depends(check_auth)):
+    """Обновить категорию сайтов"""
+    try:
+        data = await request.json()
+        label = data.get("label", "").strip()
+        cm_enabled = data.get("content_match_enabled")
+        sort_order = data.get("sort_order")
+        if not label:
+            return JSONResponse({"status": "error", "msg": "label required"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE site_categories SET label = %s,
+                content_match_enabled = COALESCE(%s, content_match_enabled),
+                sort_order = COALESCE(%s, sort_order)
+            WHERE id = %s
+        """, (label, cm_enabled, sort_order, cat_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "msg": f"Category '{cat_id}' updated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.delete("/api/site-categories/{cat_id}")
+async def delete_site_category(cat_id: str, auth: bool = Depends(check_auth)):
+    """Удалить категорию (сайты перемещаются в 'external')"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Move sites to external
+        cur.execute("UPDATE monitored_sites SET site_group = 'external' WHERE site_group = %s", (cat_id,))
+        # Delete category
+        cur.execute("DELETE FROM site_categories WHERE id = %s", (cat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "msg": f"Category '{cat_id}' deleted, sites moved to external"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
@@ -2647,35 +2856,33 @@ async def _index_stream():
 
     cur.execute("""
         SELECT 
-            CASE WHEN site = ANY(%s) THEN 0
-                 WHEN site = ANY(%s) THEN 1
-                 ELSE 2 END as grp,
-            ROUND(SUM(status_200_count) * 100.0 
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            ROUND((SUM(avg_response_time * checks_count) 
-                  / NULLIF(SUM(checks_count), 0))::numeric, 3) as resp
-        FROM checks_agg 
-        WHERE bucket > NOW() - INTERVAL '30 days'
-          AND site <> ALL(%s)
+            COALESCE((SELECT sort_order FROM site_categories WHERE id = ms.site_group), 2) as grp,
+            ROUND(SUM(ca.status_200_count) * 100.0 
+                  / NULLIF(SUM(ca.checks_count), 0)::numeric, 2) as upt,
+            ROUND((SUM(ca.avg_response_time * ca.checks_count) 
+                  / NULLIF(SUM(ca.checks_count), 0))::numeric, 3) as resp
+        FROM checks_agg ca
+        JOIN monitored_sites ms ON ca.site = ms.site
+        WHERE ca.bucket > NOW() - INTERVAL '30 days'
+          AND ca.site <> ALL(%s)
         GROUP BY grp
-    """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
+    """, (SELF_MONITORING_SITES,))
     group_agg_rows = cur.fetchall()
     if group_agg_rows and group_agg_rows[0][0] is not None:
         group_agg = {r['grp']: r for r in group_agg_rows}
     else:
         cur.execute("""
             SELECT 
-                CASE WHEN site = ANY(%s) THEN 0
-                     WHEN site = ANY(%s) THEN 1
-                     ELSE 2 END as grp,
-                ROUND(COUNT(*) FILTER (WHERE status = 200) * 100.0
+                COALESCE((SELECT sort_order FROM site_categories WHERE id = ms.site_group), 2) as grp,
+                ROUND(COUNT(*) FILTER (WHERE l.status = 200) * 100.0
                       / NULLIF(COUNT(*), 0)::numeric, 2) as upt,
-                ROUND(AVG(response_time)::numeric, 3) as resp
-            FROM logs 
-            WHERE timestamp > NOW() - INTERVAL '30 days'
-              AND site <> ALL(%s)
+                ROUND(AVG(l.response_time)::numeric, 3) as resp
+            FROM logs l
+            JOIN monitored_sites ms ON l.site = ms.site
+            WHERE l.timestamp > NOW() - INTERVAL '30 days'
+              AND l.site <> ALL(%s)
             GROUP BY grp
-        """, (KEY_SITES, STDO_SITES, SELF_MONITORING_SITES))
+        """, (SELF_MONITORING_SITES,))
         group_agg = {r['grp']: r for r in cur.fetchall()}
 
     cur.execute("""
@@ -2980,12 +3187,24 @@ def _build_body(data: dict) -> str:
             return 1
         return 2
 
-    settings = load_settings()
-    group_names = {
-        0: settings.get('category_key_label', 'Ключевые'),
-        1: settings.get('category_stdo_label', 'СТДО'),
-        2: settings.get('category_external_label', 'Внешние сайты')
-    }
+    # Load dynamic categories
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, label, sort_order FROM site_categories ORDER BY sort_order")
+    db_cats = cur.fetchall()
+    cur.close()
+    conn.close()
+    cat_ids = [c[0] for c in db_cats]
+    cat_index = {c[0]: i for i, c in enumerate(db_cats)}
+    group_names = {i: c[1] for i, c in enumerate(db_cats)}
+
+    def get_site_group(site_name):
+        if site_name in KEY_SITES:
+            return cat_index.get('key', 0)
+        if site_name in STDO_SITES:
+            return cat_index.get('stdo', 1)
+        return cat_index.get('external', 2)
+
     sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
     key_sites_json = json.dumps(KEY_SITES)
@@ -2993,10 +3212,12 @@ def _build_body(data: dict) -> str:
     external_sites_json = json.dumps(EXTERNAL_SITES)
 
     group_stats = {}
-    for g in [0, 1, 2]:
-        group_sites = [s for s in sorted_sites if get_site_group(s) == g]
+    for c in db_cats:
+        cat_id = c[0]
+        cat_idx = cat_index[cat_id]
+        group_sites = [s for s in sorted_sites if get_site_group(s) == cat_idx]
         group_valid = [latest[s] for s in group_sites if s in latest]
-        g_row = group_agg.get(g)
+        g_row = group_agg.get(cat_idx)
         if g_row and g_row.get('upt') is not None:
             g_upt = float(g_row['upt'])
             g_resp = float(g_row['resp'] or 0)
@@ -3007,7 +3228,7 @@ def _build_body(data: dict) -> str:
             else:
                 g_upt, g_resp = 0, 0
         g_online = sum(1 for v in group_valid if v['status'] == 200) if group_valid else 0
-        group_stats[g] = {
+        group_stats[cat_idx] = {
             'online': g_online, 'total': len(group_sites),
             'upt': float(g_upt), 'resp': float(g_resp)
         }
