@@ -38,7 +38,8 @@ NEW_MONITORING_SITES = [
     "agpp.tdms.nipigas.ru/cp/",
     "agpp.tdms.nipigas.ru/DMS21/",
     "tst-stdo.tdms.sibur.ru/cp/",
-    "cp.tdms.sibur.ru/cp/"
+    "cp.tdms.sibur.ru/cp/",
+    "portal-rd.rusproject.ru"
 ]
 
 SELF_MONITORING_SITES = [
@@ -563,6 +564,7 @@ def init_db():
             ("photo.sibur.ru", "external"),
             ("polylabsearch.ru", "external"),
             ("portenergo.com", "external"),
+            ("portal-rd.rusproject.ru", "external"),
             ("rusvinyl.ru", "external"),
             ("sharefile.sibur.ru", "external"),
             ("sibur.digital", "external"),
@@ -614,7 +616,7 @@ def init_db():
     """)
     cur.execute("""
         INSERT INTO app_settings (key, value) VALUES
-            ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization'),
+            ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ'),
             ('category_key_label', 'Ключевые'),
             ('category_stdo_label', 'СТДО'),
             ('category_external_label', 'Внешние сайты')
@@ -1654,6 +1656,19 @@ async def startup_event():
             conn.commit()
         except Exception as e:
             print(f"[STARTUP WARN] Pattern update: {e}")
+        # Миграция: добавить portal-rd.rusproject.ru если отсутствует
+        try:
+            cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'portal-rd.rusproject.ru'")
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+                    VALUES ('portal-rd.rusproject.ru', 'external', 2, TRUE)
+                    ON CONFLICT DO NOTHING
+                """)
+                conn.commit()
+                print("[STARTUP] Added portal-rd.rusproject.ru to monitored_sites")
+        except Exception as e:
+            print(f"[STARTUP WARN] portal-rd migration: {e}")
         cur.close()
         conn.close()
     except Exception as e:
@@ -1801,13 +1816,20 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         cur = conn.cursor(cursor_factory=DictCursor)
         cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
+        # Load categories for dynamic badges
+        cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
+        cat_rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
     except Exception:
         rows = []
+        cat_rows = []
 
     H = []
-    H.append("""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
+    # Pass categories to JS for dynamic badge rendering
+    cat_json = json.dumps({c['id']: c['label'] for c in cat_rows})
+    H.append(f"""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
+    <script>window._adminCategories = {cat_json};</script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }
@@ -1837,6 +1859,11 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         .badge-key { background: #fef3c7; color: #92400e; }
         .badge-stdo { background: #dbeafe; color: #1e40af; }
         .badge-ext { background: #f3f4f6; color: #4b5563; }
+        /* Dynamic category badges */
+        .badge-cat { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+        .badge-cat[data-cat="key"] { background: #fef3c7; color: #92400e; }
+        .badge-cat[data-cat="stdo"] { background: #dbeafe; color: #1e40af; }
+        .badge-cat[data-cat="external"] { background: #f3f4f6; color: #4b5563; }
         .actions { display: flex; gap: 4px; flex-wrap: nowrap; }
         .actions .btn { white-space: nowrap; }
         .row-disabled td { opacity: 0.6; background: #f8fafc; }
@@ -1871,9 +1898,10 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         </div>
         <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
+    cat_labels = {c['id']: c['label'] for c in cat_rows}
     for r in rows:
-        badge = 'badge-key' if r['site_group'] == 'key' else ('badge-stdo' if r['site_group'] == 'stdo' else 'badge-ext')
-        grp_name = '⭐ Ключевой' if r['site_group'] == 'key' else ('🛡️ СТДО' if r['site_group'] == 'stdo' else '🌐 Внешний')
+        badge = 'badge-cat'
+        grp_name = cat_labels.get(r['site_group'], r['site_group'])
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
         site_esc = r['site'].replace("'", "\'")
@@ -1884,7 +1912,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         )
         H.append(f"""<tr class="{disabled_cls}" id="row-{site_esc}">
             <td><strong>{r['site']}</strong></td>
-            <td><span class="badge {badge}">{grp_name}</span></td>
+            <td><span class="badge badge-cat" data-cat="{r['site_group']}">{grp_name}</span></td>
             <td>{status}</td>
             <td>{r['alert_threshold']}</td>
             <td>
@@ -2482,8 +2510,12 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         threshold = int(data.get("threshold", 5))
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
-        if group not in ('key', 'stdo', 'external'):
-            return JSONResponse({"status": "error", "msg": "group must be key/stdo/external"}, status_code=400)
+        # Validate group against DB categories
+        cur.execute("SELECT id FROM site_categories")
+        valid_groups = [r[0] for r in cur.fetchall()]
+        cur.close()
+        if group not in valid_groups:
+            return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         if threshold < 1 or threshold > 60:
             return JSONResponse({"status": "error", "msg": "threshold must be 1-60"}, status_code=400)
         if site in SELF_MONITORING_SITES:
