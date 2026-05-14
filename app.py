@@ -1835,20 +1835,29 @@ async def admin_auth(request: Request, response: Response):
 async def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
     """Страница управления сайтами (требует admin-пароль) + Self Monitoring"""
     if admin_session != "authenticated_admin":
-        return RedirectResponse(url='/admin/login', status_code=302)
+        # HTML-редирект + удаление возможной stale cookie с secure=True
+        return HTMLResponse("""<script>document.cookie='admin_session=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;';location.href='/admin/login';</script>""")
+    try:
+        return await _admin_page_inner(request, response)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[ADMIN PAGE FATAL] {e}\n{tb}")
+        return HTMLResponse(f"""<html><body style="padding:20px;font-family:monospace"><h2 style="color:#dc2626">Ошибка: {e}</h2><pre style="background:#fee2e2;padding:15px;border-radius:8px;overflow:auto">{tb}</pre><p><a href="/">← Назад</a></p></body></html>""", status_code=500)
+
+async def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
         cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
-        # Load categories for dynamic badges
         cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
         cat_rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
     except Exception as e:
         import traceback
-        print(f"[ADMIN PAGE ERROR] {e}")
+        print(f"[ADMIN PAGE DB ERROR] {e}")
         traceback.print_exc()
         rows = []
         cat_rows = []
