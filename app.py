@@ -2444,6 +2444,7 @@ async def create_site_category(request: Request, auth: bool = Depends(check_auth
         conn.commit()
         cur.close()
         conn.close()
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Category '{label}' created/updated"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -2470,6 +2471,7 @@ async def update_site_category(cat_id: str, request: Request, auth: bool = Depen
         conn.commit()
         cur.close()
         conn.close()
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Category '{cat_id}' updated"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -2488,6 +2490,7 @@ async def delete_site_category(cat_id: str, auth: bool = Depends(check_auth)):
         conn.commit()
         cur.close()
         conn.close()
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Category '{cat_id}' deleted, sites moved to external"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -2570,6 +2573,7 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         conn.commit()
         cur.close()
         conn.close()
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Site '{site}' added"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -2602,6 +2606,7 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(che
         conn.close()
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Site '{site_name}' updated"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -2627,6 +2632,7 @@ async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
         conn.close()
         if row is None:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        _invalidate_dashboard_cache()
         new_status = "enabled" if row[0] else "disabled"
         return {"status": "ok", "msg": f"Site '{site_name}' {new_status}", "is_active": row[0]}
     except Exception as e:
@@ -2648,6 +2654,7 @@ async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
         conn.close()
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Site '{site_name}' deleted"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -3098,12 +3105,51 @@ async def _index_stream():
 
     active_incidents = [r for r in incidents_list if not r.get('resolved', True)]
 
+    # Загружаем динамические категории + сайты по категориям
+    conn2 = get_db_connection()
+    cur2 = conn2.cursor(cursor_factory=DictCursor)
+    cur2.execute("SELECT id, label, sort_order FROM site_categories ORDER BY sort_order")
+    db_cats_list = [dict(r) for r in cur2.fetchall()]
+    cur2.execute("SELECT site, site_group FROM monitored_sites WHERE site_group != 'self' ORDER BY site")
+    monitored_rows = cur2.fetchall()
+    cur2.close()
+    conn2.close()
+
+    # Собираем сайты по категориям
+    sites_by_cat = {}
+    for r in monitored_rows:
+        sg = r['site_group'] or 'external'
+        sites_by_cat.setdefault(sg, []).append(r['site'])
+    # Добавляем сайты не из monitored_sites во 'external'
+    for s in SITES:
+        found = False
+        for cat_sites in sites_by_cat.values():
+            if s in cat_sites:
+                found = True
+                break
+        if not found:
+            sites_by_cat.setdefault('external', []).append(s)
+
+    categories_data = []
+    for cat in db_cats_list:
+        cat_id = cat['id']
+        cat_sites = sites_by_cat.get(cat_id, [])
+        categories_data.append({
+            'id': cat_id,
+            'label': cat['label'],
+            'sort_order': cat['sort_order'],
+            'sites': cat_sites
+        })
+
     data = {
         "s30": s30, "s24": s24,
         "latest": latest, "stats": stats,
         "incidents": incidents_list,
         "active_incidents": active_incidents,
         "group_agg": group_agg,
+        "categories": categories_data,
+        "sites_by_cat": sites_by_cat,
+        "db_cats": db_cats_list,
         "now_msk": datetime.datetime.now(TZ_MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
     }
     with _dashboard_cache["lock"]:
@@ -3301,40 +3347,41 @@ def _build_body(data: dict) -> str:
     active_incidents_count = len({r['site'] for r in active_incidents})
     offline_count = len(incidents)
 
-    def get_site_group(site_name):
-        if site_name in KEY_SITES:
-            return 0
-        if site_name in STDO_SITES:
-            return 1
-        return 2
+    # Динамические категории из данных (загружены в _index_stream)
+    categories = data.get("categories", [])
+    sites_by_cat = data.get("sites_by_cat", {})
+    db_cats = data.get("db_cats", [])
 
-    # Load dynamic categories
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, label, sort_order FROM site_categories ORDER BY sort_order")
-    db_cats = cur.fetchall()
-    cur.close()
-    conn.close()
-    cat_ids = [c[0] for c in db_cats]
-    cat_index = {c[0]: i for i, c in enumerate(db_cats)}
-    group_names = {i: c[1] for i, c in enumerate(db_cats)}
+    # Build cat index: cat_id -> sort_index
+    cat_index = {c['id']: i for i, c in enumerate(db_cats)}
+    group_names = {i: c['label'] for i, c in enumerate(db_cats)}
+
+    # Site -> group index
+    site_to_cat = {}
+    for cat_id, sites_list in sites_by_cat.items():
+        idx = cat_index.get(cat_id, 999)
+        for s in sites_list:
+            site_to_cat[s] = idx
 
     def get_site_group(site_name):
-        if site_name in KEY_SITES:
-            return cat_index.get('key', 0)
-        if site_name in STDO_SITES:
-            return cat_index.get('stdo', 1)
-        return cat_index.get('external', 2)
+        return site_to_cat.get(site_name, 999)
 
     sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
-    key_sites_json = json.dumps(KEY_SITES)
-    stdo_sites_json = json.dumps(STDO_SITES)
-    external_sites_json = json.dumps(EXTERNAL_SITES)
+
+    # Build categoriesData for JS: [{id, label, sites}]
+    categories_data_js = []
+    for cat in categories:
+        categories_data_js.append({
+            'id': cat['id'],
+            'label': cat['label'],
+            'sites': cat['sites']
+        })
+    categories_json = json.dumps(categories_data_js)
 
     group_stats = {}
     for c in db_cats:
-        cat_id = c[0]
+        cat_id = c['id']
         cat_idx = cat_index[cat_id]
         group_sites = [s for s in sorted_sites if get_site_group(s) == cat_idx]
         group_valid = [latest[s] for s in group_sites if s in latest]
@@ -3356,9 +3403,7 @@ def _build_body(data: dict) -> str:
     group_stats_json = json.dumps(group_stats)
 
     js_vars = {
-        'key_sites_json': key_sites_json,
-        'stdo_sites_json': stdo_sites_json,
-        'external_sites_json': external_sites_json,
+        'categories_json': categories_json,
         'group_stats_json': group_stats_json,
     }
 
@@ -3419,7 +3464,8 @@ def _build_body(data: dict) -> str:
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
         is_err = (v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or
                   (0 <= v['domain_days'] <= 30) or v.get('ssl_chain_valid') == False)
-        prefix = "🛡️ " if s in STDO_SITES else ("⭐ " if s in KEY_SITES else "")
+        g_idx = get_site_group(s)
+        prefix = "⭐ " if g_idx == 0 else ("🛡️ " if g_idx == 1 else "")
 
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
@@ -3501,9 +3547,7 @@ def _build_body(data: dict) -> str:
     let chartsLoading = false;
     let showingAll = false;
 
-    const keySites = $key_sites_json;
-    const stdoSites = $stdo_sites_json;
-    const externalSites = $external_sites_json;
+    const categoriesData = $categories_json;
     const groupStats = $group_stats_json;
 
     function tab(e, n){
@@ -3580,23 +3624,10 @@ def _build_body(data: dict) -> str:
             const container = document.getElementById('charts-container');
             container.innerHTML = '';
 
-            renderChartSection('Ключевые', 0, keySites, g_data, container);
-            renderChartSection('СТДО', 1, stdoSites, g_data, container);
-
-            if (showingAll) {
-                renderChartSection('Внешние сайты', 2, externalSites, g_data, container);
-            } else {
-                const btnDiv = document.createElement('div');
-                btnDiv.style.textAlign = 'center';
-                btnDiv.style.padding = '20px';
-                btnDiv.style.gridColumn = '1 / -1';
-                const btn = document.createElement('button');
-                btn.innerText = 'Показать все внешние сайты';
-                btn.className = 'tab-btn';
-                btn.style.cursor = 'pointer';
-                btn.onclick = () => { showingAll = true; chartsLoaded = false; loadCharts(); };
-                btnDiv.appendChild(btn);
-                container.appendChild(btnDiv);
+            // Рендерим графики по динамическим категориям
+            for (let i = 0; i < categoriesData.length; i++) {
+                const cat = categoriesData[i];
+                renderChartSection(cat.label, i, cat.sites, g_data, container);
             }
 
             chartsLoaded = true;
