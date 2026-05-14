@@ -21,7 +21,7 @@ from string import Template
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
@@ -512,6 +512,19 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Миграция: добавить отсутствующие столбцы в monitored_sites
+    if not _column_exists(cur, 'monitored_sites', 'site_group'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN site_group TEXT DEFAULT 'external'")
+        print("[INIT] Migrated: added site_group column")
+    if not _column_exists(cur, 'monitored_sites', 'is_active'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN is_active BOOLEAN DEFAULT TRUE")
+        print("[INIT] Migrated: added is_active column")
+    if not _column_exists(cur, 'monitored_sites', 'alert_threshold'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN alert_threshold INTEGER DEFAULT 5")
+        print("[INIT] Migrated: added alert_threshold column")
+    if not _column_exists(cur, 'monitored_sites', 'created_at'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        print("[INIT] Migrated: added created_at column")
     # Таблица категорий сайтов (динамические)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS site_categories (
@@ -1797,7 +1810,6 @@ async def admin_auth(request: Request, response: Response):
                 value="authenticated_admin",
                 max_age=2592000,
                 httponly=True,
-                secure=True,
                 samesite="lax"
             )
             return {"status": "ok"}
@@ -1810,7 +1822,7 @@ async def admin_auth(request: Request, response: Response):
 async def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
     """Страница управления сайтами (требует admin-пароль) + Self Monitoring"""
     if admin_session != "authenticated_admin":
-        return HTMLResponse("""<script>location.href='/admin/login';</script>""", status_code=302)
+        return RedirectResponse(url='/admin/login', status_code=302)
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
@@ -1821,7 +1833,10 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         cat_rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
-    except Exception:
+    except Exception as e:
+        import traceback
+        print(f"[ADMIN PAGE ERROR] {e}")
+        traceback.print_exc()
         rows = []
         cat_rows = []
 
@@ -1904,7 +1919,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         grp_name = cat_labels.get(r['site_group'], r['site_group'])
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
-        site_esc = r['site'].replace("'", "\'")
+        site_esc = r['site'].replace("'", "\\'")
         toggle_btn = (
             '<button class="btn btn-gray" onclick="toggleSite(' + "'" + site_esc + "'" + ')">🛑 Отключить</button>'
             if r['is_active']
