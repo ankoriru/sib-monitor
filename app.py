@@ -909,6 +909,9 @@ async def check_single_site(session, site, semaphore):
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
+                elif curr_status == 401:
+                    # 401 = сервер работает, требует авторизацию — считаем OK
+                    curr_status = 200
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
@@ -1699,11 +1702,21 @@ async def startup_event():
                 resolved = TRUE
             WHERE resolved = FALSE
               AND site IN (
-                  SELECT site FROM latest_status WHERE status = 200
+                  SELECT site FROM latest_status WHERE status = 200 OR status = 401
               )
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Closed {cur.rowcount} stale unresolved incidents for online sites")
+        # Force-close incidents for sites that return 401 (auth required = online)
+        cur.execute("""
+            UPDATE incidents
+            SET end_time = NOW(),
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                resolved = TRUE
+            WHERE resolved = FALSE AND site = 'sharefile.sibur.ru'
+        """)
+        if cur.rowcount > 0:
+            print(f"[STARTUP] Force-closed {cur.rowcount} incidents for sharefile.sibur.ru (401=online)")
         conn.commit()
         cur.close()
         conn.close()
