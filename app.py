@@ -47,7 +47,7 @@ SELF_MONITORING_SITES = [
 
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
-CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization", re.IGNORECASE)
+CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ", re.IGNORECASE)
 
 # Глобальный кэш для динамического content match (обновляется из БД)
 _content_match_pattern = None
@@ -276,7 +276,7 @@ def load_active_sites():
 def load_settings():
     """Читает настройки приложения из БД. Fallback на дефолты."""
     defaults = {
-        'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization',
+        'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ',
         'category_key_label': 'Ключевые',
         'category_stdo_label': 'СТДО',
         'category_external_label': 'Внешние сайты'
@@ -883,7 +883,14 @@ async def check_single_site(session, site, semaphore):
                             print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
                         else:
                             curr_status = 701
-                            print(f"[CONTENT MISMATCH] {site} — no match in full text ({len(text)} chars)")
+                            # Диагностика: показать ВЕСЬ текст и найденные слова
+                            print(f"[CONTENT MISMATCH] {site} — text ({len(text)} chars): {repr(text_lower[:800])}")
+                            for kw in ['войдите', 'логин', 'пароль', 'login', 'password', 'sibur', 'сибур']:
+                                idx = text_lower.find(kw)
+                                if idx >= 0:
+                                    print(f"  FOUND '{kw}' at pos {idx}: ...{text_lower[max(0,idx-20):idx+len(kw)+20]}...")
+                                else:
+                                    print(f"  NOT FOUND: '{kw}'")
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
@@ -1619,6 +1626,17 @@ async def startup_event():
             cur.execute("INSERT INTO app_meta (key, value) VALUES ('sm_cleanup_v1', 'done') ON CONFLICT (key) DO NOTHING")
             conn.commit()
             print("[STARTUP] Self-monitoring cleanup done (one-time)")
+        # Обновление content match паттерна при старте
+        try:
+            cur.execute("""
+                UPDATE app_settings SET value = 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ'
+                WHERE key = 'content_match_pattern' AND value NOT LIKE '%транспорт%'
+            """)
+            if cur.rowcount > 0:
+                print(f"[STARTUP] Content match pattern updated ({cur.rowcount} rows)")
+            conn.commit()
+        except Exception as e:
+            print(f"[STARTUP WARN] Pattern update: {e}")
         cur.close()
         conn.close()
     except Exception as e:
