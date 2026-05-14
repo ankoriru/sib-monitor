@@ -1863,10 +1863,8 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         <div id="sites-tab" class="tab-content active-content">
         <div class="add-form">
             <input type="text" id="newSite" placeholder="site.ru" style="flex:1;min-width:200px;">
-            <select id="newGroup">
-                <option value="external">🌐 Внешний</option>
-                <option value="key">⭐ Ключевой</option>
-                <option value="stdo">🛡️ СТДО</option>
+            <select id="newGroup" data-dynamic="categories">
+                <option value="">Загрузка...</option>
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
@@ -1896,10 +1894,8 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
                     <button class="btn btn-danger" onclick="deleteSite('{site_esc}')">🗑️ Удалить</button>
                 </div>
                 <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;">
-                    <select id="grp-{site_esc}" style="width:120px;">
-                        <option value="external" {'selected' if r['site_group']=='external' else ''}>🌐 Внешний</option>
-                        <option value="key" {'selected' if r['site_group']=='key' else ''}>⭐ Ключевой</option>
-                        <option value="stdo" {'selected' if r['site_group']=='stdo' else ''}>🛡️ СТДО</option>
+                    <select id="grp-{site_esc}" data-group="{r['site_group']}" data-dynamic="categories" style="width:120px;">
+                        <option value="">Загрузка...</option>
                     </select>
                     <input type="number" id="thr-{site_esc}" value="{r['alert_threshold']}" min="1" max="60" style="width:70px;">
                     <button class="btn btn-primary" onclick="saveRow('{site_esc}')">💾 Сохранить</button>
@@ -1970,6 +1966,7 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         target.classList.add('active-content');
         btn.classList.add('active');
         console.log('Tab activated:', n);
+        if (n === 'sites-tab') loadCategorySelects();
         if (n === 'settings-tab') loadSettings();
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
@@ -2074,6 +2071,30 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
             msg.textContent = 'Ошибка сети';
             console.error('saveSettings error:', e);
         }
+    }
+    window.loadCategorySelects = async function() {
+        try {
+            var r = await fetch('/api/site-categories');
+            var d = await r.json();
+            if (d.status !== 'ok' || !d.categories) return;
+            var cats = d.categories;
+            // Заполняем все select[data-dynamic="categories"]
+            var selects = document.querySelectorAll('select[data-dynamic="categories"]');
+            selects.forEach(function(sel) {
+                var currentVal = sel.value;
+                var dataGroup = sel.getAttribute('data-group');
+                sel.innerHTML = '';
+                cats.forEach(function(c) {
+                    var opt = document.createElement('option');
+                    opt.value = c.id;
+                    opt.textContent = c.label;
+                    sel.appendChild(opt);
+                });
+                // Восстанавливаем выбранное
+                if (currentVal) sel.value = currentVal;
+                else if (dataGroup) sel.value = dataGroup;
+            });
+        } catch(e) { console.error('loadCategorySelects error:', e); }
     }
     window.loadSelfMonitoring = async function() {
         const loading = document.getElementById('self-loading');
