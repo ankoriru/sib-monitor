@@ -1011,7 +1011,7 @@ def flush_batch():
 # ИНЦИДЕНТЫ — запись из worker
 # ============================================================================
 def _db_incident_start(site, status, ssl_chain_valid=None, start_time=None):
-    """Фиксирует начало инцидента. start_time — время первого фейла (по умолчанию NOW())."""
+    """Фиксирует начало инцидента. Если активный уже есть — обновляет max_status, не дублирует."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1022,6 +1022,23 @@ def _db_incident_start(site, status, ssl_chain_valid=None, start_time=None):
             701: 'Content Mismatch'
         }.get(status, 'Server Error')
         ts = start_time if start_time else datetime.datetime.now()
+        # Проверяем: есть ли уже активный инцидент для этого сайта
+        cur.execute("SELECT id FROM incidents WHERE site = %s AND resolved = FALSE LIMIT 1", (site,))
+        existing = cur.fetchone()
+        if existing:
+            # Активный инцидент уже есть — обновляем max_status
+            cur.execute("""
+                UPDATE incidents
+                SET max_status = GREATEST(COALESCE(max_status, 0), %s),
+                    description = %s,
+                    ssl_chain_valid = COALESCE(%s, ssl_chain_valid)
+                WHERE id = %s
+            """, (status, description, ssl_chain_valid, existing[0]))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return
+        # Активного нет — создаём новый
         cur.execute("""
             INSERT INTO incidents (site, start_time, max_status, description, ssl_chain_valid)
             VALUES (%s, %s, %s, %s, %s)
@@ -1066,7 +1083,7 @@ def _db_incident_resolve(site):
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = GREATEST(1, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
                 resolved = TRUE
             WHERE site = %s AND resolved = FALSE
         """, (site,))
@@ -1650,7 +1667,7 @@ async def startup_event():
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
-                duration_min = GREATEST(1, CEIL(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
                 resolved = TRUE
             WHERE resolved = FALSE
               AND site IN (
