@@ -1954,9 +1954,9 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     </div>
     <div id="toast" class="toast"></div>
     <script>
-    document.addEventListener('DOMContentLoaded', function() {
+    // Скрипт в конце body — DOM уже готов, вызываем сразу
     // Загрузить категории при первой загрузке страницы
-    setTimeout(loadCategorySelects, 100);
+    setTimeout(function() { if (window.loadCategorySelects) loadCategorySelects(); }, 100);
     window.adminTab = function(btn, n) {
         console.log('adminTab clicked:', n);
         var i, x = document.getElementsByClassName('tab-content'),
@@ -2253,7 +2253,6 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
         setTimeout(() => { t.style.display = 'none'; }, 3000);
     }
-    });
     </script></body></html>""")
     return HTMLResponse("".join(H))
 
