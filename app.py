@@ -1868,8 +1868,8 @@ async def _admin_page_inner(request, response):
     H.append(f"""<html><head><meta charset="UTF-8"><title>Управление сайтами</title>
     <script>window._adminCategories = {cat_json};</script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }
+    <style>""")
+    H.append("""        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }")
         .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         h1 { color: #00717a; margin: 0 0 20px; }
         .tabs { display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
