@@ -1955,6 +1955,8 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
     <div id="toast" class="toast"></div>
     <script>
     document.addEventListener('DOMContentLoaded', function() {
+    // Загрузить категории при первой загрузке страницы
+    setTimeout(loadCategorySelects, 100);
     window.adminTab = function(btn, n) {
         console.log('adminTab clicked:', n);
         var i, x = document.getElementsByClassName('tab-content'),
