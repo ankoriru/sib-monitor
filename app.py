@@ -3170,18 +3170,27 @@ def _build_body(data: dict) -> str:
                     if v['response_time'] > 20 and v['status'] == 200]
     active_incidents = data.get("active_incidents", [])
 
-    all_warn_list = (
-        [f"❌ {s} (Offline)" for s in incidents]
-        + [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
+    # Сборка предупреждений: объединяем ❌ + ⚠️ в одну строку
+    # Билдим lookup: site → incident info
+    inc_lookup = {r['site']: f", Инцидент {r['dur']} мин, {r['description']}" for r in active_incidents}
+    all_warn_list = []
+    for s in incidents:
+        line = f"❌ {s} (Offline){inc_lookup.pop(s, '')}"
+        all_warn_list.append(line)
+    # Добавляем оставшиеся инциденты (не связанные с offline)
+    for r in active_incidents:
+        if r['site'] not in incidents:
+            all_warn_list.append(f"⚠️ {r['site']} (Инцидент {r['dur']} мин, {r['description']})")
+    all_warn_list += (
+        [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
         + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)"
            for s in latency_warn]
-        + [f"⚠️ {r['site']} (Инцидент {r['dur']} мин, {r['description']})"
-           for r in active_incidents]
     )
 
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
     total_sites = len(SITES)
-    active_incidents_count = len(active_incidents)
+    # Уникальные активные инциденты (1 на сайт)
+    active_incidents_count = len({r['site'] for r in active_incidents})
     offline_count = len(incidents)
 
     def get_site_group(site_name):
@@ -3269,7 +3278,7 @@ def _build_body(data: dict) -> str:
                 <strong><br>{s24['resp']}с / {s30['resp']}с</strong>
             </div>
             <div class="kpi-card {'danger-card' if active_incidents_count > 0 or offline_count > 0 else ''}">
-                <span>Инциденты</span><strong><br>{active_incidents_count + offline_count}</strong>
+                <span>Инциденты</span><strong><br>{active_incidents_count}</strong>
                 {f'<br><span style="font-size:11px;color:#dc2626;">({active_incidents_count} active)</span>' if active_incidents_count > 0 else ''}
             </div>
             <div class="kpi-card {'danger-card' if ssl_warn else ''}">
