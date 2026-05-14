@@ -78,7 +78,7 @@ SITES = [
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
     "rusvinyl.ru", "sharefile.sibur.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
-    "snck.ru", "tu-sibur.ru", "vivilen.sibur.ru"
+    "snck.ru", "transportorder.sibur.ru", "tu-sibur.ru", "vivilen.sibur.ru"
 ] + NEW_MONITORING_SITES
 
 PRIORITY_SITES = [
@@ -86,7 +86,7 @@ PRIORITY_SITES = [
 ] + NEW_MONITORING_SITES
 
 # --- Группировка сайтов для UI ---
-KEY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"]
+KEY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru", "transportorder.sibur.ru"]
 STDO_SITES = NEW_MONITORING_SITES[:]
 EXTERNAL_SITES = [s for s in SITES if s not in KEY_SITES and s not in STDO_SITES]
 
@@ -571,6 +571,7 @@ def init_db():
             ("sibur-yug.ru", "external"),
             ("snck.ru", "external"),
             ("tu-sibur.ru", "external"),
+            ("transportorder.sibur.ru", "key"),
             ("vivilen.sibur.ru", "external"),
         ]
         # STDO сайты
@@ -621,6 +622,15 @@ def init_db():
     """)
     if cur.rowcount > 0:
         print(f"[INIT] Seeded app_settings: {cur.rowcount} defaults")
+
+    # Миграция: transportorder.sibur.ru → key
+    cur.execute("SELECT value FROM app_meta WHERE key = 'transportorder_key'")
+    if not cur.fetchone():
+        cur.execute("UPDATE monitored_sites SET site_group = 'key' WHERE site = 'transportorder.sibur.ru'")
+        if cur.rowcount > 0:
+            print(f"[INIT] Moved transportorder.sibur.ru to 'key' category")
+        cur.execute("INSERT INTO app_meta (key, value) VALUES ('transportorder_key', 'done') ON CONFLICT (key) DO NOTHING")
+        conn.commit()
 
     conn.commit()
     cur.close()
@@ -872,19 +882,27 @@ async def check_single_site(session, site, semaphore):
                 curr_status = resp.status
                 resp_time = time.time() - start
                 # Content match для сайтов с включенным content match в их категории
-                print(f"[CM DEBUG] {site}: status={curr_status} in_cm={site in _cm_sites_set} cm_set_size={len(_cm_sites_set)} regex={_content_match_regex.pattern[:50]}")
+                print(f"[CM DEBUG] {site}: status={curr_status} in_cm={site in _cm_sites_set}")
                 if site in _cm_sites_set and curr_status in (200, 401):
                     try:
-                        text = await asyncio.wait_for(resp.text(), timeout=3)
-                        text_preview = text[:500].replace('\n', ' ').replace('\r', '')
-                        match_found = _content_match_regex.search(text)
-                        print(f"[CM DEBUG] {site}: text_preview={text_preview[:200]} match={bool(match_found)}")
+                        text = await asyncio.wait_for(resp.text(), timeout=10)
+                        text_lower = text.lower()
+                        match_found = _content_match_regex.search(text_lower)
+                        preview_start = text_lower.find('sibur')
+                        if preview_start == -1:
+                            preview_start = text_lower.find('login')
+                        if preview_start == -1:
+                            preview_start = text_lower.find('auth')
+                        if preview_start == -1:
+                            preview_start = 0
+                        text_preview = text_lower[preview_start:preview_start+200]
+                        print(f"[CM DEBUG] {site}: match={bool(match_found)} preview={text_preview[:150]}")
                         if match_found:
                             curr_status = 200
                             print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
                         else:
                             curr_status = 701
-                            print(f"[CONTENT MISMATCH] {site} — no match in preview")
+                            print(f"[CONTENT MISMATCH] {site} — no match in full text ({len(text)} chars)")
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
