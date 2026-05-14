@@ -47,7 +47,7 @@ SELF_MONITORING_SITES = [
 
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
-CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login", re.IGNORECASE)
+CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization", re.IGNORECASE)
 
 # Глобальный кэш для динамического content match (обновляется из БД)
 _content_match_pattern = None
@@ -265,7 +265,7 @@ def load_active_sites():
 def load_settings():
     """Читает настройки приложения из БД. Fallback на дефолты."""
     defaults = {
-        'content_match_pattern': 'sibur|сибур|логин|пароль|login',
+        'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization',
         'category_key_label': 'Ключевые',
         'category_stdo_label': 'СТДО',
         'category_external_label': 'Внешние сайты'
@@ -580,7 +580,7 @@ def init_db():
     """)
     cur.execute("""
         INSERT INTO app_settings (key, value) VALUES
-            ('content_match_pattern', 'sibur|сибур|логин|пароль|login'),
+            ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization'),
             ('category_key_label', 'Ключевые'),
             ('category_stdo_label', 'СТДО'),
             ('category_external_label', 'Внешние сайты')
@@ -838,16 +838,20 @@ async def check_single_site(session, site, semaphore):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
-                # Content match для Ключевых сайтов
-                if curr_status == 200 and site in KEY_SITES:
+                # Content match для Ключевых сайтов (200 или 401 — страница авторизации)
+                if site in KEY_SITES and curr_status in (200, 401):
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=3)
-                        if not _content_match_regex.search(text):
+                        text_preview = text[:500].replace('\n', ' ').replace('\r', '')
+                        if _content_match_regex.search(text):
+                            curr_status = 200
+                            print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
+                        else:
                             curr_status = 701
-                            print(f"[CONTENT MISMATCH] {site}")
-                    except Exception:
+                            print(f"[CONTENT MISMATCH] {site} — text preview: {text_preview}")
+                    except Exception as e:
                         curr_status = 701
-                        print(f"[CONTENT MISMATCH] {site} — timeout")
+                        print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
@@ -1565,6 +1569,16 @@ async def startup_event():
             cur.execute("INSERT INTO app_meta (key, value) VALUES ('sm_cleanup_v1', 'done') ON CONFLICT (key) DO NOTHING")
             conn.commit()
             print("[STARTUP] Self-monitoring cleanup done (one-time)")
+        # Одноразовое обновление content match паттерна (v2)
+        cur.execute("SELECT value FROM app_meta WHERE key = 'cm_pattern_v2'")
+        if not cur.fetchone():
+            cur.execute("""
+                INSERT INTO app_settings (key, value) VALUES ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization')
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """)
+            cur.execute("INSERT INTO app_meta (key, value) VALUES ('cm_pattern_v2', 'done') ON CONFLICT (key) DO NOTHING")
+            conn.commit()
+            print("[STARTUP] Content match pattern updated to v2")
         cur.close()
         conn.close()
     except Exception as e:
