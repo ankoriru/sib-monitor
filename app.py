@@ -264,13 +264,14 @@ def load_active_sites():
             return sites, categories, thresholds
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
-    # Fallback
+    # Fallback — всегда возвращаем 3 значения (sites, categories, thresholds)
     all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
+    categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
-    return all_sites, key, stdo, ext, thresholds
+    return all_sites, categories, thresholds
 
 
 
@@ -1310,7 +1311,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if fail_count[site] >= alert_threshold and was_up:
                 # Порог превышен — создаём инцидент + алерт
                 incident_start = first_fail_time.get(site) or datetime.datetime.now()
-                print(f"[INCIDENT START] {site} (start: {incident_start})")
+                print(f"[INCIDENT START] {site} fail={fail_count[site]} thr={alert_threshold} status={curr_status} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[ALERT TRIGGER] {site} fail={fail_count[site]} thr={alert_threshold}")
                 ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
@@ -1334,6 +1335,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
 
             fc = fail_count.get(site, 0)
             if fc >= thresholds.get(site, 5):
+                print(f"[INCIDENT RESOLVE] {site} after {fc} min down")
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
@@ -1486,7 +1488,9 @@ def check_worker():
                     del fail_count[site]
                     del last_latency_map[site]
 
-            print(f"[WORKER] {len(SITES)} sites, starting check cycle at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
+            print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
+            if not SITES:
+                print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
 
             # Быстрые HTTP-проверки обычных сайтов
             results = loop.run_until_complete(check_all_sites(SITES))
