@@ -37,7 +37,7 @@ SELF_MONITORING_SITES = [
 
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
-CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ", re.IGNORECASE)
+CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh", re.IGNORECASE)
 
 # Глобальный кэш для динамического content match (обновляется из БД)
 _content_match_pattern = None
@@ -254,11 +254,11 @@ def get_db_connection():
 
 def load_active_sites():
     """Читает список активных сайтов из БД. Fallback на дефолтный список. Self-monitoring исключены.
-    Возвращает: (sites, categories, thresholds, ssl_verify_map)"""
+    Возвращает: (sites, categories, thresholds, ssl_verify_map, cm_enabled_map)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, site_group, alert_threshold, ssl_verify FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
+        cur.execute("SELECT site, site_group, alert_threshold, ssl_verify, content_match_enabled FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
         rows = cur.fetchall()
         # Load dynamic categories from DB
         cur.execute("SELECT id, label, content_match_enabled FROM site_categories ORDER BY sort_order")
@@ -269,6 +269,7 @@ def load_active_sites():
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
             thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
             ssl_verify_map = {r[0]: (r[3] if r[3] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            cm_enabled_map = {r[0]: (r[4] if r[4] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
             print(f"[LOAD ACTIVE] Loaded {len(sites)} active sites from DB: {sites[:5]}...")
             # Build dynamic categories dict
             categories = {}
@@ -279,19 +280,22 @@ def load_active_sites():
             for r in rows:
                 if r[1] not in cat_ids and r[0] not in SELF_MONITORING_SITES:
                     categories.setdefault('external', []).append(r[0])
-            return sites, categories, thresholds, ssl_verify_map
+            return sites, categories, thresholds, ssl_verify_map, cm_enabled_map
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
-    # Fallback: load ssl_verify from DB for all sites in SITES
+    # Fallback: load settings from DB for all sites in SITES
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, ssl_verify FROM monitored_sites WHERE site = ANY(%s)", (list(SITES),))
-        db_ssl_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur.fetchall()}
+        cur.execute("SELECT site, ssl_verify, content_match_enabled FROM monitored_sites WHERE site = ANY(%s)", (list(SITES),))
+        db_rows = cur.fetchall()
+        db_ssl_map = {r[0]: (r[1] if r[1] is not None else True) for r in db_rows}
+        db_cm_map = {r[0]: (r[2] if r[2] is not None else True) for r in db_rows}
         cur.close()
         conn.close()
     except Exception:
         db_ssl_map = {}
+        db_cm_map = {}
     # Fallback
     all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
@@ -300,14 +304,15 @@ def load_active_sites():
     categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
     ssl_verify_map = {s: db_ssl_map.get(s, True) for s in all_sites}
-    return all_sites, categories, thresholds, ssl_verify_map
+    cm_enabled_map = {s: db_cm_map.get(s, True) for s in all_sites}
+    return all_sites, categories, thresholds, ssl_verify_map, cm_enabled_map
 
 
 
 def load_settings():
     """Читает настройки приложения из БД. Fallback на дефолты."""
     defaults = {
-        'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ',
+        'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh',
         'category_key_label': 'Ключевые',
         'category_stdo_label': 'СТДО',
         'category_external_label': 'Внешние сайты'
@@ -553,8 +558,9 @@ def init_db():
     if not _column_exists(cur, 'monitored_sites', 'ssl_verify'):
         cur.execute("ALTER TABLE monitored_sites ADD COLUMN ssl_verify BOOLEAN DEFAULT TRUE")
         print("[INIT] Migrated: added ssl_verify column")
-        # Default: все существующие сайты получают ssl_verify = TRUE
-        # Чтобы отключить SSL для самоподписанных сайтов — используйте админку или UPDATE
+    if not _column_exists(cur, 'monitored_sites', 'content_match_enabled'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN content_match_enabled BOOLEAN DEFAULT TRUE")
+        print("[INIT] Migrated: added content_match_enabled column")
     # Таблица категорий сайтов (динамические)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS site_categories (
@@ -659,7 +665,7 @@ def init_db():
     """)
     cur.execute("""
         INSERT INTO app_settings (key, value) VALUES
-            ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ'),
+            ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh'),
             ('category_key_label', 'Ключевые'),
             ('category_stdo_label', 'СТДО'),
             ('category_external_label', 'Внешние сайты')
@@ -1501,7 +1507,7 @@ def check_worker():
         t_start = time.time()
         try:
             # Обновляем список сайтов из БД каждый цикл
-            SITES, _categories, thresholds, ssl_verify_map = load_active_sites()
+            SITES, _categories, thresholds, ssl_verify_map, cm_enabled_map = load_active_sites()
             # Build legacy vars for backward compat
             KEY_SITES = _categories.get('key', [])
             STDO_SITES = _categories.get('stdo', [])
@@ -1517,6 +1523,9 @@ def check_worker():
             _cm_sites_set = set()
             for cat_id in cm_cats:
                 _cm_sites_set.update(_categories.get(cat_id, []))
+            # Фильтруем по content_match_enabled на уровне сайта
+            _cm_sites_set = {s for s in _cm_sites_set if cm_enabled_map.get(s, True)}
+            print(f"[WORKER] Content match sites: {len(_cm_sites_set)} ({list(_cm_sites_set)[:5]}...)")
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1735,14 +1744,15 @@ async def startup_event():
             cur.execute("INSERT INTO app_meta (key, value) VALUES ('sm_cleanup_v1', 'done') ON CONFLICT (key) DO NOTHING")
             conn.commit()
             print("[STARTUP] Self-monitoring cleanup done (one-time)")
-        # Обновление content match паттерна при старте
+        # Обновление content match паттерна при старте (v2: +spnego/auth words)
         try:
+            new_pattern_v2 = 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh'
             cur.execute("""
-                UPDATE app_settings SET value = 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ'
-                WHERE key = 'content_match_pattern' AND value NOT LIKE '%транспорт%'
-            """)
+                UPDATE app_settings SET value = %s
+                WHERE key = 'content_match_pattern' AND value NOT LIKE '%spnego%'
+            """, (new_pattern_v2,))
             if cur.rowcount > 0:
-                print(f"[STARTUP] Content match pattern updated ({cur.rowcount} rows)")
+                print(f"[STARTUP] Content match pattern updated to v2 ({cur.rowcount} rows)")
             conn.commit()
         except Exception as e:
             print(f"[STARTUP WARN] Pattern update: {e}")
@@ -1939,7 +1949,7 @@ async def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
         cat_rows = [dict(r) for r in cur.fetchall()]
@@ -2024,11 +2034,14 @@ async def _admin_page_inner(request, response):
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
-                <input type="checkbox" id="newSslVerify" checked> SSL проверка
+                <input type="checkbox" id="newSslVerify" checked> SSL
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+                <input type="checkbox" id="newCmEnabled" checked> CM
             </label>
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th>SSL</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th>SSL</th><th>CM</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
     cat_labels = {c['id']: c['label'] for c in cat_rows}
     for r in rows:
@@ -2037,7 +2050,7 @@ async def _admin_page_inner(request, response):
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
         ssl_status = '🔒 SSL' if r['ssl_verify'] else '⚠️ Без SSL'
-        ssl_btn_cls = 'btn-gray' if r['ssl_verify'] else 'btn-warn'
+        cm_status = '✅ CM' if r.get('content_match_enabled', True) else '❌ CM'
         site_esc = r['site'].replace("'", "\\'")
         toggle_btn = (
             '<button class="btn btn-gray" onclick="toggleSite(' + "'" + site_esc + "'" + ')">🛑 Отключить</button>'
@@ -2050,6 +2063,7 @@ async def _admin_page_inner(request, response):
             <td>{status}</td>
             <td>{r['alert_threshold']}</td>
             <td><span onclick="toggleSsl('{site_esc}')" style="cursor:pointer" title="Нажмите для переключения">{ssl_status}</span></td>
+            <td><span onclick="toggleCm('{site_esc}')" style="cursor:pointer" title="Нажмите для переключения Content Match">{cm_status}</span></td>
             <td>
                 <div class="actions">
                     <button class="btn btn-warn" onclick="editRow('{site_esc}')">✏️ Изменить</button>
@@ -2235,8 +2249,10 @@ async def _admin_page_inner(request, response):
             if (d.status === 'ok') {
                 var matchColor = d.match_found ? 'color:#16a34a' : 'color:#dc2626';
                 var matchText = d.match_found ? '✅ Совпадение найдено' : '❌ Совпадений нет';
+                var authNote = d.auth_note ? '<div style="color:#d97706;margin-top:4px;">⚠️ ' + d.auth_note + '</div>' : '';
+                var origStatus = d.original_status !== d.http_status ? ' (было ' + d.original_status + ')' : '';
                 var matchesHtml = d.matches.length ? '<details style="margin-top:4px;"><summary>Найденные фрагменты (' + d.matches.length + ')</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:100px;">' + d.matches.map(function(m) { return '...' + m + '...'; }).join('<br>') + '</pre></details>' : '';
-                resultDiv.innerHTML = '<div><strong>HTTP ' + d.http_status + '</strong> | <span style="' + matchColor + '">' + matchText + '</span></div><div style="color:#64748b;margin-top:4px;">Паттерн: <code>' + d.pattern + '</code></div><details style="margin-top:4px;"><summary>HTML preview (500 chars)</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:100px;font-size:10px;">' + d.text_preview + '</pre></details>' + matchesHtml;
+                resultDiv.innerHTML = '<div><strong>HTTP ' + d.http_status + '</strong>' + origStatus + ' | <span style="' + matchColor + '">' + matchText + '</span></div>' + authNote + '<div style="color:#64748b;margin-top:4px;">Паттерн: <code>' + d.pattern + '</code></div><details style="margin-top:4px;"><summary>HTML preview (800 chars)</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:120px;font-size:10px;">' + d.text_preview + '</pre></details>' + matchesHtml;
             } else {
                 resultDiv.innerHTML = '<span style="color:#dc2626">Ошибка: ' + (d.msg || 'Неизвестная ошибка') + '</span>';
             }
@@ -2455,8 +2471,9 @@ async def _admin_page_inner(request, response):
         const group = document.getElementById('newGroup').value;
         const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
         const sslVerify = document.getElementById('newSslVerify').checked;
+        const cmEnabled = document.getElementById('newCmEnabled').checked;
         if (!site) return showToast('Введите сайт');
-        const r = await fetch('/api/sites', {method:'POST', credentials: 'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify})});
+        const r = await fetch('/api/sites', {method:'POST', credentials: 'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify, content_match_enabled: cmEnabled})});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2487,6 +2504,12 @@ async def _admin_page_inner(request, response):
     }
     window.toggleSsl = async function(site) {
         const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-ssl', {method:'POST', credentials: 'include'});
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    window.toggleCm = async function(site) {
+        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-cm', {method:'POST', credentials: 'include'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2715,7 +2738,7 @@ async def list_sites(auth: bool = Depends(admin_auth)):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -2733,6 +2756,7 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
         group = data.get("group", "external")
         threshold = int(data.get("threshold", 5))
         ssl_verify = data.get("ssl_verify", True)
+        content_match_enabled = data.get("content_match_enabled", True)
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
         if threshold < 1 or threshold > 60:
@@ -2749,14 +2773,15 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
             conn.close()
             return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         cur.execute("""
-            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
-            VALUES (%s, %s, %s, TRUE, %s)
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify, content_match_enabled)
+            VALUES (%s, %s, %s, TRUE, %s, %s)
             ON CONFLICT (site) DO UPDATE SET
                 is_active = TRUE,
                 site_group = EXCLUDED.site_group,
                 alert_threshold = EXCLUDED.alert_threshold,
-                ssl_verify = EXCLUDED.ssl_verify
-        """, (site, group, threshold, ssl_verify))
+                ssl_verify = EXCLUDED.ssl_verify,
+                content_match_enabled = EXCLUDED.content_match_enabled
+        """, (site, group, threshold, ssl_verify, content_match_enabled))
         conn.commit()
         cur.close()
         conn.close()
@@ -2854,6 +2879,33 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
+@app.post("/api/sites/{site_name:path}/toggle-cm")
+async def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
+    """Переключить content_match_enabled для сайта"""
+    try:
+        if site_name in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE monitored_sites
+            SET content_match_enabled = NOT COALESCE(content_match_enabled, TRUE)
+            WHERE site = %s
+            RETURNING content_match_enabled
+        """, (site_name,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if row is None:
+            return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        _invalidate_dashboard_cache()
+        cm_status = "enabled" if row[0] else "disabled"
+        return {"status": "ok", "msg": f"Content Match {cm_status} for '{site_name}'", "content_match_enabled": row[0]}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
 @app.post("/api/test-content-match")
 async def test_content_match(request: Request, auth: bool = Depends(admin_auth)):
     """Проверить Content Match (regex) на конкретном сайте"""
@@ -2883,6 +2935,15 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(check_url, allow_redirects=True) as resp:
                 status = resp.status
+                original_status = status
+                auth_note = ""
+                # Преобразуем специальные статусы как в check_worker
+                if status in (307, 308):
+                    status = 200
+                    auth_note = "307 Redirect → treated as OK"
+                elif status == 401:
+                    status = 200
+                    auth_note = "401 Auth Required → treated as OK"
                 try:
                     text = await asyncio.wait_for(resp.text(), timeout=10)
                 except Exception:
@@ -2901,10 +2962,12 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
                     "status": "ok",
                     "site": site,
                     "http_status": status,
+                    "original_status": original_status,
+                    "auth_note": auth_note,
                     "pattern": pattern,
                     "match_found": bool(match_found),
                     "matches": matches[:5],
-                    "text_preview": text_lower[:500] if text else "(empty response)"
+                    "text_preview": text[:800] if text else "(empty response)"
                 }
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
