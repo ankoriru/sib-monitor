@@ -40,7 +40,8 @@ NEW_MONITORING_SITES = [
     "tst-stdo.tdms.sibur.ru/cp/",
     "cp.tdms.sibur.ru/cp/",
     "portal-rd.rusproject.ru",
-    "lsdts.sibur.ru"
+    "lsdts.sibur.ru",
+    "extar.sibur.ru"
 ]
 
 SELF_MONITORING_SITES = [
@@ -3427,9 +3428,23 @@ def _build_body(data: dict) -> str:
     # Сборка предупреждений: объединяем ❌ + ⚠️ в одну строку
     # Билдим lookup: site → incident info
     inc_lookup = {r['site']: f", Инцидент {r['dur']} мин, {r['description']}" for r in active_incidents}
+    # Описания статусов
+    status_desc = {
+        0: "Недоступен",
+        401: "Требуется авторизация",
+        403: "Доступ запрещён",
+        404: "Не найден",
+        500: "Ошибка сервера",
+        502: "Bad Gateway",
+        503: "Сервис недоступен",
+        504: "Gateway Timeout",
+        701: "Контент не совпадает",
+    }
     all_warn_list = []
     for s in incidents:
-        line = f"❌ {s} (Offline){inc_lookup.pop(s, '')}"
+        st = latest[s]['status']
+        desc = status_desc.get(st, f"Код {st}")
+        line = f"❌ {s} ({desc}){inc_lookup.pop(s, '')}"
         all_warn_list.append(line)
     # Добавляем оставшиеся инциденты (не связанные с offline)
     for r in active_incidents:
