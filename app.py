@@ -261,6 +261,16 @@ def load_active_sites():
             return sites, categories, thresholds, ssl_verify_map
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
+    # Fallback: load ssl_verify from DB for all sites in SITES
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT site, ssl_verify FROM monitored_sites WHERE site = ANY(%s)", (list(SITES),))
+        db_ssl_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur.fetchall()}
+        cur.close()
+        conn.close()
+    except Exception:
+        db_ssl_map = {}
     # Fallback
     all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
@@ -268,7 +278,7 @@ def load_active_sites():
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
     categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
-    ssl_verify_map = {s: True for s in all_sites}  # default: SSL verification ON
+    ssl_verify_map = {s: db_ssl_map.get(s, True) for s in all_sites}
     return all_sites, categories, thresholds, ssl_verify_map
 
 
@@ -882,8 +892,6 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
         try:
             if not verify_ssl and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
-                if 'sibur' in site:
-                    print(f"[SSL SKIP] {site} — using ssl=False connector")
             else:
                 actual_session = session
 
@@ -1297,8 +1305,6 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
     TG-алерт и _db_incident_start — при fail_count >= threshold.
     Скриншот в фоне — не блокирует worker."""
     try:
-        if 'sibur' in site:
-            print(f"[SIBUR CHECK] {site} status={curr_status} resp={round(resp_time,2)}s ssl={ssl_d} chain={ssl_chain_valid}")
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
@@ -1312,7 +1318,6 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
 
             alert_threshold = thresholds.get(site, 5)
-            print(f"[ALERT CHECK] {site} fail={fail_count[site]} thr={alert_threshold} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= alert_threshold and was_up:
                 # Порог превышен — создаём инцидент + алерт
@@ -1379,8 +1384,6 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
             if fail_count[site] == 1:
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[SM FIRST FAIL] {site} at {first_fail_time[site]}")
-
-            print(f"[SM ALERT CHECK] {site} fail={fail_count[site]} thr={SM_THRESHOLD} last={last_status.get(site, 200)}")
 
             if fail_count[site] >= SM_THRESHOLD and was_up:
                 # Порог 10 мин превышен — инцидент + алерт
@@ -1750,6 +1753,9 @@ async def startup_event():
         conn.close()
     except Exception as e:
         print(f"[STARTUP WARN] Self-monitoring cleanup: {e}")
+    # Invalidate cache + backfill on startup
+    _invalidate_dashboard_cache()
+    print("[STARTUP] Dashboard cache invalidated")
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
     # Cleanup: закрыть "висящие" unresolved инциденты для сайтов, которые сейчас Online
