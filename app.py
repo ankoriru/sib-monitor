@@ -632,10 +632,17 @@ def init_db():
         # STDO сайты
         for s in STDO_SITES:
             default_sites.append((s, "stdo"))
-        execute_values(cur,
-            "INSERT INTO monitored_sites (site, site_group) VALUES %s ON CONFLICT DO NOTHING",
-            default_sites
-        )
+        for s, group in default_sites:
+            cur.execute("""
+                INSERT INTO monitored_sites (site, site_group, ssl_verify, content_match_enabled, is_active)
+                VALUES (%s, %s, FALSE, TRUE, TRUE)
+                ON CONFLICT (site) DO UPDATE SET
+                    site_group = EXCLUDED.site_group,
+                    ssl_verify = COALESCE(monitored_sites.ssl_verify, EXCLUDED.ssl_verify),
+                    content_match_enabled = COALESCE(monitored_sites.content_match_enabled, EXCLUDED.content_match_enabled),
+                    is_active = TRUE
+            """, (s, group))
+        print(f"[INIT] Inserted/updated {len(default_sites)} default sites")
 
     # Self-monitoring сайты — отдельная группа 'self'
     for s in SELF_MONITORING_SITES:
@@ -1049,6 +1056,10 @@ def flush_batch():
     with BATCH_LOCK:
         if not batch_buffer:
             return
+        # Лог для диагностики
+        for entry in batch_buffer:
+            if entry[0] in ('lsdts.sibur.ru', 'tms.sibur.ru'):
+                print(f"[FLUSH] {entry[0]}: status={entry[1]}, resp_time={entry[2]:.2f}s")
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -1527,10 +1538,12 @@ def check_worker():
             _cm_sites_set = set()
             for cat_id in cm_cats:
                 _cm_sites_set.update(_categories.get(cat_id, []))
+            print(f"[WORKER] CM sites BEFORE filter: {len(_cm_sites_set)} = {_cm_sites_set}")
             # Фильтруем по content_match_enabled на уровне сайта
             _cm_sites_set = {s for s in _cm_sites_set if cm_enabled_map.get(s, True)}
-            print(f"[WORKER] Content match sites: {len(_cm_sites_set)} (filtered from {len(_categories)} categories)")
-            print(f"[WORKER] Content match enabled map: {cm_enabled_map}")
+            print(f"[WORKER] CM sites AFTER filter: {len(_cm_sites_set)} = {_cm_sites_set}")
+            print(f"[WORKER] SSL verify map: lsdts={ssl_verify_map.get('lsdts.sibur.ru','N/A')}, tms={ssl_verify_map.get('tms.sibur.ru','N/A')}")
+            print(f"[WORKER] Content match enabled map: lsdts={cm_enabled_map.get('lsdts.sibur.ru','N/A')}, tms={cm_enabled_map.get('tms.sibur.ru','N/A')}")
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1559,6 +1572,7 @@ def check_worker():
                     del fail_count[site]
                     del last_latency_map[site]
 
+            print(f"[WORKER] SITES list: {SITES[:10]}... (total {len(SITES)})")
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
             if not SITES:
                 print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
@@ -1585,6 +1599,9 @@ def check_worker():
             # Обработка обычных сайтов
             for site, curr_status, resp_time in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
+                if site in ('lsdts.sibur.ru', 'tms.sibur.ru'):
+                    in_cm = site in _cm_sites_set
+                    print(f"[CHECK] {site}: status={curr_status}, in_cm={in_cm}, cm_enabled={cm_enabled_map.get(site, 'N/A')}")
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                      last_status, fail_count, last_latency_map, thresholds, first_fail_time)
 
@@ -1774,8 +1791,19 @@ async def startup_event():
                 print("[STARTUP] Added portal-rd.rusproject.ru to monitored_sites")
         except Exception as e:
             print(f"[STARTUP WARN] portal-rd migration: {e}")
-        # Sites removed from seed — they must be added via admin panel only
-        # ssl_verify is managed via admin panel only
+        # Fix: set ssl_verify=FALSE and content_match_enabled=FALSE for known problematic sites
+        try:
+            for s in ['lsdts.sibur.ru', 'extar.sibur.ru', 'portal-rd.rusproject.ru']:
+                cur.execute("""
+                    UPDATE monitored_sites 
+                    SET ssl_verify = FALSE, content_match_enabled = FALSE 
+                    WHERE site = %s AND (ssl_verify IS NULL OR ssl_verify = TRUE OR content_match_enabled IS NULL)
+                """, (s,))
+                if cur.rowcount > 0:
+                    print(f"[STARTUP] Fixed ssl_verify=FALSE, cm=FALSE for '{s}'")
+            conn.commit()
+        except Exception as e:
+            print(f"[STARTUP WARN] SSL/CM fix: {e}")
         cur.close()
         conn.close()
     except Exception as e:
