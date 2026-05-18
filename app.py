@@ -275,7 +275,7 @@ def load_active_sites():
                     continue
                 # CM: TRUE по умолчанию для всех сайтов (можно выключить в админке)
                 cm_enabled_map[r[0]] = r[4] if r[4] is not None else True
-            print(f"[LOAD ACTIVE] Loaded {len(sites)} active sites from DB: {sites[:5]}...")
+            # Active sites loaded from DB
             # Build dynamic categories dict
             categories = {}
             cat_ids = [c[0] for c in cat_rows]
@@ -1064,10 +1064,7 @@ def flush_batch():
     with BATCH_LOCK:
         if not batch_buffer:
             return
-        # Лог для диагностики
-        tms_entries = [e for e in batch_buffer if e[0] == 'tms.sibur.ru']
-        if tms_entries:
-            print(f"[FLUSH] tms.sibur.ru entries: {len(tms_entries)}, statuses: {[e[1] for e in tms_entries]}")
+        # Batch flush
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -1546,12 +1543,8 @@ def check_worker():
             _cm_sites_set = set()
             for cat_id in cm_cats:
                 _cm_sites_set.update(_categories.get(cat_id, []))
-            print(f"[WORKER] CM sites BEFORE filter: {len(_cm_sites_set)} = {_cm_sites_set}")
             # Фильтруем по content_match_enabled на уровне сайта
             _cm_sites_set = {s for s in _cm_sites_set if cm_enabled_map.get(s, True)}
-            print(f"[WORKER] CM sites AFTER filter: {len(_cm_sites_set)} = {_cm_sites_set}")
-            print(f"[WORKER] SSL verify map: lsdts={ssl_verify_map.get('lsdts.sibur.ru','N/A')}, tms={ssl_verify_map.get('tms.sibur.ru','N/A')}")
-            print(f"[WORKER] Content match enabled map: lsdts={cm_enabled_map.get('lsdts.sibur.ru','N/A')}, tms={cm_enabled_map.get('tms.sibur.ru','N/A')}")
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1580,8 +1573,7 @@ def check_worker():
                     del fail_count[site]
                     del last_latency_map[site]
 
-            print(f"[WORKER] SITES: {SITES}")
-            print(f"[WORKER] tms in SITES: {'tms.sibur.ru' in SITES}")
+            # SITES loaded from DB
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
             if not SITES:
                 print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
@@ -1608,9 +1600,7 @@ def check_worker():
             # Обработка обычных сайтов
             for site, curr_status, resp_time in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
-                if site in ('lsdts.sibur.ru', 'tms.sibur.ru'):
-                    in_cm = site in _cm_sites_set
-                    print(f"[CHECK] {site}: status={curr_status}, in_cm={in_cm}, cm_enabled={cm_enabled_map.get(site, 'N/A')}")
+                # Site check complete
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                      last_status, fail_count, last_latency_map, thresholds, first_fail_time)
 
@@ -2889,6 +2879,7 @@ async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
         _invalidate_dashboard_cache()
         new_status = "enabled" if row[0] else "disabled"
+        print(f"[TOGGLE] Site '{site_name}' {new_status}, cache invalidated")
         return {"status": "ok", "msg": f"Site '{site_name}' {new_status}", "is_active": row[0]}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
@@ -3333,9 +3324,13 @@ async def _index_stream():
     s30 = _get_stats_from_agg(cur, '30 days')
     s24 = _get_stats_from_agg(cur, '24 hours')
 
+    # Загружаем активные сайты из БД (не используем глобальный SITES)
+    cur.execute("SELECT site FROM monitored_sites WHERE is_active = TRUE AND site_group != 'self'")
+    db_active_sites = [r['site'] for r in cur.fetchall()]
+    
     cur.execute("SELECT * FROM latest_status")
     latest_all = {r['site']: r for r in cur.fetchall()}
-    latest = {s: latest_all[s] for s in SITES if s in latest_all}
+    latest = {s: latest_all[s] for s in db_active_sites if s in latest_all}
     self_latest = {s: latest_all[s] for s in SELF_MONITORING_SITES if s in latest_all}
     for s in SELF_MONITORING_SITES:
         if s not in self_latest:
@@ -3740,8 +3735,7 @@ def _build_body(data: dict) -> str:
     # Fallback: если sites_by_cat пуст — используем SITES
     if not active_sites_set:
         active_sites_set = set(SITES)
-    # Debug log
-    print(f"[BUILD BODY] active_sites: {len(active_sites_set)}, latest has: {len(latest)}, tms in latest: {'tms.sibur.ru' in latest}")
+    # Build body from active sites
 
     incidents = [s for s, v in latest.items() if s in active_sites_set and v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
@@ -3780,8 +3774,12 @@ def _build_body(data: dict) -> str:
            for s in latency_warn]
     )
 
+    # Считаем по активным сайтам из динамических категорий (не глобальный SITES)
+    all_active_sites = []
+    for cat in data.get("categories", []):
+        all_active_sites.extend(cat['sites'])
+    total_sites = len(all_active_sites) if all_active_sites else len(SITES)
     online_count = sum(1 for s in latest.values() if s['status'] == 200)
-    total_sites = len(SITES)
     # Уникальные активные инциденты (1 на сайт)
     active_incidents_count = len({r['site'] for r in active_incidents})
     offline_count = len(incidents)
