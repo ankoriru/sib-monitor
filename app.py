@@ -269,6 +269,7 @@ def load_active_sites():
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
             thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
             ssl_verify_map = {r[0]: (r[3] if r[3] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            print(f"[LOAD ACTIVE] Loaded {len(sites)} active sites from DB: {sites[:5]}...")
             # Build dynamic categories dict
             categories = {}
             cat_ids = [c[0] for c in cat_rows]
@@ -917,18 +918,23 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 resp_time = time.time() - start
-                # Content match для сайтов с включенным content match в их категории
-                if site in _cm_sites_set and curr_status in (200, 401):
+                # Сначала преобразуем специальные статусы
+                if curr_status in (307, 308):
+                    # 307/308 = редирект, сервер работает — считаем OK
+                    curr_status = 200
+                elif curr_status == 401:
+                    # 401 = сервер работает, требует авторизацию — считаем OK
+                    curr_status = 200
+                # Content match для сайтов с content match enabled (только для 200)
+                if site in _cm_sites_set and curr_status == 200:
                     try:
                         text = await asyncio.wait_for(resp.text(), timeout=10)
                         text_lower = text.lower()
                         match_found = _content_match_regex.search(text_lower)
                         if match_found:
-                            curr_status = 200
-                            print(f"[CONTENT MATCH OK] {site} (status {resp.status})")
+                            print(f"[CONTENT MATCH OK] {site}")
                         else:
                             curr_status = 701
-                            # Диагностика: показать ВЕСЬ текст и найденные слова
                             print(f"[CONTENT MISMATCH] {site} — text ({len(text)} chars): {repr(text_lower[:800])}")
                             for kw in ['войдите', 'логин', 'пароль', 'login', 'password', 'sibur', 'сибур']:
                                 idx = text_lower.find(kw)
@@ -939,12 +945,6 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
-                elif curr_status in (307, 308):
-                    # 307/308 = редирект, сервер работает — считаем OK
-                    curr_status = 200
-                elif curr_status == 401:
-                    # 401 = сервер работает, требует авторизацию — считаем OK
-                    curr_status = 200
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
@@ -1183,8 +1183,12 @@ def refresh_materialized_view():
             conn.rollback()
             cur.execute("REFRESH MATERIALIZED VIEW latest_status")
         conn.commit()
+        # Проверяем что обновление прошло
+        cur.execute("SELECT COUNT(*) FROM latest_status")
+        count = cur.fetchone()[0]
         cur.close()
         conn.close()
+        print(f"[REFRESH MV] latest_status: {count} sites")
     except Exception as e:
         print(f"Ошибка обновления мат. представления: {e}")
 
@@ -1544,6 +1548,8 @@ def check_worker():
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
             if not SITES:
                 print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
+            else:
+                print(f"[WORKER] Sites: {SITES[:5]}... (total {len(SITES)})")
 
             # Быстрые HTTP-проверки обычных сайтов
             results = loop.run_until_complete(check_all_sites(SITES, ssl_verify_map))
