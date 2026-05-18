@@ -31,19 +31,6 @@ TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
 
-NEW_MONITORING_SITES = [
-    "icenter.tdms.nipigas.ru/cp/",
-    "tdms.progress-epc.ru/cp/",
-    "icenter.tdms.newresources.ru/cp/",
-    "agpp.tdms.nipigas.ru/cp/",
-    "agpp.tdms.nipigas.ru/DMS21/",
-    "tst-stdo.tdms.sibur.ru/cp/",
-    "cp.tdms.sibur.ru/cp/",
-    "portal-rd.rusproject.ru",
-    "lsdts.sibur.ru",
-    "extar.sibur.ru"
-]
-
 SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
 ]
@@ -58,10 +45,8 @@ _content_match_regex = CONTENT_MATCH_KEYWORDS
 # Глобальный набор сайтов с content match (заполняется в check_worker)
 _cm_sites_set = set()
 
-# --- SEC-1: Whitelist для self-signed сертификатов ---
-SELF_SIGNED_SITES = set(NEW_MONITORING_SITES)
-if os.getenv("SELF_SIGNED_SITES"):
-    SELF_SIGNED_SITES.update(os.getenv("SELF_SIGNED_SITES").split(","))
+# Deprecated: SELF_SIGNED_SITES удалён — используйте monitored_sites.ssl_verify в БД
+SELF_SIGNED_SITES = set()
 
 # --- SEC-2: BCrypt-хеширование паролей через env ---
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
@@ -81,16 +66,24 @@ SITES = [
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
     "rusvinyl.ru", "sharefile.sibur.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
-    "snck.ru", "transportorder.sibur.ru", "tu-sibur.ru", "vivilen.sibur.ru"
-] + NEW_MONITORING_SITES
+    "snck.ru", "transportorder.sibur.ru", "tu-sibur.ru", "vivilen.sibur.ru",
+    # TDMS / STDO системы (ранее NEW_MONITORING_SITES)
+    "icenter.tdms.nipigas.ru/cp/", "tdms.progress-epc.ru/cp/",
+    "icenter.tdms.newresources.ru/cp/", "agpp.tdms.nipigas.ru/cp/",
+    "agpp.tdms.nipigas.ru/DMS21/", "tst-stdo.tdms.sibur.ru/cp/",
+    "cp.tdms.sibur.ru/cp/", "portal-rd.rusproject.ru",
+    "lsdts.sibur.ru", "extar.sibur.ru"
+]
 
 PRIORITY_SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru"
-] + NEW_MONITORING_SITES
+]
 
-# --- Группировка сайтов для UI ---
+# --- Группировка сайтов для UI (fallback, основная логика через БД) ---
 KEY_SITES = ["sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru", "career.sibur.ru", "transportorder.sibur.ru"]
-STDO_SITES = NEW_MONITORING_SITES[:]
+STDO_SITES = ["icenter.tdms.nipigas.ru/cp/", "tdms.progress-epc.ru/cp/", "icenter.tdms.newresources.ru/cp/",
+              "agpp.tdms.nipigas.ru/cp/", "agpp.tdms.nipigas.ru/DMS21/", "tst-stdo.tdms.sibur.ru/cp/",
+              "cp.tdms.sibur.ru/cp/", "portal-rd.rusproject.ru", "lsdts.sibur.ru", "extar.sibur.ru"]
 EXTERNAL_SITES = [s for s in SITES if s not in KEY_SITES and s not in STDO_SITES]
 
 app = FastAPI()
@@ -275,7 +268,7 @@ def load_active_sites():
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
     categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
-    ssl_verify_map = {s: (s not in SELF_SIGNED_SITES) for s in all_sites}
+    ssl_verify_map = {s: True for s in all_sites}  # default: SSL verification ON
     return all_sites, categories, thresholds, ssl_verify_map
 
 
@@ -299,11 +292,6 @@ def load_settings():
     except Exception as e:
         print(f"[WARN] Failed to load settings: {e}")
     return defaults
-
-def should_verify(site: str) -> bool:
-    """SEC-1: Определяет, нужна ли полная SSL-валидация для сайта"""
-    return site not in SELF_SIGNED_SITES
-
 
 def _safe_index(cur, conn, index_name, table_name, columns):
     """Создаёт индекс, если его ещё нет; игнорирует DuplicateTable/DuplicateObject"""
@@ -534,11 +522,8 @@ def init_db():
     if not _column_exists(cur, 'monitored_sites', 'ssl_verify'):
         cur.execute("ALTER TABLE monitored_sites ADD COLUMN ssl_verify BOOLEAN DEFAULT TRUE")
         print("[INIT] Migrated: added ssl_verify column")
-        # Migrate: sites in SELF_SIGNED_SITES get ssl_verify = FALSE
-        for s in SELF_SIGNED_SITES:
-            cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s", (s,))
-        if SELF_SIGNED_SITES:
-            print(f"[INIT] Migrated: set ssl_verify=FALSE for {len(SELF_SIGNED_SITES)} self-signed sites")
+        # Default: все существующие сайты получают ssl_verify = TRUE
+        # Чтобы отключить SSL для самоподписанных сайтов — используйте админку или UPDATE
     # Таблица категорий сайтов (динамические)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS site_categories (
@@ -833,10 +818,11 @@ def send_tg_msg(text, photo_path=None):
 # ============================================================================
 # WHOIS
 # ============================================================================
-def _check_ssl_sync(domain_only, site):
-    """Синхронная SSL-проверка (для вызова через asyncio.to_thread)"""
+def _check_ssl_sync(domain_only, site, verify_ssl=True):
+    """Синхронная SSL-проверка (для вызова через asyncio.to_thread).
+    verify_ssl=False — пропускает верификацию (для самоподписанных сертификатов)."""
     try:
-        if site in SELF_SIGNED_SITES:
+        if not verify_ssl:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -1570,10 +1556,21 @@ def ssl_whois_worker():
 
             # Проверяем все сайты, включая self-monitoring
             all_sites_to_check = list(SITES) + list(SELF_MONITORING_SITES)
+            # Load ssl_verify settings from DB
+            try:
+                conn_ssl = get_db_connection()
+                cur_ssl = conn_ssl.cursor()
+                cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
+                ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
+                cur_ssl.close()
+                conn_ssl.close()
+            except Exception:
+                ssl_whois_verify_map = {}
             for site in all_sites_to_check:
                 domain_only = site.split('/')[0]
+                verify_ssl = ssl_whois_verify_map.get(site, True)
                 try:
-                    ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site)
+                    ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site, verify_ssl=verify_ssl)
                 except Exception:
                     ssl_d, ssl_chain_valid = -1, None
 
@@ -1722,13 +1719,6 @@ async def startup_event():
                 print("[STARTUP] Added lsdts.sibur.ru to monitored_sites (ssl_verify=FALSE)")
         except Exception as e:
             print(f"[STARTUP WARN] lsdts migration: {e}")
-        # Fix: set ssl_verify=FALSE for all self-signed sites where it's NULL
-        try:
-            for s in SELF_SIGNED_SITES:
-                cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s AND ssl_verify IS NULL", (s,))
-            conn.commit()
-        except Exception as e:
-            print(f"[STARTUP WARN] NULL ssl_verify fix: {e}")
         # Миграция: добавить extar.sibur.ru если отсутствует
         try:
             cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'extar.sibur.ru'")
