@@ -895,6 +895,8 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
         try:
             if not verify_ssl and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
+                if 'sibur' in site:
+                    print(f"[SSL SKIP] {site} — using ssl=False connector")
             else:
                 actual_session = session
 
@@ -1308,6 +1310,8 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
     TG-алерт и _db_incident_start — при fail_count >= threshold.
     Скриншот в фоне — не блокирует worker."""
     try:
+        if 'sibur' in site:
+            print(f"[SIBUR CHECK] {site} status={curr_status} resp={round(resp_time,2)}s ssl={ssl_d} chain={ssl_chain_valid}")
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
@@ -1709,14 +1713,21 @@ async def startup_event():
             cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'lsdts.sibur.ru'")
             if not cur.fetchone():
                 cur.execute("""
-                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
-                    VALUES ('lsdts.sibur.ru', 'stdo', 2, TRUE)
+                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
+                    VALUES ('lsdts.sibur.ru', 'stdo', 2, TRUE, FALSE)
                     ON CONFLICT DO NOTHING
                 """)
                 conn.commit()
-                print("[STARTUP] Added lsdts.sibur.ru to monitored_sites")
+                print("[STARTUP] Added lsdts.sibur.ru to monitored_sites (ssl_verify=FALSE)")
         except Exception as e:
             print(f"[STARTUP WARN] lsdts migration: {e}")
+        # Fix: set ssl_verify=FALSE for all self-signed sites where it's NULL
+        try:
+            for s in SELF_SIGNED_SITES:
+                cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s AND ssl_verify IS NULL", (s,))
+            conn.commit()
+        except Exception as e:
+            print(f"[STARTUP WARN] NULL ssl_verify fix: {e}")
         # Миграция: добавить extar.sibur.ru если отсутствует
         try:
             cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'extar.sibur.ru'")
@@ -2708,9 +2719,10 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(check_auth)):
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
+        # Если NULL — считаем что включено, переключаем в FALSE
         cur.execute("""
             UPDATE monitored_sites
-            SET ssl_verify = NOT ssl_verify
+            SET ssl_verify = CASE WHEN COALESCE(ssl_verify, TRUE) = TRUE THEN FALSE ELSE TRUE END
             WHERE site = %s
             RETURNING ssl_verify
         """, (site_name,))
