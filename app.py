@@ -2554,18 +2554,19 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         threshold = int(data.get("threshold", 5))
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
-        # Validate group against DB categories
-        cur.execute("SELECT id FROM site_categories")
-        valid_groups = [r[0] for r in cur.fetchall()]
-        cur.close()
-        if group not in valid_groups:
-            return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         if threshold < 1 or threshold > 60:
             return JSONResponse({"status": "error", "msg": "threshold must be 1-60"}, status_code=400)
         if site in SELF_MONITORING_SITES:
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
+        # Validate group against DB categories
+        cur.execute("SELECT id FROM site_categories")
+        valid_groups = [r[0] for r in cur.fetchall()]
+        if group not in valid_groups:
+            cur.close()
+            conn.close()
+            return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         cur.execute("""
             INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
             VALUES (%s, %s, %s, TRUE)
