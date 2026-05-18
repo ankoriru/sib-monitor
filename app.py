@@ -269,7 +269,12 @@ def load_active_sites():
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
             thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
             ssl_verify_map = {r[0]: (r[3] if r[3] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
-            cm_enabled_map = {r[0]: (r[4] if r[4] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            cm_enabled_map = {}
+            for r in rows:
+                if r[0] in SELF_MONITORING_SITES:
+                    continue
+                # CM: TRUE по умолчанию для всех сайтов (можно выключить в админке)
+                cm_enabled_map[r[0]] = r[4] if r[4] is not None else True
             print(f"[LOAD ACTIVE] Loaded {len(sites)} active sites from DB: {sites[:5]}...")
             # Build dynamic categories dict
             categories = {}
@@ -287,9 +292,10 @@ def load_active_sites():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, ssl_verify, content_match_enabled FROM monitored_sites WHERE site = ANY(%s)", (list(SITES),))
+        cur.execute("SELECT site, ssl_verify, content_match_enabled, site_group FROM monitored_sites WHERE site = ANY(%s) AND is_active = TRUE", (list(SITES),))
         db_rows = cur.fetchall()
         db_ssl_map = {r[0]: (r[1] if r[1] is not None else True) for r in db_rows}
+        # CM по умолчанию: TRUE для всех сайтов
         db_cm_map = {r[0]: (r[2] if r[2] is not None else True) for r in db_rows}
         cur.close()
         conn.close()
@@ -304,6 +310,7 @@ def load_active_sites():
     categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
     ssl_verify_map = {s: db_ssl_map.get(s, True) for s in all_sites}
+    # Fallback CM: True для всех сайтов по умолчанию
     cm_enabled_map = {s: db_cm_map.get(s, True) for s in all_sites}
     return all_sites, categories, thresholds, ssl_verify_map, cm_enabled_map
 
@@ -633,6 +640,7 @@ def init_db():
         for s in STDO_SITES:
             default_sites.append((s, "stdo"))
         for s, group in default_sites:
+            # CM по умолчанию: TRUE для всех сайтов
             cur.execute("""
                 INSERT INTO monitored_sites (site, site_group, ssl_verify, content_match_enabled, is_active)
                 VALUES (%s, %s, FALSE, TRUE, TRUE)
@@ -1057,9 +1065,9 @@ def flush_batch():
         if not batch_buffer:
             return
         # Лог для диагностики
-        for entry in batch_buffer:
-            if entry[0] in ('lsdts.sibur.ru', 'tms.sibur.ru'):
-                print(f"[FLUSH] {entry[0]}: status={entry[1]}, resp_time={entry[2]:.2f}s")
+        tms_entries = [e for e in batch_buffer if e[0] == 'tms.sibur.ru']
+        if tms_entries:
+            print(f"[FLUSH] tms.sibur.ru entries: {len(tms_entries)}, statuses: {[e[1] for e in tms_entries]}")
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -1572,7 +1580,8 @@ def check_worker():
                     del fail_count[site]
                     del last_latency_map[site]
 
-            print(f"[WORKER] SITES list: {SITES[:10]}... (total {len(SITES)})")
+            print(f"[WORKER] SITES: {SITES}")
+            print(f"[WORKER] tms in SITES: {'tms.sibur.ru' in SITES}")
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
             if not SITES:
                 print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
@@ -1793,11 +1802,12 @@ async def startup_event():
             print(f"[STARTUP WARN] portal-rd migration: {e}")
         # Fix: set ssl_verify=FALSE and content_match_enabled=FALSE for known problematic sites
         try:
+            # Fix: set ssl_verify=FALSE for known SSL-problematic sites
             for s in ['lsdts.sibur.ru', 'extar.sibur.ru', 'portal-rd.rusproject.ru']:
                 cur.execute("""
                     UPDATE monitored_sites 
-                    SET ssl_verify = FALSE, content_match_enabled = FALSE 
-                    WHERE site = %s AND (ssl_verify IS NULL OR ssl_verify = TRUE OR content_match_enabled IS NULL)
+                    SET ssl_verify = FALSE
+                    WHERE site = %s AND (ssl_verify IS NULL OR ssl_verify = TRUE)
                 """, (s,))
                 if cur.rowcount > 0:
                     print(f"[STARTUP] Fixed ssl_verify=FALSE, cm=FALSE for '{s}'")
@@ -3524,7 +3534,7 @@ async def _index_stream():
     cur2 = conn2.cursor(cursor_factory=DictCursor)
     cur2.execute("SELECT id, label, sort_order FROM site_categories ORDER BY sort_order")
     db_cats_list = [dict(r) for r in cur2.fetchall()]
-    cur2.execute("SELECT site, site_group FROM monitored_sites WHERE site_group != 'self' ORDER BY site")
+    cur2.execute("SELECT site, site_group FROM monitored_sites WHERE site_group != 'self' AND is_active = TRUE ORDER BY site")
     monitored_rows = cur2.fetchall()
     cur2.close()
     conn2.close()
@@ -3727,6 +3737,11 @@ def _build_body(data: dict) -> str:
     active_sites_set = set()
     for cat_sites in data.get("sites_by_cat", {}).values():
         active_sites_set.update(cat_sites)
+    # Fallback: если sites_by_cat пуст — используем SITES
+    if not active_sites_set:
+        active_sites_set = set(SITES)
+    # Debug log
+    print(f"[BUILD BODY] active_sites: {len(active_sites_set)}, latest has: {len(latest)}, tms in latest: {'tms.sibur.ru' in latest}")
 
     incidents = [s for s, v in latest.items() if s in active_sites_set and v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
