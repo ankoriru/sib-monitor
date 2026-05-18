@@ -1784,6 +1784,17 @@ async def startup_event():
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Force-closed {cur.rowcount} incidents for sharefile.sibur.ru (401=online)")
+        # Close incidents for deleted sites (not in monitored_sites anymore)
+        cur.execute("""
+            UPDATE incidents
+            SET end_time = NOW(),
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                resolved = TRUE
+            WHERE resolved = FALSE
+              AND site NOT IN (SELECT site FROM monitored_sites WHERE is_active = TRUE)
+        """)
+        if cur.rowcount > 0:
+            print(f"[STARTUP] Closed {cur.rowcount} incidents for deleted/inactive sites")
         conn.commit()
         cur.close()
         conn.close()
