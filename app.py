@@ -39,7 +39,8 @@ NEW_MONITORING_SITES = [
     "agpp.tdms.nipigas.ru/DMS21/",
     "tst-stdo.tdms.sibur.ru/cp/",
     "cp.tdms.sibur.ru/cp/",
-    "portal-rd.rusproject.ru"
+    "portal-rd.rusproject.ru",
+    "lsdts.sibur.ru"
 ]
 
 SELF_MONITORING_SITES = [
@@ -238,11 +239,12 @@ def get_db_connection():
 
 
 def load_active_sites():
-    """Читает список активных сайтов из БД. Fallback на дефолтный список. Self-monitoring исключены."""
+    """Читает список активных сайтов из БД. Fallback на дефолтный список. Self-monitoring исключены.
+    Возвращает: (sites, categories, thresholds, ssl_verify_map)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, site_group, alert_threshold FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
+        cur.execute("SELECT site, site_group, alert_threshold, ssl_verify FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
         rows = cur.fetchall()
         # Load dynamic categories from DB
         cur.execute("SELECT id, label, content_match_enabled FROM site_categories ORDER BY sort_order")
@@ -252,6 +254,7 @@ def load_active_sites():
         if rows:
             sites = [r[0] for r in rows if r[0] not in SELF_MONITORING_SITES]
             thresholds = {r[0]: (r[2] if r[2] is not None else 5) for r in rows if r[0] not in SELF_MONITORING_SITES}
+            ssl_verify_map = {r[0]: (r[3] if r[3] is not None else True) for r in rows if r[0] not in SELF_MONITORING_SITES}
             # Build dynamic categories dict
             categories = {}
             cat_ids = [c[0] for c in cat_rows]
@@ -261,17 +264,18 @@ def load_active_sites():
             for r in rows:
                 if r[1] not in cat_ids and r[0] not in SELF_MONITORING_SITES:
                     categories.setdefault('external', []).append(r[0])
-            return sites, categories, thresholds
+            return sites, categories, thresholds, ssl_verify_map
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
-    # Fallback — всегда возвращаем 3 значения (sites, categories, thresholds)
+    # Fallback
     all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
     stdo = STDO_SITES[:]
     ext = [s for s in EXTERNAL_SITES if s not in SELF_MONITORING_SITES]
     categories = {'key': key, 'stdo': stdo, 'external': ext}
     thresholds = {s: 5 for s in all_sites}
-    return all_sites, categories, thresholds
+    ssl_verify_map = {s: (s not in SELF_SIGNED_SITES) for s in all_sites}
+    return all_sites, categories, thresholds, ssl_verify_map
 
 
 
@@ -526,6 +530,14 @@ def init_db():
     if not _column_exists(cur, 'monitored_sites', 'created_at'):
         cur.execute("ALTER TABLE monitored_sites ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         print("[INIT] Migrated: added created_at column")
+    if not _column_exists(cur, 'monitored_sites', 'ssl_verify'):
+        cur.execute("ALTER TABLE monitored_sites ADD COLUMN ssl_verify BOOLEAN DEFAULT TRUE")
+        print("[INIT] Migrated: added ssl_verify column")
+        # Migrate: sites in SELF_SIGNED_SITES get ssl_verify = FALSE
+        for s in SELF_SIGNED_SITES:
+            cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s", (s,))
+        if SELF_SIGNED_SITES:
+            print(f"[INIT] Migrated: set ssl_verify=FALSE for {len(SELF_SIGNED_SITES)} self-signed sites")
     # Таблица категорий сайтов (динамические)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS site_categories (
@@ -579,6 +591,8 @@ def init_db():
             ("polylabsearch.ru", "external"),
             ("portenergo.com", "external"),
             ("portal-rd.rusproject.ru", "external"),
+            ("lsdts.sibur.ru", "stdo"),
+            ("extar.sibur.ru", "stdo"),
             ("rusvinyl.ru", "external"),
             ("sharefile.sibur.ru", "external"),
             ("sibur.digital", "external"),
@@ -867,19 +881,19 @@ def get_domain_info(site):
 # ============================================================================
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
-async def check_single_site(session, site, semaphore):
-    """Быстрая HTTP-проверка сайта. Content match для Ключевых сайтов.
-    SSL+WHOIS обновляются отдельным циклом."""
+async def check_single_site(session, site, semaphore, verify_ssl=True):
+    """Быстрая HTTP-проверка сайта. Content match для сайтов с content_match_enabled.
+    SSL+WHOIS обновляются отдельным циклом.
+    verify_ssl=True → обычная проверка SSL; verify_ssl=False → SSL не проверяется."""
     check_url = f"https://{site}"
     curr_status, resp_time = 0, 25.0
 
-    ssl_verify = not should_verify(site)
-    connector = aiohttp.TCPConnector(ssl=False) if ssl_verify else None
+    connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
     start = time.time()
     actual_session = None
     async with semaphore:
         try:
-            if ssl_verify and connector:
+            if not verify_ssl and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
             else:
                 actual_session = session
@@ -916,17 +930,18 @@ async def check_single_site(session, site, semaphore):
         except Exception as e:
             curr_status, resp_time = 0, 25.0
         finally:
-            if ssl_verify and connector and actual_session is not None:
+            if not verify_ssl and connector and actual_session is not None:
                 await actual_session.close()
 
     return (site, curr_status, resp_time)
 
 
-async def check_all_sites(sites_list):
+async def check_all_sites(sites_list, ssl_verify_map=None):
     """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
     semaphore = asyncio.Semaphore(15)
+    ssl_map = ssl_verify_map or {}
     async with aiohttp.ClientSession() as session:
-        tasks = [check_single_site(session, site, semaphore) for site in sites_list]
+        tasks = [check_single_site(session, site, semaphore, verify_ssl=ssl_map.get(site, True)) for site in sites_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
 
@@ -1444,7 +1459,7 @@ def check_worker():
         t_start = time.time()
         try:
             # Обновляем список сайтов из БД каждый цикл
-            SITES, _categories, thresholds = load_active_sites()
+            SITES, _categories, thresholds, ssl_verify_map = load_active_sites()
             # Build legacy vars for backward compat
             KEY_SITES = _categories.get('key', [])
             STDO_SITES = _categories.get('stdo', [])
@@ -1493,7 +1508,7 @@ def check_worker():
                 print("[WORKER WARN] SITES is empty! Check monitored_sites table and is_active flags.")
 
             # Быстрые HTTP-проверки обычных сайтов
-            results = loop.run_until_complete(check_all_sites(SITES))
+            results = loop.run_until_complete(check_all_sites(SITES, ssl_verify_map))
             http_time = round(time.time() - t_start, 1)
             print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
 
@@ -1689,6 +1704,32 @@ async def startup_event():
                 print("[STARTUP] Added portal-rd.rusproject.ru to monitored_sites")
         except Exception as e:
             print(f"[STARTUP WARN] portal-rd migration: {e}")
+        # Миграция: добавить lsdts.sibur.ru если отсутствует
+        try:
+            cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'lsdts.sibur.ru'")
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+                    VALUES ('lsdts.sibur.ru', 'stdo', 2, TRUE)
+                    ON CONFLICT DO NOTHING
+                """)
+                conn.commit()
+                print("[STARTUP] Added lsdts.sibur.ru to monitored_sites")
+        except Exception as e:
+            print(f"[STARTUP WARN] lsdts migration: {e}")
+        # Миграция: добавить extar.sibur.ru если отсутствует
+        try:
+            cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'extar.sibur.ru'")
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
+                    VALUES ('extar.sibur.ru', 'stdo', 2, TRUE, FALSE)
+                    ON CONFLICT DO NOTHING
+                """)
+                conn.commit()
+                print("[STARTUP] Added extar.sibur.ru to monitored_sites (ssl_verify=FALSE)")
+        except Exception as e:
+            print(f"[STARTUP WARN] extar migration: {e}")
         cur.close()
         conn.close()
     except Exception as e:
@@ -1853,7 +1894,7 @@ async def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
         cat_rows = [dict(r) for r in cur.fetchall()]
@@ -1935,9 +1976,12 @@ async def _admin_page_inner(request, response):
                 <option value="">Загрузка...</option>
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
+            <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+                <input type="checkbox" id="newSslVerify" checked> SSL проверка
+            </label>
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
+        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th>SSL</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
     cat_labels = {c['id']: c['label'] for c in cat_rows}
     for r in rows:
@@ -1945,6 +1989,8 @@ async def _admin_page_inner(request, response):
         grp_name = cat_labels.get(r['site_group'], r['site_group'])
         disabled_cls = 'row-disabled' if not r['is_active'] else ''
         status = '🟢 Активен' if r['is_active'] else '🔴 Отключен'
+        ssl_status = '🔒 SSL' if r['ssl_verify'] else '⚠️ Без SSL'
+        ssl_btn_cls = 'btn-gray' if r['ssl_verify'] else 'btn-warn'
         site_esc = r['site'].replace("'", "\\'")
         toggle_btn = (
             '<button class="btn btn-gray" onclick="toggleSite(' + "'" + site_esc + "'" + ')">🛑 Отключить</button>'
@@ -1956,6 +2002,7 @@ async def _admin_page_inner(request, response):
             <td><span class="badge badge-cat" data-cat="{r['site_group']}">{grp_name}</span></td>
             <td>{status}</td>
             <td>{r['alert_threshold']}</td>
+            <td><span onclick="toggleSsl('{site_esc}')" style="cursor:pointer" title="Нажмите для переключения">{ssl_status}</span></td>
             <td>
                 <div class="actions">
                     <button class="btn btn-warn" onclick="editRow('{site_esc}')">✏️ Изменить</button>
@@ -2281,8 +2328,9 @@ async def _admin_page_inner(request, response):
         const site = document.getElementById('newSite').value.trim();
         const group = document.getElementById('newGroup').value;
         const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
+        const sslVerify = document.getElementById('newSslVerify').checked;
         if (!site) return showToast('Введите сайт');
-        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold})});
+        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify})});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2307,6 +2355,12 @@ async def _admin_page_inner(request, response):
     }
     window.toggleSite = async function(site) {
         const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle', {method:'POST'});
+        const data = await r.json();
+        if (data.status === 'ok') { location.reload(); }
+        else { showToast(data.msg || 'Ошибка'); }
+    }
+    window.toggleSsl = async function(site) {
+        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-ssl', {method:'POST'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2535,7 +2589,7 @@ async def list_sites(auth: bool = Depends(check_auth)):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -2552,6 +2606,7 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
         site = data.get("site", "").strip()
         group = data.get("group", "external")
         threshold = int(data.get("threshold", 5))
+        ssl_verify = data.get("ssl_verify", True)
         if not site:
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
         if threshold < 1 or threshold > 60:
@@ -2568,13 +2623,14 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
             conn.close()
             return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         cur.execute("""
-            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
-            VALUES (%s, %s, %s, TRUE)
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
+            VALUES (%s, %s, %s, TRUE, %s)
             ON CONFLICT (site) DO UPDATE SET
                 is_active = TRUE,
                 site_group = EXCLUDED.site_group,
-                alert_threshold = EXCLUDED.alert_threshold
-        """, (site, group, threshold))
+                alert_threshold = EXCLUDED.alert_threshold,
+                ssl_verify = EXCLUDED.ssl_verify
+        """, (site, group, threshold, ssl_verify))
         conn.commit()
         cur.close()
         conn.close()
@@ -2640,6 +2696,33 @@ async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
         _invalidate_dashboard_cache()
         new_status = "enabled" if row[0] else "disabled"
         return {"status": "ok", "msg": f"Site '{site_name}' {new_status}", "is_active": row[0]}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.post("/api/sites/{site_name:path}/toggle-ssl")
+async def toggle_site_ssl(site_name: str, auth: bool = Depends(check_auth)):
+    """Переключить ssl_verify для сайта"""
+    try:
+        if site_name in SELF_MONITORING_SITES:
+            return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE monitored_sites
+            SET ssl_verify = NOT ssl_verify
+            WHERE site = %s
+            RETURNING ssl_verify
+        """, (site_name,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if row is None:
+            return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        _invalidate_dashboard_cache()
+        ssl_status = "verified" if row[0] else "skipped"
+        return {"status": "ok", "msg": f"SSL {ssl_status} for '{site_name}'", "ssl_verify": row[0]}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
