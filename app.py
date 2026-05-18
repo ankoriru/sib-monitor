@@ -1125,6 +1125,29 @@ def _db_incident_resolve(site):
         print(f"[INCIDENT RESOLVE ERR] {site}: {e}")
 
 
+def _db_incident_resolve_by_id(incident_id):
+    """Закрывает инцидент по ID (ручное закрытие через админку)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE incidents
+            SET end_time = NOW(),
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                resolved = TRUE
+            WHERE id = %s AND resolved = FALSE
+            RETURNING site
+        """, (incident_id,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[INCIDENT RESOLVE BY ID ERR] {incident_id}: {e}")
+        return None
+
+
 # ============================================================================
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
@@ -2782,6 +2805,21 @@ async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 
+@app.post("/api/incidents/{incident_id}/resolve")
+async def resolve_incident_endpoint(incident_id: int, admin_session: str = Cookie(None)):
+    """Ручное закрытие инцидента по ID (требует admin-пароль)"""
+    if admin_session != "authenticated_admin":
+        return JSONResponse({"status": "error", "msg": "Требуется авторизация в админке"}, status_code=401)
+    try:
+        site = _db_incident_resolve_by_id(incident_id)
+        if site:
+            _invalidate_dashboard_cache()
+            return {"status": "ok", "msg": f"Инцидент #{incident_id} закрыт"}
+        return JSONResponse({"status": "error", "msg": "Инцидент не найден или уже закрыт"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
 # ============================================================================
 # API: Self Monitoring (для админ-панели)
 # ============================================================================
@@ -3623,17 +3661,21 @@ def _build_body(data: dict) -> str:
     </div></div>
     <div id="t3" class="tab-content">
     <div class="table-wrap"><table class="incidents-table"><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
-    <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th></tr></thead><tbody>""")
+    <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th><th>Действие</th></tr></thead><tbody>""")
 
     for idx, r in enumerate(incidents_list):
         hidden_class = 'incident-hidden' if idx >= 20 else ''
-        resolved_badge = '✅ Resolved' if r.get('resolved', True) else '🔴 Active'
-        H.append(f"""<tr class="{hidden_class}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+        resolved = r.get('resolved', True)
+        resolved_badge = '✅ Resolved' if resolved else '🔴 Active'
+        incident_id = r['id']
+        close_btn = '' if resolved else f'<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;" onclick="resolveIncident({incident_id})">✅ Закрыть</button>'
+        H.append(f"""<tr class="{hidden_class}" id="incident-row-{r['id']}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
             <td>{r['max_status']}</td><td>{r['description']}</td>
             <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
                 {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td>
-            <td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{'#dcfce7;color:#166534' if r.get('resolved', True) else '#fee2e2;color:#991b1b'}">{resolved_badge}</span></td></tr>""")
+            <td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{'#dcfce7;color:#166534' if resolved else '#fee2e2;color:#991b1b'}">{resolved_badge}</span></td>
+            <td>{close_btn}</td></tr>""")
 
     total_incidents = len(incidents_list)
     if total_incidents > 20:
@@ -3772,6 +3814,23 @@ def _build_body(data: dict) -> str:
                 '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
         } finally {
             chartsLoading = false;
+        }
+    }
+
+    async function resolveIncident(incidentId) {
+        if (!confirm('Закрыть инцидент #' + incidentId + '?')) return;
+        try {
+            const r = await fetch('/api/incidents/' + incidentId + '/resolve', {method: 'POST'});
+            const data = await r.json();
+            if (data.status === 'ok') {
+                const row = document.getElementById('incident-row-' + incidentId);
+                if (row) row.style.opacity = '0.5';
+                location.reload();
+            } else {
+                alert(data.msg || 'Ошибка');
+            }
+        } catch (e) {
+            alert('Ошибка сети: ' + e);
         }
     }
 
