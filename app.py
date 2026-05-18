@@ -607,8 +607,6 @@ def init_db():
             ("polylabsearch.ru", "external"),
             ("portenergo.com", "external"),
             ("portal-rd.rusproject.ru", "external"),
-            ("lsdts.sibur.ru", "stdo"),
-            ("extar.sibur.ru", "stdo"),
             ("rusvinyl.ru", "external"),
             ("sharefile.sibur.ru", "external"),
             ("sibur.digital", "external"),
@@ -1752,46 +1750,8 @@ async def startup_event():
                 print("[STARTUP] Added portal-rd.rusproject.ru to monitored_sites")
         except Exception as e:
             print(f"[STARTUP WARN] portal-rd migration: {e}")
-        # Миграция: добавить lsdts.sibur.ru если отсутствует
-        try:
-            cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'lsdts.sibur.ru'")
-            if not cur.fetchone():
-                cur.execute("""
-                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
-                    VALUES ('lsdts.sibur.ru', 'stdo', 2, TRUE, FALSE)
-                    ON CONFLICT DO NOTHING
-                """)
-                conn.commit()
-                print("[STARTUP] Added lsdts.sibur.ru to monitored_sites (ssl_verify=FALSE)")
-        except Exception as e:
-            print(f"[STARTUP WARN] lsdts migration: {e}")
-        # Миграция: добавить extar.sibur.ru если отсутствует
-        try:
-            cur.execute("SELECT 1 FROM monitored_sites WHERE site = 'extar.sibur.ru'")
-            if not cur.fetchone():
-                cur.execute("""
-                    INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify)
-                    VALUES ('extar.sibur.ru', 'stdo', 2, TRUE, FALSE)
-                    ON CONFLICT DO NOTHING
-                """)
-                conn.commit()
-                print("[STARTUP] Added extar.sibur.ru to monitored_sites (ssl_verify=FALSE)")
-        except Exception as e:
-            print(f"[STARTUP WARN] extar migration: {e}")
-        # FORCE FIX: set ssl_verify=FALSE for sites with known SSL issues
-        ssl_skip_sites = ['lsdts.sibur.ru', 'extar.sibur.ru', 'portal-rd.rusproject.ru',
-                          'icenter.tdms.nipigas.ru/cp/', 'tdms.progress-epc.ru/cp/',
-                          'icenter.tdms.newresources.ru/cp/', 'agpp.tdms.nipigas.ru/cp/',
-                          'agpp.tdms.nipigas.ru/DMS21/', 'tst-stdo.tdms.sibur.ru/cp/',
-                          'cp.tdms.sibur.ru/cp/']
-        try:
-            for s in ssl_skip_sites:
-                cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s AND (ssl_verify = TRUE OR ssl_verify IS NULL)", (s,))
-                if cur.rowcount > 0:
-                    print(f"[STARTUP] Fixed ssl_verify=FALSE for '{s}' (was NULL or TRUE)")
-            conn.commit()
-        except Exception as e:
-            print(f"[STARTUP WARN] SSL skip fix: {e}")
+        # Sites removed from seed — they must be added via admin panel only
+        # ssl_verify is managed via admin panel only
         cur.close()
         conn.close()
     except Exception as e:
@@ -2862,29 +2822,20 @@ async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
-        # 1. Деактивируем сайт (не удаляем!)
-        cur.execute("UPDATE monitored_sites SET is_active = FALSE WHERE site = %s", (site_name,))
-        conn.commit()
+        # 1. Полное удаление инцидентов для этого сайта
+        cur.execute("DELETE FROM incidents WHERE site = %s", (site_name,))
+        deleted_incidents = cur.rowcount
+        # 2. Полное удаление сайта из БД
+        cur.execute("DELETE FROM monitored_sites WHERE site = %s", (site_name,))
         affected = cur.rowcount
-        # 2. Закрываем активные инциденты для этого сайта
-        if affected > 0:
-            cur.execute("""
-                UPDATE incidents
-                SET end_time = NOW(),
-                    duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
-                    resolved = TRUE
-                WHERE site = %s AND resolved = FALSE
-            """, (site_name,))
-            closed_incidents = cur.rowcount
-            conn.commit()
-            if closed_incidents > 0:
-                print(f"[DELETE SITE] Closed {closed_incidents} incidents for '{site_name}'")
+        conn.commit()
         cur.close()
         conn.close()
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
+        print(f"[DELETE SITE] '{site_name}' fully deleted, {deleted_incidents} incidents removed")
         _invalidate_dashboard_cache()
-        return {"status": "ok", "msg": f"Site '{site_name}' deactivated"}
+        return {"status": "ok", "msg": f"Site '{site_name}' fully deleted"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
@@ -3386,20 +3337,11 @@ async def _index_stream():
     cur2.close()
     conn2.close()
 
-    # Собираем сайты по категориям
+    # Собираем сайты по категориям (только из monitored_sites is_active=TRUE)
     sites_by_cat = {}
     for r in monitored_rows:
         sg = r['site_group'] or 'external'
         sites_by_cat.setdefault(sg, []).append(r['site'])
-    # Добавляем сайты не из monitored_sites во 'external'
-    for s in SITES:
-        found = False
-        for cat_sites in sites_by_cat.values():
-            if s in cat_sites:
-                found = True
-                break
-        if not found:
-            sites_by_cat.setdefault('external', []).append(s)
 
     categories_data = []
     for cat in db_cats_list:
@@ -3592,9 +3534,6 @@ def _build_body(data: dict) -> str:
     active_sites_set = set()
     for cat_sites in data.get("sites_by_cat", {}).values():
         active_sites_set.update(cat_sites)
-    # Если sites_by_cat пуст — fallback на SITES
-    if not active_sites_set:
-        active_sites_set = set(SITES)
 
     incidents = [s for s, v in latest.items() if s in active_sites_set and v['status'] != 200]
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
