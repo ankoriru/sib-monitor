@@ -2021,6 +2021,7 @@ async def _admin_page_inner(request, response):
         </div>
         <div class="tabs">
             <button class="tab-btn active" onclick="adminTab(this, 'sites-tab')">Сайты</button>
+            <button class="tab-btn" onclick="adminTab(this, 'incidents-tab')">Инциденты</button>
             <button class="tab-btn" onclick="adminTab(this, 'settings-tab')">Настройки</button>
             <button class="tab-btn" onclick="adminTab(this, 'self-tab')">Self Monitoring</button>
             <button class="tab-btn" onclick="adminTab(this, 'docs-tab')">Описание</button>
@@ -2077,6 +2078,13 @@ async def _admin_page_inner(request, response):
         </tr>""")
 
     H.append("""</tbody></table></div>
+    <div id="incidents-tab" class="tab-content">
+        <h3 style="color:#00717a;margin-top:0;">Управление инцидентами</h3>
+        <div id="admin-incidents-loading">Загрузка...</div>
+        <table id="admin-incidents-table" style="display:none;width:100%;font-size:13px;"><thead><tr>
+            <th>Начало</th><th>Сайт</th><th>Длительность</th><th>Код</th><th>Описание</th><th>Статус</th><th>Действие</th>
+        </tr></thead><tbody id="admin-incidents-tbody"></tbody></table>
+    </div>
     <div id="settings-tab" class="tab-content">
         <h3 style="color:#00717a;margin-top:0;">Настройки приложения</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;max-width:800px;">
@@ -2141,6 +2149,7 @@ async def _admin_page_inner(request, response):
         btn.classList.add('active');
         console.log('Tab activated:', n);
         if (n === 'sites-tab') loadCategorySelects();
+        if (n === 'incidents-tab') loadAdminIncidents();
         if (n === 'settings-tab') loadSettings();
         if (n === 'self-tab') loadSelfMonitoring();
         if (n === 'docs-tab') loadDocs();
@@ -2308,6 +2317,47 @@ async def _admin_page_inner(request, response):
             }
         } catch (e) {
             loading.innerText = 'Ошибка связи с сервером';
+        }
+    }
+    window.loadAdminIncidents = async function() {
+        const loading = document.getElementById('admin-incidents-loading');
+        const table = document.getElementById('admin-incidents-table');
+        const tbody = document.getElementById('admin-incidents-tbody');
+        loading.style.display = 'block';
+        table.style.display = 'none';
+        try {
+            const r = await fetch('/api/incidents');
+            const data = await r.json();
+            if (data.status === 'ok' && data.incidents) {
+                let html = '';
+                for (const inc of data.incidents) {
+                    const resolved = inc.resolved;
+                    const badge = resolved ? '<span style="font-size:12px;padding:3px 8px;border-radius:4px;background:#dcfce7;color:#166534">✅ Resolved</span>' : '<span style="font-size:12px;padding:3px 8px;border-radius:4px;background:#fee2e2;color:#991b1b">🔴 Active</span>';
+                    const closeBtn = resolved ? '' : `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;" onclick="resolveIncident(${inc.id})">✅ Закрыть</button>`;
+                    html += `<tr id="admin-inc-${inc.id}"><td>${inc.start_time}</td><td>${inc.site}</td><td>${inc.duration_min} мин</td><td>${inc.max_status}</td><td>${inc.description || '—'}</td><td>${badge}</td><td>${closeBtn}</td></tr>`;
+                }
+                tbody.innerHTML = html;
+                loading.style.display = 'none';
+                table.style.display = 'table';
+            } else {
+                loading.innerText = 'Ошибка загрузки инцидентов';
+            }
+        } catch (e) {
+            loading.innerText = 'Ошибка связи с сервером';
+        }
+    }
+    window.resolveIncident = async function(incidentId) {
+        if (!confirm('Закрыть инцидент #' + incidentId + '?')) return;
+        try {
+            const r = await fetch('/api/incidents/' + incidentId + '/resolve', {method: 'POST'});
+            const data = await r.json();
+            if (data.status === 'ok') {
+                loadAdminIncidents();
+            } else {
+                alert(data.msg || 'Ошибка');
+            }
+        } catch (e) {
+            alert('Ошибка сети: ' + e);
         }
     }
     function renderSelfTable(data) {
@@ -2786,21 +2836,59 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(check_auth)):
 
 @app.delete("/api/sites/{site_name:path}")
 async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
-    """Окончательное удаление сайта из БД"""
+    """Деактивация сайта (is_active=FALSE) + закрытие активных инцидентов"""
     try:
         if site_name in SELF_MONITORING_SITES:
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("DELETE FROM monitored_sites WHERE site = %s", (site_name,))
+        # 1. Деактивируем сайт (не удаляем!)
+        cur.execute("UPDATE monitored_sites SET is_active = FALSE WHERE site = %s", (site_name,))
         conn.commit()
         affected = cur.rowcount
+        # 2. Закрываем активные инциденты для этого сайта
+        if affected > 0:
+            cur.execute("""
+                UPDATE incidents
+                SET end_time = NOW(),
+                    duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
+                    resolved = TRUE
+                WHERE site = %s AND resolved = FALSE
+            """, (site_name,))
+            closed_incidents = cur.rowcount
+            conn.commit()
+            if closed_incidents > 0:
+                print(f"[DELETE SITE] Closed {closed_incidents} incidents for '{site_name}'")
         cur.close()
         conn.close()
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
         _invalidate_dashboard_cache()
-        return {"status": "ok", "msg": f"Site '{site_name}' deleted"}
+        return {"status": "ok", "msg": f"Site '{site_name}' deactivated"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.get("/api/incidents")
+async def get_incidents(auth: bool = Depends(check_auth)):
+    """Список всех инцидентов (последние 100)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("""
+            SELECT id, site, start_time, duration_min, max_status, description, resolved
+            FROM incidents
+            ORDER BY start_time DESC
+            LIMIT 100
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        # Format start_time
+        for r in rows:
+            if r.get('start_time'):
+                r['start_time'] = r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')
+        return {"status": "ok", "incidents": rows}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
@@ -3176,7 +3264,8 @@ async def _index_stream():
                  WHEN max_status = 503 THEN 'Service Unavailable'
                  WHEN max_status = 701 THEN 'Content Mismatch'
                  ELSE 'Server Error' END as description,
-            ssl_chain_valid
+            ssl_chain_valid,
+            id
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
           AND site <> ALL(%s)
@@ -3207,7 +3296,8 @@ async def _index_stream():
                      WHEN MAX(status) = 503 THEN 'Service Unavailable'
                      WHEN MAX(status) = 701 THEN 'Content Mismatch'
                      ELSE 'Server Error' END as description,
-                NULL::boolean as ssl_chain_valid
+                NULL::boolean as ssl_chain_valid,
+                0 as id
             FROM incident_groups
             GROUP BY site, grp_id ORDER BY start_time DESC LIMIT 100
         """, (SELF_MONITORING_SITES,))
@@ -3222,7 +3312,8 @@ async def _index_stream():
                  WHEN max_status = 503 THEN 'Service Unavailable'
                  WHEN max_status = 701 THEN 'Content Mismatch'
                  ELSE 'Server Error' END as description,
-            ssl_chain_valid
+            ssl_chain_valid,
+            id
         FROM incidents
         WHERE start_time > NOW() - INTERVAL '30 days'
           AND site = ANY(%s)
@@ -3661,21 +3752,18 @@ def _build_body(data: dict) -> str:
     </div></div>
     <div id="t3" class="tab-content">
     <div class="table-wrap"><table class="incidents-table"><thead><tr><th>Начало</th><th>Сайт</th><th>Длительность</th>
-    <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th><th>Действие</th></tr></thead><tbody>""")
+    <th>Код</th><th>Описание</th><th>Цепочка SSL</th><th>Статус</th></tr></thead><tbody>""")
 
     for idx, r in enumerate(incidents_list):
         hidden_class = 'incident-hidden' if idx >= 20 else ''
         resolved = r.get('resolved', True)
         resolved_badge = '✅ Resolved' if resolved else '🔴 Active'
-        incident_id = r['id']
-        close_btn = '' if resolved else f'<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;" onclick="resolveIncident({incident_id})">✅ Закрыть</button>'
-        H.append(f"""<tr class="{hidden_class}" id="incident-row-{r['id']}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
+        H.append(f"""<tr class="{hidden_class}"><td>{r['start_time'].astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M')}</td>
             <td>{r['site']}</td><td class='txt-err'>{r['dur']} мин</td>
             <td>{r['max_status']}</td><td>{r['description']}</td>
             <td class="{'txt-err' if r.get('ssl_chain_valid') == False else 'txt-ok' if r.get('ssl_chain_valid') == True else ''}">
                 {'✅' if r.get('ssl_chain_valid') == True else '❌' if r.get('ssl_chain_valid') == False else '—'}</td>
-            <td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{'#dcfce7;color:#166534' if resolved else '#fee2e2;color:#991b1b'}">{resolved_badge}</span></td>
-            <td>{close_btn}</td></tr>""")
+            <td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{'#dcfce7;color:#166534' if resolved else '#fee2e2;color:#991b1b'}">{resolved_badge}</span></td></tr>""")
 
     total_incidents = len(incidents_list)
     if total_incidents > 20:
@@ -3814,23 +3902,6 @@ def _build_body(data: dict) -> str:
                 '<div style="text-align:center; padding:40px; color:#b91c1c;">Ошибка загрузки графиков</div>';
         } finally {
             chartsLoading = false;
-        }
-    }
-
-    async function resolveIncident(incidentId) {
-        if (!confirm('Закрыть инцидент #' + incidentId + '?')) return;
-        try {
-            const r = await fetch('/api/incidents/' + incidentId + '/resolve', {method: 'POST'});
-            const data = await r.json();
-            if (data.status === 'ok') {
-                const row = document.getElementById('incident-row-' + incidentId);
-                if (row) row.style.opacity = '0.5';
-                location.reload();
-            } else {
-                alert(data.msg || 'Ошибка');
-            }
-        } catch (e) {
-            alert('Ошибка сети: ' + e);
         }
     }
 
