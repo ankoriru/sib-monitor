@@ -561,6 +561,10 @@ def init_db():
     if not _column_exists(cur, 'monitored_sites', 'content_match_enabled'):
         cur.execute("ALTER TABLE monitored_sites ADD COLUMN content_match_enabled BOOLEAN DEFAULT TRUE")
         print("[INIT] Migrated: added content_match_enabled column")
+    # Fix NULL values for content_match_enabled
+    cur.execute("UPDATE monitored_sites SET content_match_enabled = TRUE WHERE content_match_enabled IS NULL")
+    if cur.rowcount > 0:
+        print(f"[INIT] Fixed {cur.rowcount} rows with NULL content_match_enabled")
     # Таблица категорий сайтов (динамические)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS site_categories (
@@ -1525,7 +1529,8 @@ def check_worker():
                 _cm_sites_set.update(_categories.get(cat_id, []))
             # Фильтруем по content_match_enabled на уровне сайта
             _cm_sites_set = {s for s in _cm_sites_set if cm_enabled_map.get(s, True)}
-            print(f"[WORKER] Content match sites: {len(_cm_sites_set)} ({list(_cm_sites_set)[:5]}...)")
+            print(f"[WORKER] Content match sites: {len(_cm_sites_set)} (filtered from {len(_categories)} categories)")
+            print(f"[WORKER] Content match enabled map: {cm_enabled_map}")
             # Обновляем настройки (content match pattern)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
@@ -1912,7 +1917,7 @@ async def admin_login_page():
 
 
 @app.post("/admin/auth")
-async def admin_auth(request: Request, response: Response):
+async def admin_login_handler(request: Request, response: Response):
     """Проверка пароля для админ-панели"""
     try:
         data = await request.json()
