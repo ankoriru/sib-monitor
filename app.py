@@ -66,7 +66,7 @@ SITES = [
     "photo.sibur.ru", "polylabsearch.ru", "portenergo.com",
     "rusvinyl.ru", "sharefile.sibur.ru",
     "sibur.digital", "sibur-int.com", "sibur-int.ru", "sibur-yug.ru",
-    "snck.ru", "transportorder.sibur.ru", "tu-sibur.ru", "vivilen.sibur.ru",
+    "snck.ru", "transportorder.sibur.ru", "tms.sibur.ru", "tu-sibur.ru", "vivilen.sibur.ru",
     # TDMS / STDO системы (ранее NEW_MONITORING_SITES)
     "icenter.tdms.nipigas.ru/cp/", "tdms.progress-epc.ru/cp/",
     "icenter.tdms.newresources.ru/cp/", "agpp.tdms.nipigas.ru/cp/",
@@ -619,7 +619,7 @@ def init_db():
             ("vivilen.sibur.ru", "external"),
         ]
         # STDO сайты
-        for s in NEW_MONITORING_SITES:
+        for s in STDO_SITES:
             default_sites.append((s, "stdo"))
         execute_values(cur,
             "INSERT INTO monitored_sites (site, site_group) VALUES %s ON CONFLICT DO NOTHING",
@@ -939,6 +939,9 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                     except Exception as e:
                         curr_status = 701
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
+                elif curr_status in (307, 308):
+                    # 307/308 = редирект, сервер работает — считаем OK
+                    curr_status = 200
                 elif curr_status == 401:
                     # 401 = сервер работает, требует авторизацию — считаем OK
                     curr_status = 200
@@ -1992,6 +1995,7 @@ async def _admin_page_inner(request, response):
         .row-err { background-color: #fff1f2 !important; }
         .txt-err { color: #dc2626; font-weight: bold; }
         .txt-ok { color: #16a34a; font-weight: bold; }
+        .txt-warn { color: #d97706; font-weight: bold; }
         .loading { text-align: center; padding: 40px; color: #999; }
     </style></head><body>
     <div class="container">
@@ -2072,6 +2076,13 @@ async def _admin_page_inner(request, response):
                 <h4 style="margin-top:0;color:#475569;">Content Match (regex)</h4>
                 <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Паттерн проверки контента для ключевых сайтов. Если контент не содержит совпадений, сайт считается DOWN (701).</p>
                 <input type="text" id="setting-pattern" placeholder="sibur|сибур|логин" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;box-sizing:border-box;">
+                <hr style="border:0;border-top:1px solid #e2e8f0;margin:12px 0;">
+                <h5 style="margin:0 0 8px;color:#475569;">Тестер Content Match</h5>
+                <div style="display:flex;gap:6px;margin-bottom:8px;">
+                    <input type="text" id="test-cm-site" placeholder="tms.sibur.ru" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;">
+                    <button onclick="testContentMatch()" class="btn btn-primary" style="font-size:12px;padding:6px 12px;">Проверить</button>
+                </div>
+                <div id="test-cm-result" style="font-size:12px;display:none;"></div>
             </div>
             <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
                 <h4 style="margin-top:0;color:#475569;">Категории сайтов</h4>
@@ -2201,6 +2212,29 @@ async def _admin_page_inner(request, response):
                 alert('Ошибка: ' + d.msg);
             }
         } catch(e) { alert('Ошибка сети'); }
+    }
+    window.testContentMatch = async function() {
+        var site = document.getElementById('test-cm-site').value.trim();
+        var resultDiv = document.getElementById('test-cm-result');
+        if (!site) { resultDiv.style.display = 'block'; resultDiv.innerHTML = '<span style="color:#dc2626">Введите сайт</span>'; return; }
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = 'Проверка...';
+        try {
+            var pattern = document.getElementById('setting-pattern').value.trim();
+            var r = await fetch('/api/test-content-match', {
+                method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({site: site, pattern: pattern})
+            });
+            var d = await r.json();
+            if (d.status === 'ok') {
+                var matchColor = d.match_found ? 'color:#16a34a' : 'color:#dc2626';
+                var matchText = d.match_found ? '✅ Совпадение найдено' : '❌ Совпадений нет';
+                var matchesHtml = d.matches.length ? '<details style="margin-top:4px;"><summary>Найденные фрагменты (' + d.matches.length + ')</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:100px;">' + d.matches.map(function(m) { return '...' + m + '...'; }).join('<br>') + '</pre></details>' : '';
+                resultDiv.innerHTML = '<div><strong>HTTP ' + d.http_status + '</strong> | <span style="' + matchColor + '">' + matchText + '</span></div><div style="color:#64748b;margin-top:4px;">Паттерн: <code>' + d.pattern + '</code></div><details style="margin-top:4px;"><summary>HTML preview (500 chars)</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:100px;font-size:10px;">' + d.text_preview + '</pre></details>' + matchesHtml;
+            } else {
+                resultDiv.innerHTML = '<span style="color:#dc2626">Ошибка: ' + (d.msg || 'Неизвестная ошибка') + '</span>';
+            }
+        } catch(e) { resultDiv.innerHTML = '<span style="color:#dc2626">Ошибка сети</span>'; }
     }
     window.saveSettings = async function() {
         var msg = document.getElementById('settings-msg');
@@ -2810,6 +2844,62 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
         _invalidate_dashboard_cache()
         ssl_status = "verified" if row[0] else "skipped"
         return {"status": "ok", "msg": f"SSL {ssl_status} for '{site_name}'", "ssl_verify": row[0]}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
+@app.post("/api/test-content-match")
+async def test_content_match(request: Request, auth: bool = Depends(admin_auth)):
+    """Проверить Content Match (regex) на конкретном сайте"""
+    try:
+        data = await request.json()
+        site = data.get("site", "").strip()
+        pattern = data.get("pattern", "")
+        if not site:
+            return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
+        # Load current pattern from DB if not provided
+        if not pattern:
+            settings = load_settings()
+            pattern = settings.get('content_match_pattern', 'sibur|сибур')
+        # Check SSL setting for this site
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT ssl_verify FROM monitored_sites WHERE site = %s", (site,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        verify_ssl = row[0] if row and row[0] is not None else True
+        # Make HTTP request
+        import aiohttp
+        check_url = f"https://{site}"
+        connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(check_url, allow_redirects=True) as resp:
+                status = resp.status
+                try:
+                    text = await asyncio.wait_for(resp.text(), timeout=10)
+                except Exception:
+                    text = ""
+                text_lower = text.lower()
+                import re
+                regex = re.compile(pattern, re.IGNORECASE)
+                match_found = regex.search(text_lower)
+                matches = []
+                if match_found:
+                    for m in regex.finditer(text_lower[:2000]):
+                        start = max(0, m.start() - 30)
+                        end = min(len(text_lower), m.end() + 30)
+                        matches.append(text_lower[start:end])
+                return {
+                    "status": "ok",
+                    "site": site,
+                    "http_status": status,
+                    "pattern": pattern,
+                    "match_found": bool(match_found),
+                    "matches": matches[:5],
+                    "text_preview": text_lower[:500] if text else "(empty response)"
+                }
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
@@ -3492,6 +3582,7 @@ def _build_head() -> str:
         .row-err { background-color: #fff1f2 !important; }
         .txt-err { color: #dc2626; font-weight: bold; }
         .txt-ok { color: #16a34a; font-weight: bold; }
+        .txt-warn { color: #d97706; font-weight: bold; }
         .refresh-btn { background: #00717a; color: white; border: none;
                         padding: 8px 15px; border-radius: 6px; cursor: pointer; }
         .btn-test { background: #00717a; color: white; border: none;
@@ -3597,7 +3688,14 @@ def _build_body(data: dict) -> str:
     def get_site_group(site_name):
         return site_to_cat.get(site_name, 999)
 
-    sorted_sites = sorted(SITES, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
+    # Собираем все активные сайты из динамических категорий (не из глобального SITES)
+    all_active_sites = []
+    for cat in categories:
+        all_active_sites.extend(cat['sites'])
+    # Fallback: если категории пусты — используем SITES
+    if not all_active_sites:
+        all_active_sites = SITES
+    sorted_sites = sorted(all_active_sites, key=lambda x: (get_site_group(x), 0 if x == 'sibur.ru' else 1, x))
     sorted_sites_json = json.dumps(sorted_sites)
 
     # Build categoriesData for JS: [{id, label, sites}]
@@ -3691,18 +3789,33 @@ def _build_body(data: dict) -> str:
             g_sub = f'<span class="group-sub">Online: {st["online"]}/{st["total"]} | Uptime: {st["upt"]}% | Avg Ответ: {st["resp"]}с</span>'
             H.append(f'<tr><td colspan="9" class="group-header">{group_names[g]}{g_sub}</td></tr>')
             current_group = g
+        # Проверяем, есть ли сайт в latest (проверялся ли уже)
+        is_new_site = s not in latest
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
-        is_err = (v['status'] != 200 or (0 <= v['ssl_days'] <= 20) or
-                  (0 <= v['domain_days'] <= 30) or v.get('ssl_chain_valid') == False)
+        is_err = (not is_new_site and v['status'] != 200) or (0 <= v['ssl_days'] <= 20) or \
+                 (0 <= v['domain_days'] <= 30) or v.get('ssl_chain_valid') == False
         g_idx = get_site_group(s)
         prefix = "⭐ " if g_idx == 0 else ("🛡️ " if g_idx == 1 else "")
+
+        # Статус для отображения
+        if is_new_site:
+            status_label = '⏳ Ожидает проверки'
+            status_class = 'txt-warn'
+        elif v['status'] == 200:
+            status_label = 'Online'
+            status_class = 'txt-ok'
+        elif v['status'] == 701:
+            status_label = 'Content Mismatch'
+            status_class = 'txt-err'
+        else:
+            status_label = 'Offline'
+            status_class = 'txt-err'
 
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
-            <td><span class="{'txt-ok' if v['status']==200 else 'txt-err'}">
-                {'Online' if v['status']==200 else ('Content Mismatch' if v['status']==701 else 'Offline')}</span></td>
+            <td><span class="{status_class}">{status_label}</span></td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
             <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
