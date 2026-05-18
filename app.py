@@ -1732,6 +1732,20 @@ async def startup_event():
                 print("[STARTUP] Added extar.sibur.ru to monitored_sites (ssl_verify=FALSE)")
         except Exception as e:
             print(f"[STARTUP WARN] extar migration: {e}")
+        # FORCE FIX: set ssl_verify=FALSE for sites with known SSL issues
+        ssl_skip_sites = ['lsdts.sibur.ru', 'extar.sibur.ru', 'portal-rd.rusproject.ru',
+                          'icenter.tdms.nipigas.ru/cp/', 'tdms.progress-epc.ru/cp/',
+                          'icenter.tdms.newresources.ru/cp/', 'agpp.tdms.nipigas.ru/cp/',
+                          'agpp.tdms.nipigas.ru/DMS21/', 'tst-stdo.tdms.sibur.ru/cp/',
+                          'cp.tdms.sibur.ru/cp/']
+        try:
+            for s in ssl_skip_sites:
+                cur.execute("UPDATE monitored_sites SET ssl_verify = FALSE WHERE site = %s AND (ssl_verify = TRUE OR ssl_verify IS NULL)", (s,))
+                if cur.rowcount > 0:
+                    print(f"[STARTUP] Fixed ssl_verify=FALSE for '{s}' (was NULL or TRUE)")
+            conn.commit()
+        except Exception as e:
+            print(f"[STARTUP WARN] SSL skip fix: {e}")
         cur.close()
         conn.close()
     except Exception as e:
