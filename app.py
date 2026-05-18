@@ -219,7 +219,27 @@ def admin_check_auth(request: Request, response: Response, admin_session: str = 
                     value="authenticated_admin",
                     max_age=2592000,
                     httponly=True,
-                    secure=True,
+                    samesite="lax"
+                )
+                return True
+        except Exception:
+            pass
+    raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+def admin_auth(request: Request, response: Response, admin_session: str = Cookie(None)):
+    """Универсальная аутентификация для API админки (cookie или X-Admin-Auth header)"""
+    if admin_session == "authenticated_admin":
+        return True
+    auth = request.headers.get("X-Admin-Auth")
+    if auth:
+        try:
+            if bcrypt.checkpw(auth.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+                response.set_cookie(
+                    key="admin_session",
+                    value="authenticated_admin",
+                    max_age=2592000,
+                    httponly=True,
                     samesite="lax"
                 )
                 return True
@@ -2157,13 +2177,13 @@ async def _admin_page_inner(request, response):
     window.loadSettings = async function() {
         try {
             // Load content match pattern
-            var r = await fetch('/api/settings');
+            var r = await fetch('/api/settings', {credentials: 'include'});
             var d = await r.json();
             if (d.status === 'ok' && d.settings) {
                 document.getElementById('setting-pattern').value = d.settings['content_match_pattern'] || '';
             }
             // Load dynamic categories
-            var cr = await fetch('/api/site-categories');
+            var cr = await fetch('/api/site-categories', {credentials: 'include'});
             var cd = await cr.json();
             if (cd.status === 'ok' && cd.categories) {
                 window._categories = cd.categories;
@@ -2192,7 +2212,7 @@ async def _admin_page_inner(request, response):
         var sort = parseInt(document.getElementById('cat-sort-' + catId).value) || 0;
         if (!label) { alert('Название обязательно'); return; }
         try {
-            var r = await fetch('/api/site-categories/' + catId, {
+            var r = await fetch('/api/site-categories/' + catId, {credentials: 'include',
                 method: 'PUT', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({label: label, content_match_enabled: cm, sort_order: sort})
             });
@@ -2207,7 +2227,7 @@ async def _admin_page_inner(request, response):
         if (!id || !label) { alert('ID и название обязательны'); return; }
         if (!/^[a-z0-9_]+$/.test(id)) { alert('ID: только a-z, 0-9, _'); return; }
         try {
-            var r = await fetch('/api/site-categories', {
+            var r = await fetch('/api/site-categories', {credentials: 'include',
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({id: id, label: label, content_match_enabled: cm})
             });
@@ -2228,7 +2248,7 @@ async def _admin_page_inner(request, response):
         var pattern = document.getElementById('setting-pattern').value.trim();
         if (!pattern) { msg.textContent = 'Паттерн обязателен'; return; }
         try {
-            var r = await fetch('/api/settings/content_match_pattern', {
+            var r = await fetch('/api/settings/content_match_pattern', {credentials: 'include',
                 method: 'PUT', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({value: pattern})
             });
@@ -2242,7 +2262,7 @@ async def _admin_page_inner(request, response):
                     var cm = document.getElementById('cat-cm-' + c.id).checked;
                     var sort = parseInt(document.getElementById('cat-sort-' + c.id).value) || 0;
                     if (!label) continue;
-                    var cr = await fetch('/api/site-categories/' + c.id, {
+                    var cr = await fetch('/api/site-categories/' + c.id, {credentials: 'include',
                         method: 'PUT', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({label: label, content_match_enabled: cm, sort_order: sort})
                     });
@@ -2257,7 +2277,7 @@ async def _admin_page_inner(request, response):
     }
     window.loadCategorySelects = async function() {
         try {
-            var r = await fetch('/api/site-categories');
+            var r = await fetch('/api/site-categories', {credentials: 'include'});
             var d = await r.json();
             if (d.status !== 'ok' || !d.categories) return;
             var cats = d.categories;
@@ -2285,7 +2305,7 @@ async def _admin_page_inner(request, response):
         loading.style.display = 'block';
         content.style.display = 'none';
         try {
-            const r = await fetch('/api/self-monitoring');
+            const r = await fetch('/api/self-monitoring', {credentials: 'include'});
             const data = await r.json();
             if (data.status === 'ok') {
                 renderSelfTable(data);
@@ -2326,7 +2346,7 @@ async def _admin_page_inner(request, response):
         loading.style.display = 'block';
         table.style.display = 'none';
         try {
-            const r = await fetch('/api/incidents');
+            const r = await fetch('/api/incidents', {credentials: 'include'});
             const data = await r.json();
             if (data.status === 'ok' && data.incidents) {
                 let html = '';
@@ -2349,7 +2369,7 @@ async def _admin_page_inner(request, response):
     window.resolveIncident = async function(incidentId) {
         if (!confirm('Закрыть инцидент #' + incidentId + '?')) return;
         try {
-            const r = await fetch('/api/incidents/' + incidentId + '/resolve', {method: 'POST'});
+            const r = await fetch('/api/incidents/' + incidentId + '/resolve', {method: 'POST', credentials: 'include'});
             const data = await r.json();
             if (data.status === 'ok') {
                 loadAdminIncidents();
@@ -2436,7 +2456,7 @@ async def _admin_page_inner(request, response):
         const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
         const sslVerify = document.getElementById('newSslVerify').checked;
         if (!site) return showToast('Введите сайт');
-        const r = await fetch('/api/sites', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify})});
+        const r = await fetch('/api/sites', {method:'POST', credentials: 'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify})});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2452,7 +2472,7 @@ async def _admin_page_inner(request, response):
         const group = document.getElementById('grp-' + site).value;
         const threshold = parseInt(document.getElementById('thr-' + site).value);
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {
-            method:'PUT', headers:{'Content-Type':'application/json'},
+            method:'PUT', credentials: 'include', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({group, threshold})
         });
         const data = await r.json();
@@ -2460,20 +2480,20 @@ async def _admin_page_inner(request, response):
         else { showToast(data.msg || 'Ошибка'); }
     }
     window.toggleSite = async function(site) {
-        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle', {method:'POST'});
+        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle', {method:'POST', credentials: 'include'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
     window.toggleSsl = async function(site) {
-        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-ssl', {method:'POST'});
+        const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-ssl', {method:'POST', credentials: 'include'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
     }
     window.deleteSite = async function(site) {
         if (!confirm('Удалить ' + site + ' окончательно?')) return;
-        const r = await fetch('/api/sites/' + encodeURIComponent(site), {method:'DELETE'});
+        const r = await fetch('/api/sites/' + encodeURIComponent(site), {method:'DELETE', credentials: 'include'});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2491,7 +2511,7 @@ async def _admin_page_inner(request, response):
 # API: Настройки приложения (content match, названия категорий)
 # ============================================================================
 @app.get("/api/settings")
-async def get_settings(auth: bool = Depends(check_auth)):
+async def get_settings(auth: bool = Depends(admin_auth)):
     """Получить все настройки приложения"""
     try:
         return {"status": "ok", "settings": load_settings()}
@@ -2500,7 +2520,7 @@ async def get_settings(auth: bool = Depends(check_auth)):
 
 
 @app.put("/api/settings/{key}")
-async def update_setting(key: str, request: Request, auth: bool = Depends(check_auth)):
+async def update_setting(key: str, request: Request, auth: bool = Depends(admin_auth)):
     """Обновить одну настройку (content_match_pattern, category_*_label)"""
     try:
         data = await request.json()
@@ -2535,7 +2555,7 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(check_
 
 
 @app.get("/api/categories")
-async def get_categories(auth: bool = Depends(check_auth)):
+async def get_categories(auth: bool = Depends(admin_auth)):
     """Получить сайты по категориям (динамические из БД)"""
     try:
         conn = get_db_connection()
@@ -2569,7 +2589,7 @@ async def get_categories(auth: bool = Depends(check_auth)):
 
 
 @app.get("/api/site-categories")
-async def list_site_categories(auth: bool = Depends(check_auth)):
+async def list_site_categories(auth: bool = Depends(admin_auth)):
     """Получить список категорий сайтов"""
     try:
         conn = get_db_connection()
@@ -2584,7 +2604,7 @@ async def list_site_categories(auth: bool = Depends(check_auth)):
 
 
 @app.post("/api/site-categories")
-async def create_site_category(request: Request, auth: bool = Depends(check_auth)):
+async def create_site_category(request: Request, auth: bool = Depends(admin_auth)):
     """Создать новую категорию сайтов"""
     try:
         data = await request.json()
@@ -2615,7 +2635,7 @@ async def create_site_category(request: Request, auth: bool = Depends(check_auth
 
 
 @app.put("/api/site-categories/{cat_id}")
-async def update_site_category(cat_id: str, request: Request, auth: bool = Depends(check_auth)):
+async def update_site_category(cat_id: str, request: Request, auth: bool = Depends(admin_auth)):
     """Обновить категорию сайтов"""
     try:
         data = await request.json()
@@ -2642,7 +2662,7 @@ async def update_site_category(cat_id: str, request: Request, auth: bool = Depen
 
 
 @app.delete("/api/site-categories/{cat_id}")
-async def delete_site_category(cat_id: str, auth: bool = Depends(check_auth)):
+async def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
     """Удалить категорию (сайты перемещаются в 'external')"""
     try:
         conn = get_db_connection()
@@ -2690,7 +2710,7 @@ async def health():
 
 
 @app.get("/api/sites")
-async def list_sites(auth: bool = Depends(check_auth)):
+async def list_sites(auth: bool = Depends(admin_auth)):
     """Список всех сайтов в мониторинге (без self-monitoring)"""
     try:
         conn = get_db_connection()
@@ -2705,7 +2725,7 @@ async def list_sites(auth: bool = Depends(check_auth)):
 
 
 @app.post("/api/sites")
-async def add_site(request: Request, auth: bool = Depends(check_auth)):
+async def add_site(request: Request, auth: bool = Depends(admin_auth)):
     """Добавить сайт в мониторинг"""
     try:
         data = await request.json()
@@ -2747,7 +2767,7 @@ async def add_site(request: Request, auth: bool = Depends(check_auth)):
 
 
 @app.put("/api/sites/{site_name:path}")
-async def update_site(site_name: str, request: Request, auth: bool = Depends(check_auth)):
+async def update_site(site_name: str, request: Request, auth: bool = Depends(admin_auth)):
     """Обновить группу и порог сайта"""
     try:
         data = await request.json()
@@ -2780,7 +2800,7 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(che
 
 
 @app.post("/api/sites/{site_name:path}/toggle")
-async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
+async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / отключить сайт (toggle is_active)"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -2807,7 +2827,7 @@ async def toggle_site(site_name: str, auth: bool = Depends(check_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-ssl")
-async def toggle_site_ssl(site_name: str, auth: bool = Depends(check_auth)):
+async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить ssl_verify для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -2835,7 +2855,7 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(check_auth)):
 
 
 @app.delete("/api/sites/{site_name:path}")
-async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
+async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Деактивация сайта (is_active=FALSE) + закрытие активных инцидентов"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -2870,7 +2890,7 @@ async def delete_site(site_name: str, auth: bool = Depends(check_auth)):
 
 
 @app.get("/api/incidents")
-async def get_incidents(auth: bool = Depends(check_auth)):
+async def get_incidents(auth: bool = Depends(admin_auth)):
     """Список всех инцидентов (последние 100)"""
     try:
         conn = get_db_connection()
@@ -3568,12 +3588,19 @@ def _build_body(data: dict) -> str:
     now_msk = data["now_msk"]
     active_incidents = data.get("active_incidents", [])
     group_agg = data.get("group_agg", {})
+    # Фильтруем только активные сайты (из monitored_sites is_active=TRUE)
+    active_sites_set = set()
+    for cat_sites in data.get("sites_by_cat", {}).values():
+        active_sites_set.update(cat_sites)
+    # Если sites_by_cat пуст — fallback на SITES
+    if not active_sites_set:
+        active_sites_set = set(SITES)
 
-    incidents = [s for s, v in latest.items() if v['status'] != 200]
-    ssl_warn = [s for s, v in latest.items() if 0 <= v['ssl_days'] <= 20]
+    incidents = [s for s, v in latest.items() if s in active_sites_set and v['status'] != 200]
+    ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s, v in latest.items()
-                    if v['response_time'] > 20 and v['status'] == 200]
-    active_incidents = data.get("active_incidents", [])
+                    if s in active_sites_set and v['response_time'] > 20 and v['status'] == 200]
+    active_incidents = [r for r in data.get("active_incidents", []) if r['site'] in active_sites_set]
 
     # Сборка предупреждений: объединяем ❌ + ⚠️ в одну строку
     # Билдим lookup: site → incident info
