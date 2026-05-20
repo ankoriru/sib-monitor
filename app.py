@@ -1640,21 +1640,21 @@ def ssl_whois_worker():
             # Проверяем все сайты, включая self-monitoring
             all_sites_to_check = list(SITES) + list(SELF_MONITORING_SITES)
         
-        # Load ssl_verify settings from DB
-        try:
-            conn_ssl = get_db_connection()
-            cur_ssl = conn_ssl.cursor()
-            cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
-            ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
-            cur_ssl.close()
-            conn_ssl.close()
-        except Exception as e:
-            print(f"[SSL WORKER] DB error loading settings: {e}")
-            # ===== НЕ СБРАСЫВАЕМ В ПУСТОЙ СЛОВАРЬ =====
-            print("[SSL WORKER] Skipping cycle — will retry in 60 sec")
-            time.sleep(60)
-            continue
-            # ============================================
+            # Load ssl_verify settings from DB
+            try:
+                conn_ssl = get_db_connection()
+                cur_ssl = conn_ssl.cursor()
+                cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
+                ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
+                cur_ssl.close()
+                conn_ssl.close()
+            except Exception as e:
+                print(f"[SSL WORKER] DB error loading settings: {e}")
+                # ===== НЕ СБРАСЫВАЕМ В ПУСТОЙ СЛОВАРЬ =====
+                print("[SSL WORKER] Skipping cycle — will retry in 60 sec")
+                time.sleep(60)
+                continue
+                # ============================================
 
             for site in all_sites_to_check:
                 domain_only = site.split('/')[0]
@@ -1704,6 +1704,7 @@ def ssl_whois_worker():
             print(f"[SSL WORKER ERROR] {e}")
 
         time.sleep(4 * 3600)
+
 
 
 # ============================================================================
