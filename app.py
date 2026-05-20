@@ -72,7 +72,7 @@ SITES = [
     "icenter.tdms.newresources.ru/cp/", "agpp.tdms.nipigas.ru/cp/",
     "agpp.tdms.nipigas.ru/DMS21/", "tst-stdo.tdms.sibur.ru/cp/",
     "cp.tdms.sibur.ru/cp/", "portal-rd.rusproject.ru",
-    "lsdts.sibur.ru", "extar.sibur.ru"
+    "lsdts.sibur.ru", "extar.sibur.ru", "passport.aeroclub.ru"
 ]
 
 PRIORITY_SITES = [
