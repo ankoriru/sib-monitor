@@ -72,7 +72,7 @@ SITES = [
     "icenter.tdms.newresources.ru/cp/", "agpp.tdms.nipigas.ru/cp/",
     "agpp.tdms.nipigas.ru/DMS21/", "tst-stdo.tdms.sibur.ru/cp/",
     "cp.tdms.sibur.ru/cp/", "portal-rd.rusproject.ru",
-    "lsdts.sibur.ru", "extar.sibur.ru", "passport.aeroclub.ru"
+    "lsdts.sibur.ru", "extar.sibur.ru"
 ]
 
 PRIORITY_SITES = [
@@ -481,37 +481,43 @@ def init_db():
         print(f"[INIT] Backfilled down_sec: {cur.rowcount} rows")
     _safe_index(cur, conn, "idx_checks_agg_bucket", "checks_agg", "bucket DESC")
 
-    # Материализованное представление — пересоздаём если нет ssl_chain_valid
-    need_recreate_mv = False
+    # latest_status: миграция с MATERIALIZED VIEW на обычную таблицу (избегаем блокировок REFRESH)
     cur.execute("""
         SELECT EXISTS (
             SELECT FROM pg_matviews WHERE matviewname = 'latest_status'
         )
     """)
-    mv_exists = cur.fetchone()[0]
-    if not mv_exists:
-        need_recreate_mv = True
-    elif not _column_exists(cur, 'latest_status', 'ssl_chain_valid'):
+    if cur.fetchone()[0]:
+        print("[INIT] Dropping old MATERIALIZED VIEW latest_status...")
         cur.execute("DROP MATERIALIZED VIEW IF EXISTS latest_status CASCADE")
-        need_recreate_mv = True
 
-    if need_recreate_mv:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS latest_status (
+            site TEXT PRIMARY KEY,
+            status INTEGER,
+            response_time REAL,
+            ssl_days INTEGER,
+            domain_days INTEGER,
+            ssl_chain_valid BOOLEAN,
+            timestamp TIMESTAMP
+        )
+    """)
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
+    except psycopg2.Error:
+        conn.rollback()
+
+    # Заполняем из logs, если пустая (при первой миграции)
+    cur.execute("SELECT COUNT(*) FROM latest_status")
+    if cur.fetchone()[0] == 0:
+        print("[INIT] Seeding latest_status from logs...")
         cur.execute("""
-            CREATE MATERIALIZED VIEW latest_status AS
-            SELECT DISTINCT ON (site)
-                site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp
-            FROM logs
-            ORDER BY site, timestamp DESC
+            INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+            SELECT DISTINCT ON (site) site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp
+            FROM logs ORDER BY site, timestamp DESC
+            ON CONFLICT (site) DO NOTHING
         """)
-        try:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
-        except psycopg2.Error:
-            conn.rollback()
-    else:
-        try:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
-        except psycopg2.Error:
-            conn.rollback()
+        print(f"[INIT] Seeded latest_status: {cur.rowcount} rows")
 
     # Таблица инцидентов
     cur.execute("""
@@ -1059,12 +1065,11 @@ def _update_checks_agg(cur, batch_data):
 
 
 def flush_batch():
-    """Сброс накопленных данных пакетом в БД + обновление агрегатов"""
+    """Сброс накопленных данных пакетом в БД + обновление агрегатов + обновление latest_status (UPSERT)"""
     global batch_buffer
     with BATCH_LOCK:
         if not batch_buffer:
             return
-        # Batch flush
         try:
             conn = get_db_connection()
             cur = conn.cursor()
@@ -1076,6 +1081,22 @@ def flush_batch():
                 batch_buffer
             )
             _update_checks_agg(cur, batch_buffer)
+
+            # Обновляем latest_status напрямую (избегаем блокирующего REFRESH MATERIALIZED VIEW)
+            for row in batch_buffer:
+                site, status, resp_time, ssl_d, dom_d, ssl_chain_valid = row[:6]
+                cur.execute("""
+                    INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (site) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        response_time = EXCLUDED.response_time,
+                        ssl_days = EXCLUDED.ssl_days,
+                        domain_days = EXCLUDED.domain_days,
+                        ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                        timestamp = EXCLUDED.timestamp
+                """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+
             conn.commit()
             cur.close()
             conn.close()
@@ -1199,29 +1220,9 @@ def _db_incident_resolve_by_id(incident_id):
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
 def refresh_materialized_view():
-    """Обновление latest_status — CONCURRENTLY если возможно, иначе обычно.
-    Защита: statement_timeout = 30s, чтобы зависший refresh не убивал воркер."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # Защита от зависания: максимум 30 секунд на refresh
-        cur.execute("SET statement_timeout = '30s'")
-        try:
-            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY latest_status")
-        except psycopg2.Error:
-            conn.rollback()
-            # После rollback настройки сессии могут сброситься — выставляем заново
-            cur.execute("SET statement_timeout = '30s'")
-            cur.execute("REFRESH MATERIALIZED VIEW latest_status")
-        conn.commit()
-        # Проверяем что обновление прошло
-        cur.execute("SELECT COUNT(*) FROM latest_status")
-        count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        print(f"[REFRESH MV] latest_status: {count} sites")
-    except Exception as e:
-        print(f"Ошибка обновления мат. представления: {e}")
+    """Устарело: latest_status теперь обычная таблица, обновляется через UPSERT в flush_batch().
+    Функция оставлена для совместимости, ничего не делает."""
+    pass
 
 
 # ============================================================================
@@ -1614,7 +1615,6 @@ def check_worker():
                                                 last_status, fail_count, last_latency_map, first_fail_time)
 
             flush_batch()
-            refresh_materialized_view()
             _update_worker_heartbeat()
             failed_now = sum(1 for _, st, *_ in results if st != 200)
             cycle_time = round(time.time() - t_start, 1)
@@ -1666,7 +1666,7 @@ def ssl_whois_worker():
                 except Exception:
                     dom_d = -1
 
-                # Обновляем latest_status через direct DB update
+                # Обновляем latest_status (теперь обычная таблица) — только SSL-поля
                 try:
                     conn = get_db_connection()
                     cur = conn.cursor()
@@ -1676,6 +1676,16 @@ def ssl_whois_worker():
                         WHERE site = %s
                           AND timestamp = (SELECT MAX(timestamp) FROM logs WHERE site = %s)
                     """, (ssl_d, dom_d, ssl_chain_valid, site, site))
+                    # Обновляем таблицу latest_status (UPSERT только SSL-поля, status не трогаем)
+                    cur.execute("""
+                        INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                        VALUES (%s, 200, 0.5, %s, %s, %s, NOW())
+                        ON CONFLICT (site) DO UPDATE SET
+                            ssl_days = EXCLUDED.ssl_days,
+                            domain_days = EXCLUDED.domain_days,
+                            ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                            timestamp = EXCLUDED.timestamp
+                    """, (site, ssl_d, dom_d, ssl_chain_valid))
                     conn.commit()
                     cur.close()
                     conn.close()
@@ -1684,7 +1694,6 @@ def ssl_whois_worker():
 
                 time.sleep(0.5)  # Небольшая пауза между сайтами
 
-            refresh_materialized_view()
             elapsed = round(time.time() - t_start, 1)
             print(f"[SSL WORKER] Completed in {elapsed}s, sleeping 4 hours")
 
@@ -3026,7 +3035,9 @@ async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
         # 1. Полное удаление инцидентов для этого сайта
         cur.execute("DELETE FROM incidents WHERE site = %s", (site_name,))
         deleted_incidents = cur.rowcount
-        # 2. Полное удаление сайта из БД
+        # 2. Удаление из latest_status
+        cur.execute("DELETE FROM latest_status WHERE site = %s", (site_name,))
+        # 3. Полное удаление сайта из БД
         cur.execute("DELETE FROM monitored_sites WHERE site = %s", (site_name,))
         affected = cur.rowcount
         conn.commit()
