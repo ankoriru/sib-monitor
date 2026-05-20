@@ -880,45 +880,22 @@ def send_tg_msg(text, photo_path=None):
 # ============================================================================
 def _check_ssl_sync(domain_only, site, verify_ssl=True):
     """Синхронная SSL-проверка (для вызова через asyncio.to_thread).
-    verify_ssl=False — пропускает верификацию (для самоподписанных сертификатов)."""
+    verify_ssl=False — полностью пропускаем проверку (не открываем socket)."""
+    if not verify_ssl:
+        return -1, None
     try:
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with socket.create_connection((domain_only, 443), timeout=3) as sock:
-                with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
-                    cert = ssock.getpeercert()
-                    exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                    ssl_d = (exp - datetime.datetime.utcnow()).days
-                    return ssl_d, None  # N/A for self-signed
-        else:
-            ctx = ssl.create_default_context()
-            with socket.create_connection((domain_only, 443), timeout=3) as sock:
-                with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
-                    cert = ssock.getpeercert()
-                    exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                    ssl_d = (exp - datetime.datetime.utcnow()).days
-                    return ssl_d, True
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain_only, 443), timeout=3) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+                cert = ssock.getpeercert()
+                exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                ssl_d = (exp - datetime.datetime.utcnow()).days
+                return ssl_d, True
     except ssl.SSLCertVerificationError:
         return -1, False
     except Exception:
         return -1, None
 
-
-def _check_whois_sync(domain_only):
-    """Синхронная WHOIS-проверка (для вызова через asyncio.to_thread)"""
-    try:
-        import whois
-        w = whois.whois(domain_only)
-        exp = w.expiration_date
-        if isinstance(exp, list):
-            exp = exp[0]
-        if exp:
-            return (exp.replace(tzinfo=None) - datetime.datetime.now()).days
-    except Exception:
-        pass
-    return -1
 
 
 def get_domain_info(site):
