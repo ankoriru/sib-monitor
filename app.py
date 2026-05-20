@@ -1199,14 +1199,19 @@ def _db_incident_resolve_by_id(incident_id):
 # ОБНОВЛЕНИЕ МАТЕРИАЛИЗОВАННОГО ПРЕДСТАВЛЕНИЯ (Этап 3)
 # ============================================================================
 def refresh_materialized_view():
-    """Обновление latest_status — CONCURRENTLY если возможно, иначе обычно"""
+    """Обновление latest_status — CONCURRENTLY если возможно, иначе обычно.
+    Защита: statement_timeout = 30s, чтобы зависший refresh не убивал воркер."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Защита от зависания: максимум 30 секунд на refresh
+        cur.execute("SET statement_timeout = '30s'")
         try:
             cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY latest_status")
         except psycopg2.Error:
             conn.rollback()
+            # После rollback настройки сессии могут сброситься — выставляем заново
+            cur.execute("SET statement_timeout = '30s'")
             cur.execute("REFRESH MATERIALIZED VIEW latest_status")
         conn.commit()
         # Проверяем что обновление прошло
@@ -1408,8 +1413,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
-                if fail_count[site] >= 2:
-                    batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
                     flush_batch()
         else:
@@ -2815,6 +2819,11 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
                 ssl_verify = EXCLUDED.ssl_verify,
                 content_match_enabled = EXCLUDED.content_match_enabled
         """, (site, group, threshold, ssl_verify, content_match_enabled))
+# Принудительная начальная запись, чтобы сайт сразу появился в latest_status
+        cur.execute("""
+            INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+            VALUES (%s, 200, 0, -1, -1, NULL, NOW())
+        """, (site,))
         conn.commit()
         cur.close()
         conn.close()
@@ -2822,7 +2831,6 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
         return {"status": "ok", "msg": f"Site '{site}' added"}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
-
 
 @app.put("/api/sites/{site_name:path}")
 async def update_site(site_name: str, request: Request, auth: bool = Depends(admin_auth)):
