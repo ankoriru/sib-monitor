@@ -1639,16 +1639,23 @@ def ssl_whois_worker():
 
             # Проверяем все сайты, включая self-monitoring
             all_sites_to_check = list(SITES) + list(SELF_MONITORING_SITES)
-            # Load ssl_verify settings from DB
-            try:
-                conn_ssl = get_db_connection()
-                cur_ssl = conn_ssl.cursor()
-                cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
-                ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
-                cur_ssl.close()
-                conn_ssl.close()
-            except Exception:
-                ssl_whois_verify_map = {}
+        
+        # Load ssl_verify settings from DB
+        try:
+            conn_ssl = get_db_connection()
+            cur_ssl = conn_ssl.cursor()
+            cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
+            ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
+            cur_ssl.close()
+            conn_ssl.close()
+        except Exception as e:
+            print(f"[SSL WORKER] DB error loading settings: {e}")
+            # ===== НЕ СБРАСЫВАЕМ В ПУСТОЙ СЛОВАРЬ =====
+            print("[SSL WORKER] Skipping cycle — will retry in 60 sec")
+            time.sleep(60)
+            continue
+            # ============================================
+
             for site in all_sites_to_check:
                 domain_only = site.split('/')[0]
                 verify_ssl = ssl_whois_verify_map.get(site, True)
@@ -2917,7 +2924,6 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
         cur = conn.cursor()
-        # Если NULL — считаем что включено, переключаем в FALSE
         cur.execute("""
             UPDATE monitored_sites
             SET ssl_verify = CASE WHEN COALESCE(ssl_verify, TRUE) = TRUE THEN FALSE ELSE TRUE END
@@ -2925,6 +2931,21 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
             RETURNING ssl_verify
         """, (site_name,))
         row = cur.fetchone()
+
+        # ===== МГНОВЕННЫЙ СБРОС ПРИ ОТКЛЮЧЕНИИ SSL =====
+        if row and row[0] == False:
+            cur.execute("""
+                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                VALUES (%s, 200, 0.5, -1, -1, NULL, NOW())
+                ON CONFLICT (site) DO UPDATE SET
+                    ssl_days = EXCLUDED.ssl_days,
+                    domain_days = EXCLUDED.domain_days,
+                    ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                    timestamp = EXCLUDED.timestamp
+            """, (site_name,))
+            print(f"[TOGGLE-SSL] Instant reset for '{site_name}' (ssl_verify=False)")
+        # ================================================
+
         conn.commit()
         cur.close()
         conn.close()
@@ -2935,6 +2956,8 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
         return {"status": "ok", "msg": f"SSL {ssl_status} for '{site_name}'", "ssl_verify": row[0]}
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+
+
 
 
 @app.post("/api/sites/{site_name:path}/toggle-cm")
@@ -3958,10 +3981,11 @@ def _build_body(data: dict) -> str:
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
             <td><span class="{status_class}">{status_label}</span></td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
-            <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{v['ssl_days']}д</td>
+                        <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
                 {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
-            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{v['domain_days']}д</td>
+            <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{'—' if v['domain_days'] < 0 else str(v['domain_days'])+'д'}</td>
+
             <td><button class="btn-test" onclick="runTest('{s}', this)">
                 <div class="loader"></div><span>📸 Screen</span></button></td></tr>""")
 
