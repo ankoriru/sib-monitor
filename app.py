@@ -898,6 +898,7 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
 
 
 
+
 def get_domain_info(site):
     return _check_whois_sync(site.split('/')[0])
 
