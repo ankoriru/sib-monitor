@@ -896,6 +896,7 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
     except Exception:
         return -1, None
 
+
 def _check_whois_sync(domain_only):
     """Синхронная WHOIS-проверка (для вызова через asyncio.to_thread)"""
     try:
@@ -1054,46 +1055,51 @@ def _update_checks_agg(cur, batch_data):
               a['r_sum'] / a['cnt'], a['r_min'], a['r_max'], a['ssl'], a['dom'], a['ssl_chain']))
 
 
-def flush_batch():
-    """Сброс накопленных данных пакетом в БД + обновление агрегатов + обновление latest_status (UPSERT)"""
+def _flush_batch_unlocked():
+    """Внутренняя реализация flush_batch — вызывать только под BATCH_LOCK!"""
     global batch_buffer
+    if not batch_buffer:
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        execute_values(
+            cur,
+            """INSERT INTO logs
+               (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
+               VALUES %s""",
+            batch_buffer
+        )
+        _update_checks_agg(cur, batch_buffer)
+
+        # Обновляем latest_status напрямую (избегаем блокирующего REFRESH MATERIALIZED VIEW)
+        for row in batch_buffer:
+            site, status, resp_time, ssl_d, dom_d, ssl_chain_valid = row[:6]
+            cur.execute("""
+                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (site) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    response_time = EXCLUDED.response_time,
+                    ssl_days = EXCLUDED.ssl_days,
+                    domain_days = EXCLUDED.domain_days,
+                    ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                    timestamp = EXCLUDED.timestamp
+            """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка batch-вставки: {e}")
+    finally:
+        batch_buffer.clear()
+
+
+def flush_batch():
+    """Сброс накопленных данных пакетом в БД — потокобезопасная обёртка."""
     with BATCH_LOCK:
-        if not batch_buffer:
-            return
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            execute_values(
-                cur,
-                """INSERT INTO logs
-                   (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
-                   VALUES %s""",
-                batch_buffer
-            )
-            _update_checks_agg(cur, batch_buffer)
-
-            # Обновляем latest_status напрямую (избегаем блокирующего REFRESH MATERIALIZED VIEW)
-            for row in batch_buffer:
-                site, status, resp_time, ssl_d, dom_d, ssl_chain_valid = row[:6]
-                cur.execute("""
-                    INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (site) DO UPDATE SET
-                        status = EXCLUDED.status,
-                        response_time = EXCLUDED.response_time,
-                        ssl_days = EXCLUDED.ssl_days,
-                        domain_days = EXCLUDED.domain_days,
-                        ssl_chain_valid = EXCLUDED.ssl_chain_valid,
-                        timestamp = EXCLUDED.timestamp
-                """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid))
-
-            conn.commit()
-            cur.close()
-            conn.close()
-        except Exception as e:
-            print(f"Ошибка batch-вставки: {e}")
-        finally:
-            batch_buffer.clear()
+        _flush_batch_unlocked()
 
 
 # ============================================================================
@@ -1406,12 +1412,12 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
-                    flush_batch()
+                    _flush_batch_unlocked()
         else:
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
-                    flush_batch()
+                    _flush_batch_unlocked()
 
             fc = fail_count.get(site, 0)
             if fc >= thresholds.get(site, 5):
@@ -1471,12 +1477,12 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
-                    flush_batch()
+                    _flush_batch_unlocked()
         else:
             with BATCH_LOCK:
                 batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
                 if len(batch_buffer) >= BATCH_SIZE:
-                    flush_batch()
+                    _flush_batch_unlocked()
 
             fc = fail_count.get(site, 0)
             if fc >= SM_THRESHOLD:
@@ -2818,10 +2824,21 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
                 ssl_verify = EXCLUDED.ssl_verify,
                 content_match_enabled = EXCLUDED.content_match_enabled
         """, (site, group, threshold, ssl_verify, content_match_enabled))
-# Принудительная начальная запись, чтобы сайт сразу появился в latest_status
+# Принудительная начальная запись в logs и latest_status (теперь таблица)
         cur.execute("""
             INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
             VALUES (%s, 200, 0, -1, -1, NULL, NOW())
+        """, (site,))
+        cur.execute("""
+            INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
+            VALUES (%s, 200, 0, -1, -1, NULL, NOW())
+            ON CONFLICT (site) DO UPDATE SET
+                status = EXCLUDED.status,
+                response_time = EXCLUDED.response_time,
+                ssl_days = EXCLUDED.ssl_days,
+                domain_days = EXCLUDED.domain_days,
+                ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                timestamp = EXCLUDED.timestamp
         """, (site,))
         conn.commit()
         cur.close()
