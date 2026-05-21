@@ -1718,7 +1718,12 @@ def daily_report_worker():
             try:
                 conn = get_db_connection()
                 cur = conn.cursor(cursor_factory=DictCursor)
-                cur.execute("SELECT site, ssl_days FROM latest_status")
+                cur.execute("""
+                    SELECT ls.site, ls.ssl_days 
+                    FROM latest_status ls
+                    JOIN monitored_sites ms ON ls.site = ms.site
+                    WHERE ms.is_active = TRUE AND ms.site_group != 'self'
+                """)
                 rows = cur.fetchall()
                 cur.close()
                 conn.close()
@@ -1726,9 +1731,9 @@ def daily_report_worker():
                 ssl_alerts = [
                     f"🔒 {r[0]} — осталось {r[1]}д."
                     for r in rows
-                    if r[1] is not None and 0 <= r[1] <= 20 and r[0] not in SELF_MONITORING_SITES
+                    if r[1] is not None and 0 <= r[1] <= 20
                 ]
-
+                
                 if ssl_alerts:
                     msg = "🔔 Утренний отчет по SSL (менее 20 дней):\n\n" + "\n".join(ssl_alerts)
                     send_tg_msg(msg)
@@ -1807,9 +1812,8 @@ async def startup_event():
                 print("[STARTUP] Added portal-rd.rusproject.ru to monitored_sites")
         except Exception as e:
             print(f"[STARTUP WARN] portal-rd migration: {e}")
-        # Fix: set ssl_verify=FALSE and content_match_enabled=FALSE for known problematic sites
+        # Fix: set ssl_verify=FALSE for known SSL-problematic sites
         try:
-            # Fix: set ssl_verify=FALSE for known SSL-problematic sites
             for s in ['lsdts.sibur.ru', 'extar.sibur.ru', 'portal-rd.rusproject.ru']:
                 cur.execute("""
                     UPDATE monitored_sites 
@@ -1817,7 +1821,7 @@ async def startup_event():
                     WHERE site = %s AND (ssl_verify IS NULL OR ssl_verify = TRUE)
                 """, (s,))
                 if cur.rowcount > 0:
-                    print(f"[STARTUP] Fixed ssl_verify=FALSE, cm=FALSE for '{s}'")
+                    print(f"[STARTUP] Fixed ssl_verify=FALSE for '{s}'")
             conn.commit()
         except Exception as e:
             print(f"[STARTUP WARN] SSL/CM fix: {e}")
@@ -1830,10 +1834,11 @@ async def startup_event():
     print("[STARTUP] Dashboard cache invalidated")
     await asyncio.to_thread(backfill_checks_agg)
     await asyncio.to_thread(_backfill_incidents)
-    # Cleanup: закрыть "висящие" unresolved инциденты для сайтов, которые сейчас Online
+    # Cleanup: закрыть "висящие" unresolved инциденты + удалить stale latest_status
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # 1. Закрыть инциденты для сайтов, которые сейчас Online
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
@@ -1846,7 +1851,7 @@ async def startup_event():
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Closed {cur.rowcount} stale unresolved incidents for online sites")
-        # Force-close incidents for sites that return 401 (auth required = online)
+        # 2. Force-close для sharefile.sibur.ru (401 = online)
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
@@ -1856,7 +1861,7 @@ async def startup_event():
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Force-closed {cur.rowcount} incidents for sharefile.sibur.ru (401=online)")
-        # Close incidents for deleted sites (not in monitored_sites anymore)
+        # 3. Закрыть инциденты для удалённых/неактивных сайтов
         cur.execute("""
             UPDATE incidents
             SET end_time = NOW(),
@@ -1867,6 +1872,14 @@ async def startup_event():
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Closed {cur.rowcount} incidents for deleted/inactive sites")
+        # 4. Удалить stale записи из latest_status для неактивных/удалённых сайтов
+        cur.execute("""
+            DELETE FROM latest_status
+            WHERE site NOT IN (SELECT site FROM monitored_sites WHERE is_active = TRUE)
+              AND site <> ALL(%s)
+        """, (SELF_MONITORING_SITES,))
+        if cur.rowcount > 0:
+            print(f"[STARTUP] Removed {cur.rowcount} stale records from latest_status")
         conn.commit()
         cur.close()
         conn.close()
@@ -1882,7 +1895,6 @@ async def startup_event():
         print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
     else:
         print(f"[OK] Telegram configured: chat_id={TELEGRAM_CHAT_ID[:5]}... (len={len(TELEGRAM_CHAT_ID)}), token_len={len(TELEGRAM_TOKEN)}")
-
 
 # ============================================================================
 # ENDPOINTS
