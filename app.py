@@ -1440,7 +1440,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = True
             elif resp_time < 10 and last_latency_map.get(site, False):
-                ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОСТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
+                ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = False
     except Exception as e:
         print(f"[ERR] {site}: {e}")
