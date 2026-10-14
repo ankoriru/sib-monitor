@@ -4184,3 +4184,29 @@ def _build_body(data: dict) -> str:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+# ============================================================================
+# ВРЕМЕННАЯ ДИАГНОСТИКА СЕТИ — удалить после проверки
+# ============================================================================
+@app.get("/netdiag")
+async def netdiag():
+    out = {}
+    for host in ["eshop.sibur.ru", "resti.club", "srm.sibur.ru", "sibur.ru"]:
+        info = {"addrs": []}
+        try:
+            seen = set()
+            for fam, _, _, _, addr in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
+                famname = "IPv6" if fam == socket.AF_INET6 else "IPv4"
+                if famname in seen:
+                    continue
+                seen.add(famname)
+                t0 = time.time()
+                try:
+                    s = socket.create_connection(addr, timeout=4)
+                    s.close()
+                    info["addrs"].append(f"{famname} {addr[0]} — OK ({round(time.time() - t0, 2)}с)")
+                except Exception as e:
+                    info["addrs"].append(f"{famname} {addr[0]} — FAIL {type(e).__name__}")
+        except Exception as e:
+            info["error"] = str(e)
+        out[host] = info
+    return out
