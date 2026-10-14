@@ -969,6 +969,7 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                         print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
         except Exception as e:
             curr_status, resp_time = 0, 25.0
+            print(f"[CHECK ERR] {site}: {type(e).__name__}: {str(e)[:150]}")
         finally:
             if not verify_ssl and connector and actual_session is not None:
                 await actual_session.close()
