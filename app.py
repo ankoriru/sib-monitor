@@ -4181,9 +4181,6 @@ def _build_body(data: dict) -> str:
     return "".join(H)
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
 # ============================================================================
 # ВРЕМЕННАЯ ДИАГНОСТИКА СЕТИ — удалить после проверки
 # ============================================================================
@@ -4210,3 +4207,9 @@ async def netdiag():
             info["error"] = str(e)
         out[host] = info
     return out
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
