@@ -35,6 +35,12 @@ SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
 ]
 
+# --- Флаги Telegram-оповещений (читаются из app_settings, обновляются каждый цикл воркера) ---
+# TG_ALERTS_ENABLED      — алерты DOWN/UP/задержка (включая скриншоты к ним)
+# TG_SSL_REPORT_ENABLED  — утренний отчёт по SSL (09:00 МСК)
+TG_ALERTS_ENABLED = True
+TG_SSL_REPORT_ENABLED = True
+
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
 CONTENT_MATCH_KEYWORDS = re.compile(r"sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh", re.IGNORECASE)
@@ -322,7 +328,9 @@ def load_settings():
         'content_match_pattern': 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh',
         'category_key_label': 'Ключевые',
         'category_stdo_label': 'СТДО',
-        'category_external_label': 'Внешние сайты'
+        'category_external_label': 'Внешние сайты',
+        'tg_alerts_enabled': 'true',
+        'tg_ssl_report_enabled': 'true'
     }
     try:
         conn = get_db_connection()
@@ -693,7 +701,9 @@ def init_db():
             ('content_match_pattern', 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh'),
             ('category_key_label', 'Ключевые'),
             ('category_stdo_label', 'СТДО'),
-            ('category_external_label', 'Внешние сайты')
+            ('category_external_label', 'Внешние сайты'),
+            ('tg_alerts_enabled', 'true'),
+            ('tg_ssl_report_enabled', 'true')
         ON CONFLICT (key) DO NOTHING
     """)
     if cur.rowcount > 0:
@@ -827,8 +837,17 @@ def ensure_partitions():
 # ============================================================================
 # TELEGRAM
 # ============================================================================
-def send_tg_msg(text, photo_path=None):
-    """Отправка в Telegram с retry (3 попытки) + логированием"""
+def send_tg_msg(text, photo_path=None, category='alert'):
+    """Отправка в Telegram с retry (3 попытки) + логированием.
+    category: 'alert' — алерты DOWN/UP/задержка (результативно выключаются флагом TG_ALERTS_ENABLED),
+              'ssl_report' — утренний отчёт по SSL (TG_SSL_REPORT_ENABLED),
+              'manual' — ручные действия (кнопка теста), всегда отправляется."""
+    if category == 'alert' and not TG_ALERTS_ENABLED:
+        print(f"[TG SKIP] Alerts disabled via admin panel. Message: {text[:60]}")
+        return False
+    if category == 'ssl_report' and not TG_SSL_REPORT_ENABLED:
+        print(f"[TG SKIP] SSL report disabled via admin panel. Message: {text[:60]}")
+        return False
     print(f"[TG SEND] Attempting to send: {text[:80]} photo={'yes' if photo_path else 'no'} token_len={len(TELEGRAM_TOKEN or '')} chat_id={TELEGRAM_CHAT_ID}")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[TG SKIP] No token/chat_id configured. Message: {text[:60]}")
@@ -1511,6 +1530,7 @@ def check_worker():
     print("[WORKER START] check_worker started")
 
     global SITES, KEY_SITES, STDO_SITES, EXTERNAL_SITES
+    global TG_ALERTS_ENABLED, TG_SSL_REPORT_ENABLED
     last_status = {}
     fail_count = {}
     last_latency_map = {}
@@ -1547,7 +1567,7 @@ def check_worker():
                 _cm_sites_set.update(_categories.get(cat_id, []))
             # Фильтруем по content_match_enabled на уровне сайта
             _cm_sites_set = {s for s in _cm_sites_set if cm_enabled_map.get(s, True)}
-            # Обновляем настройки (content match pattern)
+            # Обновляем настройки (content match pattern + флаги Telegram)
             global _content_match_pattern, _content_match_regex
             settings = load_settings()
             new_pattern = settings.get('content_match_pattern', 'sibur|сибур')
@@ -1558,6 +1578,9 @@ def check_worker():
                     print(f"[WORKER] Content match updated: {new_pattern}")
                 except re.error as e:
                     print(f"[WORKER] Invalid content match pattern: {e}")
+            # Флаги Telegram-оповещений (изменения применяются на лету, без рестарта)
+            TG_ALERTS_ENABLED = str(settings.get('tg_alerts_enabled', 'true')).lower() == 'true'
+            TG_SSL_REPORT_ENABLED = str(settings.get('tg_ssl_report_enabled', 'true')).lower() == 'true'
             # Защита: если thresholds пустой (например, БД пустая), fallback на 5
             if not thresholds and SITES:
                 thresholds = {s: 5 for s in SITES}
@@ -1712,7 +1735,7 @@ def ssl_whois_worker():
 # DAILY REPORT WORKER
 # ============================================================================
 def daily_report_worker():
-    """Рассылка отчёта по SSL в 09:00 МСК"""
+    """Рассылка отчёта по SSL в 09:00 МСК (отключается флагом tg_ssl_report_enabled)"""
     while True:
         now = datetime.datetime.now(TZ_MOSCOW)
         if now.hour == 9 and now.minute == 0:
@@ -1737,7 +1760,7 @@ def daily_report_worker():
                 
                 if ssl_alerts:
                     msg = "🔔 Утренний отчет по SSL (менее 20 дней):\n\n" + "\n".join(ssl_alerts)
-                    send_tg_msg(msg)
+                    send_tg_msg(msg, category='ssl_report')
 
                 time.sleep(61)
             except Exception:
@@ -1935,7 +1958,7 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
 
     shot = await asyncio.to_thread(take_screenshot_fast, site_name)
     if shot:
-        send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot)
+        send_tg_msg(f"🧪 Тестовый скриншот: {site_name}", shot, category='manual')
         return {"status": "success", "msg": f"Скриншот {site_name} отправлен в ТГ"}
 
     return JSONResponse(
@@ -2033,7 +2056,7 @@ async def _admin_page_inner(request, response):
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>""")
     H.append("""        body { font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 20px; color: #1e293b; }")
-        .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         h1 { color: #00717a; margin: 0 0 20px; }
         .tabs { display: flex; gap: 8px; margin-bottom: 15px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
         .tab-btn { padding: 10px 20px; border: none; background: #e2e8f0; border-radius: 6px; cursor: pointer; font-weight: bold; }
@@ -2076,6 +2099,9 @@ async def _admin_page_inner(request, response):
         .txt-ok { color: #16a34a; font-weight: bold; }
         .txt-warn { color: #d97706; font-weight: bold; }
         .loading { text-align: center; padding: 40px; color: #999; }
+        .tg-toggle-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+        .tg-toggle-row label { font-size: 13px; cursor: pointer; }
+        .tg-toggle-row input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
     </style></head><body>
     <div class="container">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
@@ -2154,7 +2180,7 @@ async def _admin_page_inner(request, response):
     </div>
     <div id="settings-tab" class="tab-content">
         <h3 style="color:#00717a;margin-top:0;">Настройки приложения</h3>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;max-width:800px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:15px;max-width:1200px;">
             <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
                 <h4 style="margin-top:0;color:#475569;">Content Match (regex)</h4>
                 <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Паттерн проверки контента для ключевых сайтов. Если контент не содержит совпадений, сайт считается DOWN (701).</p>
@@ -2166,6 +2192,18 @@ async def _admin_page_inner(request, response):
                     <button onclick="testContentMatch()" class="btn btn-primary" style="font-size:12px;padding:6px 12px;">Проверить</button>
                 </div>
                 <div id="test-cm-result" style="font-size:12px;display:none;"></div>
+            </div>
+            <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
+                <h4 style="margin-top:0;color:#475569;">Telegram оповещения</h4>
+                <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Включают/выключают отправку сообщений ботом. Применяется сразу, без перезапуска.</p>
+                <div class="tg-toggle-row">
+                    <input type="checkbox" id="setting-tg-alerts" checked>
+                    <label for="setting-tg-alerts">🚨 Алерты при падении / восстановлении / задержке сайтов</label>
+                </div>
+                <div class="tg-toggle-row" style="border-bottom:none;">
+                    <input type="checkbox" id="setting-tg-ssl" checked>
+                    <label for="setting-tg-ssl">🔔 Утренний отчёт по SSL-сертификатам (09:00 МСК)</label>
+                </div>
             </div>
             <div style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;">
                 <h4 style="margin-top:0;color:#475569;">Категории сайтов</h4>
@@ -2235,6 +2273,8 @@ async def _admin_page_inner(request, response):
             var d = await r.json();
             if (d.status === 'ok' && d.settings) {
                 document.getElementById('setting-pattern').value = d.settings['content_match_pattern'] || '';
+                document.getElementById('setting-tg-alerts').checked = (d.settings['tg_alerts_enabled'] || 'true') === 'true';
+                document.getElementById('setting-tg-ssl').checked = (d.settings['tg_ssl_report_enabled'] || 'true') === 'true';
             }
             // Load dynamic categories
             var cr = await fetch('/api/site-categories', {credentials: 'include'});
@@ -2333,6 +2373,21 @@ async def _admin_page_inner(request, response):
             });
             var d = await r.json();
             if (d.status !== 'ok') { msg.textContent = 'Ошибка: ' + d.msg; return; }
+            // Сохранение флагов Telegram
+            var tgAlerts = document.getElementById('setting-tg-alerts').checked;
+            var tgSsl = document.getElementById('setting-tg-ssl').checked;
+            var r1 = await fetch('/api/settings/tg_alerts_enabled', {credentials: 'include',
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({value: tgAlerts ? 'true' : 'false'})
+            });
+            var d1 = await r1.json();
+            if (d1.status !== 'ok') { msg.textContent = 'Ошибка (алерты): ' + d1.msg; return; }
+            var r2 = await fetch('/api/settings/tg_ssl_report_enabled', {credentials: 'include',
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({value: tgSsl ? 'true' : 'false'})
+            });
+            var d2 = await r2.json();
+            if (d2.status !== 'ok') { msg.textContent = 'Ошибка (SSL-отчёт): ' + d2.msg; return; }
             // Save category changes
             if (window._categories) {
                 for (var i = 0; i < window._categories.length; i++) {
@@ -2594,7 +2649,7 @@ async def _admin_page_inner(request, response):
 
 
 # ============================================================================
-# API: Настройки приложения (content match, названия категорий)
+# API: Настройки приложения (content match, названия категорий, Telegram-флаги)
 # ============================================================================
 @app.get("/api/settings")
 async def get_settings(auth: bool = Depends(admin_auth)):
@@ -2607,7 +2662,7 @@ async def get_settings(auth: bool = Depends(admin_auth)):
 
 @app.put("/api/settings/{key}")
 async def update_setting(key: str, request: Request, auth: bool = Depends(admin_auth)):
-    """Обновить одну настройку (content_match_pattern, category_*_label)"""
+    """Обновить одну настройку (content_match_pattern, category_*_label, tg_*_enabled)"""
     try:
         data = await request.json()
         value = data.get("value", "").strip()
@@ -2615,7 +2670,9 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(admin_
             'content_match_pattern',
             'category_key_label',
             'category_stdo_label',
-            'category_external_label'
+            'category_external_label',
+            'tg_alerts_enabled',
+            'tg_ssl_report_enabled'
         }
         if key not in allowed_keys:
             return JSONResponse({"status": "error", "msg": f"Unknown key. Allowed: {allowed_keys}"}, status_code=400)
@@ -2626,6 +2683,10 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(admin_
                 re.compile(value, re.IGNORECASE)
             except re.error as e:
                 return JSONResponse({"status": "error", "msg": f"Invalid regex: {e}"}, status_code=400)
+        if key in ('tg_alerts_enabled', 'tg_ssl_report_enabled'):
+            if value.lower() not in ('true', 'false'):
+                return JSONResponse({"status": "error", "msg": "value must be 'true' or 'false'"}, status_code=400)
+            value = value.lower()
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -4179,7 +4240,8 @@ def _build_body(data: dict) -> str:
     H.append(dash_js)
 
     return "".join(H)
-    
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
