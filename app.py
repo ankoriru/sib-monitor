@@ -32,7 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.10.30-timeouts.1"
+APP_VERSION = "2026.10.30-ssl-roster.1"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -1766,6 +1766,22 @@ def check_worker():
         time.sleep(sleep_time)
 
 
+def _load_ssl_check_sites():
+    """Read the SSL roster independently of the HTTP worker's startup timing."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT site, COALESCE(ssl_verify, TRUE)
+                FROM monitored_sites
+                WHERE is_active = TRUE
+                ORDER BY site
+            """)
+            return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
 def ssl_whois_worker():
     """Отдельный воркер: SSL + WHOIS проверки раз в 4 часа (медленные операции)"""
     print("[SSL WORKER START] ssl_whois_worker started")
@@ -1777,17 +1793,11 @@ def ssl_whois_worker():
             t_start = time.time()
             print(f"[SSL WORKER] Starting SSL+WHOIS checks at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
-            # Проверяем все сайты, включая self-monitoring
-            all_sites_to_check = list(SITES) + list(SELF_MONITORING_SITES)
-        
-            # Load ssl_verify settings from DB
+            # Не используем SITES: при старте HTTP-поток может ещё не загрузить БД.
+            # Активные self-monitoring записи также входят в эту выборку.
             try:
-                conn_ssl = get_db_connection()
-                cur_ssl = conn_ssl.cursor()
-                cur_ssl.execute("SELECT site, ssl_verify FROM monitored_sites")
-                ssl_whois_verify_map = {r[0]: (r[1] if r[1] is not None else True) for r in cur_ssl.fetchall()}
-                cur_ssl.close()
-                conn_ssl.close()
+                ssl_sites = _load_ssl_check_sites()
+                print(f"[SSL WORKER] Loaded {len(ssl_sites)} active sites from database")
             except Exception as e:
                 print(f"[SSL WORKER] DB error loading settings: {e}")
                 # ===== НЕ СБРАСЫВАЕМ В ПУСТОЙ СЛОВАРЬ =====
@@ -1796,9 +1806,8 @@ def ssl_whois_worker():
                 continue
                 # ============================================
 
-            for site in all_sites_to_check:
+            for site, verify_ssl in ssl_sites:
                 domain_only = site.split('/')[0]
-                verify_ssl = ssl_whois_verify_map.get(site, True)
                 try:
                     ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site, verify_ssl=verify_ssl)
                 except Exception:
@@ -1832,6 +1841,10 @@ def ssl_whois_worker():
                     conn.commit()
                     cur.close()
                     conn.close()
+                    _invalidate_dashboard_cache()
+                    print(f"[SSL RESULT] {site}: ssl_days={ssl_d} "
+                          f"chain_valid={ssl_chain_valid} enabled={verify_ssl} saved=true",
+                          flush=True)
                 except Exception as e:
                     print(f"[SSL WORKER] Failed to save SSL/WHOIS for {site}: {e}")
 
