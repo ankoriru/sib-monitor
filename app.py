@@ -32,7 +32,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.10.30-netprobe.1"
+APP_VERSION = "2026.10.30-timeouts.1"
+DEFAULT_HTTP_TIMEOUT = 8
+TIMEOUT_EXPERIMENT_SITES = (
+    "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
+    "tst-stdo.tdms.sibur.ru/cp/", "bopp.sibur.ru", "eshop.sibur.ru",
+    "srm.sibur.ru", "resti.club", "lsdts.sibur.ru", "tms.sibur.ru",
+    "sharefile.sibur.ru",
+)
 
 SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
@@ -263,11 +270,11 @@ def get_db_connection():
 
 def load_active_sites():
     """Читает список активных сайтов из БД. Fallback на дефолтный список. Self-monitoring исключены.
-    Возвращает: (sites, categories, thresholds, ssl_verify_map, cm_enabled_map)"""
+    Возвращает: (sites, categories, thresholds, ssl_verify_map, cm_enabled_map, timeout_map)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, site_group, alert_threshold, ssl_verify, content_match_enabled FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
+        cur.execute("SELECT site, site_group, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds FROM monitored_sites WHERE is_active = TRUE ORDER BY site")
         rows = cur.fetchall()
         # Load dynamic categories from DB
         cur.execute("SELECT id, label, content_match_enabled FROM site_categories ORDER BY sort_order")
@@ -294,23 +301,27 @@ def load_active_sites():
             for r in rows:
                 if r[1] not in cat_ids and r[0] not in SELF_MONITORING_SITES:
                     categories.setdefault('external', []).append(r[0])
-            return sites, categories, thresholds, ssl_verify_map, cm_enabled_map
+            timeout_map = {r[0]: _effective_http_timeout(r[5]) for r in rows
+                           if r[0] not in SELF_MONITORING_SITES}
+            return sites, categories, thresholds, ssl_verify_map, cm_enabled_map, timeout_map
     except Exception as e:
         print(f"[WARN] Failed to load sites from DB: {e}")
     # Fallback: load settings from DB for all sites in SITES
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT site, ssl_verify, content_match_enabled, site_group FROM monitored_sites WHERE site = ANY(%s) AND is_active = TRUE", (list(SITES),))
+        cur.execute("SELECT site, ssl_verify, content_match_enabled, site_group, http_timeout_seconds FROM monitored_sites WHERE site = ANY(%s) AND is_active = TRUE", (list(SITES),))
         db_rows = cur.fetchall()
         db_ssl_map = {r[0]: (r[1] if r[1] is not None else True) for r in db_rows}
         # CM по умолчанию: TRUE для всех сайтов
         db_cm_map = {r[0]: (r[2] if r[2] is not None else True) for r in db_rows}
+        db_timeout_map = {r[0]: _effective_http_timeout(r[4]) for r in db_rows}
         cur.close()
         conn.close()
     except Exception:
         db_ssl_map = {}
         db_cm_map = {}
+        db_timeout_map = {}
     # Fallback
     all_sites = [s for s in SITES if s not in SELF_MONITORING_SITES]
     key = KEY_SITES[:]
@@ -321,7 +332,8 @@ def load_active_sites():
     ssl_verify_map = {s: db_ssl_map.get(s, True) for s in all_sites}
     # Fallback CM: True для всех сайтов по умолчанию
     cm_enabled_map = {s: db_cm_map.get(s, True) for s in all_sites}
-    return all_sites, categories, thresholds, ssl_verify_map, cm_enabled_map
+    timeout_map = {s: db_timeout_map.get(s, DEFAULT_HTTP_TIMEOUT) for s in all_sites}
+    return all_sites, categories, thresholds, ssl_verify_map, cm_enabled_map, timeout_map
 
 
 
@@ -693,6 +705,7 @@ def init_db():
     """)
 
     # Таблица настроек приложения
+    _migrate_http_timeouts(cur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -947,7 +960,43 @@ def _ensure_check_error_column(cur):
     cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS check_error TEXT")
 
 
-def _describe_check_error(exc):
+def _validated_http_timeout(value):
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value):
+        value = int(value)
+    if type(value) is not int or not 1 <= value <= 60:
+        raise ValueError("Таймаут HTTP должен быть целым числом от 1 до 60 секунд")
+    return value
+
+
+def _effective_http_timeout(value):
+    try:
+        return _validated_http_timeout(value)
+    except ValueError:
+        return DEFAULT_HTTP_TIMEOUT
+
+
+def _migrate_http_timeouts(cur):
+    """One-time experiment, in the init transaction; never reset later admin edits."""
+    cur.execute("""
+        ALTER TABLE monitored_sites ADD COLUMN IF NOT EXISTS
+        http_timeout_seconds INTEGER NOT NULL DEFAULT 8
+        CHECK (http_timeout_seconds BETWEEN 1 AND 60)
+    """)
+    cur.execute("""
+        INSERT INTO app_meta (key, value)
+        VALUES ('http_timeout_experiment_20261030_v1', '30 seconds for 10 selected sites')
+        ON CONFLICT (key) DO NOTHING RETURNING key
+    """)
+    if cur.fetchone():
+        cur.execute("""
+            UPDATE monitored_sites SET http_timeout_seconds = 30
+            WHERE site = ANY(%s) AND site_group != 'self'
+        """, (list(TIMEOUT_EXPERIMENT_SITES),))
+        print(f"[INIT] HTTP timeout experiment: {cur.rowcount} existing sites set to 30 seconds",
+              flush=True)
+
+
+def _describe_check_error(exc, timeout_seconds=DEFAULT_HTTP_TIMEOUT):
     """Без URL, заголовков и тела ответа: не сохраняем секреты из исключений."""
     if isinstance(exc, (aiohttp.ClientConnectorCertificateError,
                         ssl.SSLCertVerificationError)):
@@ -963,7 +1012,7 @@ def _describe_check_error(exc):
     if isinstance(os_error, socket.gaierror):
         return "DNS: не удалось определить IP-адрес сайта"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "Таймаут: запрос не завершён в пределах 8 секунд"
+        return f"Таймаут: запрос не завершён в пределах {timeout_seconds} секунд"
     if isinstance(os_error, ConnectionRefusedError):
         return "Соединение отклонено сервером"
     if isinstance(os_error, ConnectionResetError):
@@ -985,11 +1034,13 @@ def _http_error_reason(status):
     return f"HTTP {status}: {names.get(status, 'неожиданный код ответа')}"
 
 
-async def check_single_site(session, site, semaphore, verify_ssl=True):
+async def check_single_site(session, site, semaphore, verify_ssl=True,
+                            timeout_seconds=DEFAULT_HTTP_TIMEOUT):
     """Быстрая HTTP-проверка сайта. Content match для сайтов с content_match_enabled.
     SSL+WHOIS обновляются отдельным циклом.
     verify_ssl=True → обычная проверка SSL; verify_ssl=False → SSL не проверяется."""
     check_url = f"https://{site}"
+    timeout_seconds = _effective_http_timeout(timeout_seconds)
     curr_status, resp_time, check_error = 0, 0.0, None
 
     connector = None
@@ -1004,7 +1055,7 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
             else:
                 actual_session = session
 
-            timeout = aiohttp.ClientTimeout(total=8)
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
                 # Сначала преобразуем специальные статусы
@@ -1019,7 +1070,8 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                 # Content match для сайтов с content match enabled (только для 200)
                 if site in _cm_sites_set and curr_status == 200:
                     try:
-                        text = await asyncio.wait_for(resp.text(), timeout=10)
+                        # ClientTimeout.total covers connect + redirects + body.
+                        text = await resp.text()
                         text_lower = text.lower()
                         match_found = _content_match_regex.search(text_lower)
                         if match_found:
@@ -1029,10 +1081,10 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                             check_error = f"Content Match: в ответе HTTP {resp.status} нет совпадения с шаблоном"
                     except Exception as e:
                         curr_status = 701
-                        check_error = f"Content Match: ошибка чтения ответа ({_describe_check_error(e)})"
+                        check_error = f"Content Match: ошибка чтения ответа ({_describe_check_error(e, timeout_seconds)})"
         except Exception as e:
             curr_status = 0
-            check_error = _describe_check_error(e)
+            check_error = _describe_check_error(e, timeout_seconds)
         finally:
             resp_time = time.perf_counter() - start
             if not verify_ssl and connector and actual_session is not None:
@@ -1046,12 +1098,16 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
     return (site, curr_status, resp_time, check_error)
 
 
-async def check_all_sites(sites_list, ssl_verify_map=None):
+async def check_all_sites(sites_list, ssl_verify_map=None, timeout_map=None):
     """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
     semaphore = asyncio.Semaphore(15)
     ssl_map = ssl_verify_map or {}
+    timeout_map = timeout_map or {}
     async with aiohttp.ClientSession() as session:
-        tasks = [check_single_site(session, site, semaphore, verify_ssl=ssl_map.get(site, True)) for site in sites_list]
+        tasks = [check_single_site(session, site, semaphore,
+                                  verify_ssl=ssl_map.get(site, True),
+                                  timeout_seconds=timeout_map.get(site, DEFAULT_HTTP_TIMEOUT))
+                 for site in sites_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
 
@@ -1603,7 +1659,7 @@ def check_worker():
         t_start = time.time()
         try:
             # Обновляем список сайтов из БД каждый цикл
-            SITES, _categories, thresholds, ssl_verify_map, cm_enabled_map = load_active_sites()
+            SITES, _categories, thresholds, ssl_verify_map, cm_enabled_map, timeout_map = load_active_sites()
             # Build legacy vars for backward compat
             KEY_SITES = _categories.get('key', [])
             STDO_SITES = _categories.get('stdo', [])
@@ -1660,7 +1716,7 @@ def check_worker():
                 print(f"[WORKER] Sites: {SITES[:5]}... (total {len(SITES)})")
 
             # Быстрые HTTP-проверки обычных сайтов
-            results = loop.run_until_complete(check_all_sites(SITES, ssl_verify_map))
+            results = loop.run_until_complete(check_all_sites(SITES, ssl_verify_map, timeout_map))
             http_time = round(time.time() - t_start, 1)
             print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
 
@@ -2133,7 +2189,7 @@ async def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
         cat_rows = [dict(r) for r in cur.fetchall()]
@@ -2220,6 +2276,10 @@ async def _admin_page_inner(request, response):
                 <option value="">Загрузка...</option>
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
+            <label style="display:flex;align-items:center;gap:6px;">Таймаут HTTP, с
+                <input type="number" id="newTimeout" value="8" min="1" max="60" step="1"
+                       required aria-label="Таймаут HTTP нового сайта, секунды" style="width:75px;">
+            </label>
             <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
                 <input type="checkbox" id="newSslVerify" checked> SSL
             </label>
@@ -2228,7 +2288,8 @@ async def _admin_page_inner(request, response):
             </label>
             <button class="btn btn-primary" onclick="addSite()">➕ Добавить</button>
         </div>
-        <table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th>SSL</th><th>CM</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
+        <p style="font-size:12px;color:#64748b;">Таймаут HTTP: 1–60 секунд на весь запрос, включая перенаправления и чтение ответа. Применяется со следующего цикла без перезапуска. Большие значения могут удлинить цикл. Порог инцидента задаётся отдельно в минутах.</p>
+        <div style="overflow-x:auto;"><table><thead><tr><th>Сайт</th><th>Группа</th><th>Статус</th><th>Порог мин</th><th>Таймаут HTTP, с</th><th>SSL</th><th>CM</th><th style="width:300px;">Действия</th></tr></thead><tbody>""")
 
     cat_labels = {c['id']: c['label'] for c in cat_rows}
     for r in rows:
@@ -2249,6 +2310,7 @@ async def _admin_page_inner(request, response):
             <td><span class="badge badge-cat" data-cat="{r['site_group']}">{grp_name}</span></td>
             <td>{status}</td>
             <td>{r['alert_threshold']}</td>
+            <td>{_effective_http_timeout(r.get('http_timeout_seconds'))}</td>
             <td><span onclick="toggleSsl('{site_esc}')" style="cursor:pointer" title="Нажмите для переключения">{ssl_status}</span></td>
             <td><span onclick="toggleCm('{site_esc}')" style="cursor:pointer" title="Нажмите для переключения Content Match">{cm_status}</span></td>
             <td>
@@ -2257,18 +2319,22 @@ async def _admin_page_inner(request, response):
                     {toggle_btn}
                     <button class="btn btn-danger" onclick="deleteSite('{site_esc}')">🗑️ Удалить</button>
                 </div>
-                <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;">
+                <div class="edit-form" id="edit-{site_esc}" style="display:none;margin-top:8px;gap:6px;flex-wrap:wrap;align-items:center;">
                     <select id="grp-{site_esc}" data-group="{r['site_group']}" data-dynamic="categories" style="width:120px;">
                         <option value="">Загрузка...</option>
                     </select>
                     <input type="number" id="thr-{site_esc}" value="{r['alert_threshold']}" min="1" max="60" style="width:70px;">
+                    <label style="display:flex;align-items:center;gap:6px;">Таймаут, с
+                        <input type="number" id="timeout-{site_esc}" value="{_effective_http_timeout(r.get('http_timeout_seconds'))}"
+                               min="1" max="60" step="1" required aria-label="Таймаут HTTP, секунды" style="width:70px;">
+                    </label>
                     <button class="btn btn-primary" onclick="saveRow('{site_esc}')">💾 Сохранить</button>
                     <button class="btn btn-gray" onclick="cancelEdit('{site_esc}')">Отмена</button>
                 </div>
             </td>
         </tr>""")
 
-    H.append("""</tbody></table></div>
+    H.append("""</tbody></table></div></div>
     <div id="incidents-tab" class="tab-content">
         <h3 style="color:#00717a;margin-top:0;">Управление инцидентами</h3>
         <div id="admin-incidents-loading">Загрузка...</div>
@@ -2686,10 +2752,13 @@ async def _admin_page_inner(request, response):
         const site = document.getElementById('newSite').value.trim();
         const group = document.getElementById('newGroup').value;
         const threshold = parseInt(document.getElementById('newThreshold').value) || 5;
+        const timeoutInput = document.getElementById('newTimeout');
+        if (!timeoutInput.reportValidity()) return;
+        const http_timeout_seconds = Number(timeoutInput.value);
         const sslVerify = document.getElementById('newSslVerify').checked;
         const cmEnabled = document.getElementById('newCmEnabled').checked;
         if (!site) return showToast('Введите сайт');
-        const r = await fetch('/api/sites', {method:'POST', credentials: 'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, ssl_verify: sslVerify, content_match_enabled: cmEnabled})});
+        const r = await fetch('/api/sites', {method:'POST', credentials: 'include', headers:{'Content-Type':'application/json'}, body: JSON.stringify({site, group, threshold, http_timeout_seconds, ssl_verify: sslVerify, content_match_enabled: cmEnabled})});
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
@@ -2704,9 +2773,12 @@ async def _admin_page_inner(request, response):
     window.saveRow = async function(site) {
         const group = document.getElementById('grp-' + site).value;
         const threshold = parseInt(document.getElementById('thr-' + site).value);
+        const timeoutInput = document.getElementById('timeout-' + site);
+        if (!timeoutInput.reportValidity()) return;
+        const http_timeout_seconds = Number(timeoutInput.value);
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {
             method:'PUT', credentials: 'include', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({group, threshold})
+            body: JSON.stringify({group, threshold, http_timeout_seconds})
         });
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
@@ -2960,7 +3032,7 @@ async def list_sites(auth: bool = Depends(admin_auth)):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -2977,6 +3049,7 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
         site = data.get("site", "").strip()
         group = data.get("group", "external")
         threshold = int(data.get("threshold", 5))
+        timeout_seconds = _validated_http_timeout(data.get("http_timeout_seconds", DEFAULT_HTTP_TIMEOUT))
         ssl_verify = data.get("ssl_verify", True)
         content_match_enabled = data.get("content_match_enabled", True)
         if not site:
@@ -2995,15 +3068,16 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
             conn.close()
             return JSONResponse({"status": "error", "msg": f"group must be one of: {valid_groups}"}, status_code=400)
         cur.execute("""
-            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify, content_match_enabled)
-            VALUES (%s, %s, %s, TRUE, %s, %s)
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active, ssl_verify, content_match_enabled, http_timeout_seconds)
+            VALUES (%s, %s, %s, TRUE, %s, %s, %s)
             ON CONFLICT (site) DO UPDATE SET
                 is_active = TRUE,
                 site_group = EXCLUDED.site_group,
                 alert_threshold = EXCLUDED.alert_threshold,
                 ssl_verify = EXCLUDED.ssl_verify,
-                content_match_enabled = EXCLUDED.content_match_enabled
-        """, (site, group, threshold, ssl_verify, content_match_enabled))
+                content_match_enabled = EXCLUDED.content_match_enabled,
+                http_timeout_seconds = EXCLUDED.http_timeout_seconds
+        """, (site, group, threshold, ssl_verify, content_match_enabled, timeout_seconds))
 # Принудительная начальная запись в logs и latest_status (теперь таблица)
         cur.execute("""
             INSERT INTO logs (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
@@ -3025,40 +3099,54 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
         conn.close()
         _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Site '{site}' added"}
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 @app.put("/api/sites/{site_name:path}")
 async def update_site(site_name: str, request: Request, auth: bool = Depends(admin_auth)):
-    """Обновить группу и порог сайта"""
+    """Обновить группу, порог и таймаут; не трогать SSL/CM и рабочие результаты."""
+    conn = None
     try:
         data = await request.json()
         group = data.get("group")
         threshold = data.get("threshold")
+        fields, values = [], []
+        if group:
+            fields.append("site_group = %s")
+            values.append(group)
+        if threshold is not None:
+            threshold = int(threshold)
+            if not 1 <= threshold <= 60:
+                raise ValueError("threshold must be 1-60")
+            fields.append("alert_threshold = %s")
+            values.append(threshold)
+        if "http_timeout_seconds" in data:
+            fields.append("http_timeout_seconds = %s")
+            values.append(_validated_http_timeout(data["http_timeout_seconds"]))
+        if not fields:
+            raise ValueError("Не указаны настройки для изменения")
         if site_name in SELF_MONITORING_SITES:
             return JSONResponse({"status": "error", "msg": "Cannot modify self-monitoring sites"}, status_code=400)
         conn = get_db_connection()
-        cur = conn.cursor()
-        if group and threshold is not None:
-            cur.execute("""
-                UPDATE monitored_sites
-                SET site_group = %s, alert_threshold = %s
-                WHERE site = %s
-            """, (group, int(threshold), site_name))
-        elif group:
-            cur.execute("UPDATE monitored_sites SET site_group = %s WHERE site = %s", (group, site_name))
-        elif threshold is not None:
-            cur.execute("UPDATE monitored_sites SET alert_threshold = %s WHERE site = %s", (int(threshold), site_name))
-        conn.commit()
-        affected = cur.rowcount
-        cur.close()
-        conn.close()
+        with conn:
+            with conn.cursor() as cur:
+                # SQL identifiers are fixed above; all values remain parameters.
+                cur.execute("UPDATE monitored_sites SET " + ", ".join(fields) + " WHERE site = %s",
+                            (*values, site_name))
+                affected = cur.rowcount
         if affected == 0:
             return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
         _invalidate_dashboard_cache()
         return {"status": "ok", "msg": f"Site '{site_name}' updated"}
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/api/sites/{site_name:path}/toggle")
@@ -3176,16 +3264,17 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
         # Check SSL setting for this site
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT ssl_verify FROM monitored_sites WHERE site = %s", (site,))
+        cur.execute("SELECT ssl_verify, http_timeout_seconds FROM monitored_sites WHERE site = %s", (site,))
         row = cur.fetchone()
         cur.close()
         conn.close()
         verify_ssl = row[0] if row and row[0] is not None else True
+        timeout_seconds = _effective_http_timeout(row[1] if row else None)
         # Make HTTP request
         import aiohttp
         check_url = f"https://{site}"
         connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(check_url, allow_redirects=True) as resp:
                 status = resp.status
@@ -3199,7 +3288,7 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
                     status = 200
                     auth_note = "401 Auth Required → treated as OK"
                 try:
-                    text = await asyncio.wait_for(resp.text(), timeout=10)
+                    text = await resp.text()
                 except Exception:
                     text = ""
                 text_lower = text.lower()
