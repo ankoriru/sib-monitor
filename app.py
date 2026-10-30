@@ -1093,6 +1093,9 @@ def _flush_batch_unlocked():
         _update_checks_agg(cur, batch_buffer)
 
         # Обновляем latest_status напрямую (избегаем блокирующего REFRESH MATERIALIZED VIEW)
+        # SSL/WHOIS в буфере — старый снимок для истории, не результат HTTP-проверки.
+        # При конфликте эти поля обновляет только ssl_whois_worker, иначе flush
+        # может затереть свежую проверку сертификата значением предыдущего цикла.
         for row in batch_buffer:
             site, status, resp_time, ssl_d, dom_d, ssl_chain_valid = row[:6]
             cur.execute("""
@@ -1101,9 +1104,6 @@ def _flush_batch_unlocked():
                 ON CONFLICT (site) DO UPDATE SET
                     status = EXCLUDED.status,
                     response_time = EXCLUDED.response_time,
-                    ssl_days = EXCLUDED.ssl_days,
-                    domain_days = EXCLUDED.domain_days,
-                    ssl_chain_valid = EXCLUDED.ssl_chain_valid,
                     timestamp = EXCLUDED.timestamp
             """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid))
 
@@ -1716,8 +1716,8 @@ def ssl_whois_worker():
                     conn.commit()
                     cur.close()
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[SSL WORKER] Failed to save SSL/WHOIS for {site}: {e}")
 
                 time.sleep(0.5)  # Небольшая пауза между сайтами
 
@@ -1734,37 +1734,72 @@ def ssl_whois_worker():
 # ============================================================================
 # DAILY REPORT WORKER
 # ============================================================================
+def _send_daily_ssl_report():
+    """Формирует отчёт по свежим SSL-проверкам, а не по кэшу latest_status."""
+    if not TG_SSL_REPORT_ENABLED:
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT site
+                FROM monitored_sites
+                WHERE is_active = TRUE AND site_group != 'self'
+                  AND COALESCE(ssl_verify, TRUE) = TRUE
+                ORDER BY site
+            """)
+            sites = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    ssl_alerts = []
+    check_errors = []
+    for site in sites:
+        # Не ждём медленного WHOIS-цикла и не выдаём старое ssl_days за свежее.
+        ssl_days, chain_valid = _check_ssl_sync(site.split('/')[0], site)
+        if ssl_days is not None and 0 <= ssl_days <= 20:
+            ssl_alerts.append(f"🔒 {site} — осталось {ssl_days}д.")
+        elif ssl_days is None or ssl_days < 0:
+            reason = ("ошибка проверки сертификата"
+                      if chain_valid is False else "не удалось проверить сертификат")
+            check_errors.append(f"⚠️ {site} — {reason}; актуальный срок неизвестен.")
+
+    sections = []
+    if ssl_alerts:
+        sections.append("🔔 Утренний отчет по SSL (20 дней и менее):\n\n"
+                        + "\n".join(ssl_alerts))
+    if check_errors:
+        sections.append("Проблемы проверки SSL:\n\n" + "\n".join(check_errors))
+    if sections:
+        # Telegram ограничивает текст сообщения 4096 символами.
+        message = "\n\n".join(sections)
+        chunk = ""
+        for line in message.splitlines(keepends=True):
+            if len(chunk) + len(line) > 4000:
+                if chunk:
+                    send_tg_msg(chunk.rstrip(), category='ssl_report')
+                chunk = ""
+            # Защита также от одной необычно длинной строки.
+            while len(line) > 4000:
+                send_tg_msg(line[:4000], category='ssl_report')
+                line = line[4000:]
+            chunk += line
+        if chunk:
+            send_tg_msg(chunk.rstrip(), category='ssl_report')
+
+
 def daily_report_worker():
     """Рассылка отчёта по SSL в 09:00 МСК (отключается флагом tg_ssl_report_enabled)"""
     while True:
         now = datetime.datetime.now(TZ_MOSCOW)
         if now.hour == 9 and now.minute == 0:
             try:
-                conn = get_db_connection()
-                cur = conn.cursor(cursor_factory=DictCursor)
-                cur.execute("""
-                    SELECT ls.site, ls.ssl_days 
-                    FROM latest_status ls
-                    JOIN monitored_sites ms ON ls.site = ms.site
-                    WHERE ms.is_active = TRUE AND ms.site_group != 'self'
-                """)
-                rows = cur.fetchall()
-                cur.close()
-                conn.close()
-
-                ssl_alerts = [
-                    f"🔒 {r[0]} — осталось {r[1]}д."
-                    for r in rows
-                    if r[1] is not None and 0 <= r[1] <= 20
-                ]
-                
-                if ssl_alerts:
-                    msg = "🔔 Утренний отчет по SSL (менее 20 дней):\n\n" + "\n".join(ssl_alerts)
-                    send_tg_msg(msg, category='ssl_report')
-
-                time.sleep(61)
-            except Exception:
-                pass
+                _send_daily_ssl_report()
+            except Exception as e:
+                print(f"[SSL REPORT ERROR] {type(e).__name__}: {e}")
+            # Не повторяем попытку в ту же минуту, в том числе после ошибки.
+            time.sleep(61)
         time.sleep(30)
 
 
