@@ -3,6 +3,9 @@ FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
 
 WORKDIR /app
 
+# Отправляем print/logging в журнал контейнера сразу, без буферизации stdout.
+ENV PYTHONUNBUFFERED=1
+
 # Устанавливаем системную библиотеку для работы с PostgreSQL
 RUN apt-get update && apt-get install -y libpq-dev && rm -rf /var/lib/apt/lists/*
 

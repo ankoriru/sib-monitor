@@ -18,6 +18,7 @@ import concurrent.futures
 import re
 from io import StringIO
 from string import Template
+from html import escape
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -30,6 +31,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
+APP_VERSION = "2026.10.30-diagnostics.1"
 
 SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
@@ -510,6 +512,7 @@ def init_db():
             timestamp TIMESTAMP
         )
     """)
+    _ensure_check_error_column(cur)
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
     except psycopg2.Error:
@@ -938,18 +941,63 @@ def get_domain_info(site):
 # ============================================================================
 # АСИНХРОННЫЕ ПРОВЕРКИ САЙТОВ (Этап 2.2)
 # ============================================================================
+def _ensure_check_error_column(cur):
+    """Аддитивная миграция: старые строки/версии приложения остаются совместимыми."""
+    cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS check_error TEXT")
+
+
+def _describe_check_error(exc):
+    """Без URL, заголовков и тела ответа: не сохраняем секреты из исключений."""
+    if isinstance(exc, (aiohttp.ClientConnectorCertificateError,
+                        ssl.SSLCertVerificationError)):
+        cert_error = getattr(exc, "certificate_error", exc)
+        detail = getattr(cert_error, "verify_message", None)
+        if detail:
+            detail = " ".join(str(detail).split())[:200]
+            return f"TLS: сертификат не прошёл проверку: {detail}"
+        return "TLS: сертификат не прошёл проверку (срок, имя хоста или цепочка доверия)"
+    if isinstance(exc, (aiohttp.ClientSSLError, ssl.SSLError)):
+        return "TLS: ошибка защищённого соединения"
+    os_error = getattr(exc, "os_error", exc)
+    if isinstance(os_error, socket.gaierror):
+        return "DNS: не удалось определить IP-адрес сайта"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "Таймаут: запрос не завершён в пределах 8 секунд"
+    if isinstance(os_error, ConnectionRefusedError):
+        return "Соединение отклонено сервером"
+    if isinstance(os_error, ConnectionResetError):
+        return "Соединение сброшено удалённой стороной"
+    if isinstance(exc, aiohttp.ServerDisconnectedError):
+        return "Сервер закрыл соединение до получения ответа"
+    if isinstance(exc, aiohttp.TooManyRedirects):
+        return "Превышено допустимое число перенаправлений"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        errno = getattr(os_error, "errno", None)
+        return f"Ошибка подключения (код ОС: {errno})"
+    return f"Ошибка запроса: {type(exc).__name__}"
+
+
+def _http_error_reason(status):
+    names = {403: "доступ запрещён", 404: "страница не найдена",
+             429: "слишком много запросов", 500: "внутренняя ошибка сервера",
+             502: "ошибка шлюза", 503: "сервис недоступен", 504: "таймаут шлюза"}
+    return f"HTTP {status}: {names.get(status, 'неожиданный код ответа')}"
+
+
 async def check_single_site(session, site, semaphore, verify_ssl=True):
     """Быстрая HTTP-проверка сайта. Content match для сайтов с content_match_enabled.
     SSL+WHOIS обновляются отдельным циклом.
     verify_ssl=True → обычная проверка SSL; verify_ssl=False → SSL не проверяется."""
     check_url = f"https://{site}"
-    curr_status, resp_time = 0, 25.0
+    curr_status, resp_time, check_error = 0, 0.0, None
 
-    connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
-    start = time.time()
+    connector = None
     actual_session = None
     async with semaphore:
+        # Очередь семафора не является временем ответа сайта.
+        start = time.perf_counter()
         try:
+            connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
             if not verify_ssl and connector:
                 actual_session = aiohttp.ClientSession(connector=connector)
             else:
@@ -958,7 +1006,6 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
             timeout = aiohttp.ClientTimeout(total=8)
             async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
                 curr_status = resp.status
-                resp_time = time.time() - start
                 # Сначала преобразуем специальные статусы
                 if curr_status in (307, 308):
                     # 307/308 = редирект, сервер работает — считаем OK
@@ -966,6 +1013,8 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                 elif curr_status == 401:
                     # 401 = сервер работает, требует авторизацию — считаем OK
                     curr_status = 200
+                if curr_status != 200:
+                    check_error = _http_error_reason(curr_status)
                 # Content match для сайтов с content match enabled (только для 200)
                 if site in _cm_sites_set and curr_status == 200:
                     try:
@@ -976,24 +1025,24 @@ async def check_single_site(session, site, semaphore, verify_ssl=True):
                             print(f"[CONTENT MATCH OK] {site}")
                         else:
                             curr_status = 701
-                            print(f"[CONTENT MISMATCH] {site} — text ({len(text)} chars): {repr(text_lower[:800])}")
-                            for kw in ['войдите', 'логин', 'пароль', 'login', 'password', 'sibur', 'сибур']:
-                                idx = text_lower.find(kw)
-                                if idx >= 0:
-                                    print(f"  FOUND '{kw}' at pos {idx}: ...{text_lower[max(0,idx-20):idx+len(kw)+20]}...")
-                                else:
-                                    print(f"  NOT FOUND: '{kw}'")
+                            check_error = f"Content Match: в ответе HTTP {resp.status} нет совпадения с шаблоном"
                     except Exception as e:
                         curr_status = 701
-                        print(f"[CONTENT MISMATCH] {site} — {type(e).__name__}: {e}")
+                        check_error = f"Content Match: ошибка чтения ответа ({_describe_check_error(e)})"
         except Exception as e:
-            curr_status, resp_time = 0, 25.0
-            print(f"[CHECK ERR] {site}: {type(e).__name__}: {str(e)[:150]}")
+            curr_status = 0
+            check_error = _describe_check_error(e)
         finally:
+            resp_time = time.perf_counter() - start
             if not verify_ssl and connector and actual_session is not None:
                 await actual_session.close()
+            elif connector is not None:
+                await connector.close()
 
-    return (site, curr_status, resp_time)
+    if check_error:
+        print(f"[CHECK ERR] {site}: status={curr_status} elapsed={resp_time:.2f}s "
+              f"reason={check_error}", flush=True)
+    return (site, curr_status, resp_time, check_error)
 
 
 async def check_all_sites(sites_list, ssl_verify_map=None):
@@ -1012,6 +1061,7 @@ async def check_self_monitoring():
     results = []
     async with aiohttp.ClientSession() as session:
         for site in SELF_MONITORING_SITES:
+            start = time.perf_counter()
             try:
                 timeout = aiohttp.ClientTimeout(total=8)
                 async with session.get(f"https://{site}", timeout=timeout, allow_redirects=True) as resp:
@@ -1019,7 +1069,7 @@ async def check_self_monitoring():
                     status = 200 if resp.status > 0 else 0
             except Exception:
                 status = 0
-            results.append((site, status, 0.5, -1, -1, None))
+            results.append((site, status, time.perf_counter() - start, -1, -1, None))
     return results
 
 
@@ -1088,7 +1138,7 @@ def _flush_batch_unlocked():
             """INSERT INTO logs
                (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
                VALUES %s""",
-            batch_buffer
+            [row[:6] for row in batch_buffer]
         )
         _update_checks_agg(cur, batch_buffer)
 
@@ -1098,14 +1148,16 @@ def _flush_batch_unlocked():
         # может затереть свежую проверку сертификата значением предыдущего цикла.
         for row in batch_buffer:
             site, status, resp_time, ssl_d, dom_d, ssl_chain_valid = row[:6]
+            check_error = row[6] if len(row) > 6 else None
             cur.execute("""
-                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, check_error, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (site) DO UPDATE SET
                     status = EXCLUDED.status,
                     response_time = EXCLUDED.response_time,
+                    check_error = EXCLUDED.check_error,
                     timestamp = EXCLUDED.timestamp
-            """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+            """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
 
         conn.commit()
         cur.close()
@@ -1396,7 +1448,8 @@ def _send_screenshot_async(site, caption):
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                         last_status, fail_count, last_latency_map, thresholds, first_fail_time):
+                         last_status, fail_count, last_latency_map, thresholds, first_fail_time,
+                         check_error=None):
     """Алерт + инцидент только при превышении порога (alert_threshold, default 5 мин).
     TG-алерт и _db_incident_start — при fail_count >= threshold.
     Скриншот в фоне — не блокирует worker."""
@@ -1430,12 +1483,12 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
-                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
                 if len(batch_buffer) >= BATCH_SIZE:
                     _flush_batch_unlocked()
         else:
             with BATCH_LOCK:
-                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid))
+                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
                 if len(batch_buffer) >= BATCH_SIZE:
                     _flush_batch_unlocked()
 
@@ -1623,11 +1676,12 @@ def check_worker():
             conn.close()
 
             # Обработка обычных сайтов
-            for site, curr_status, resp_time in results:
+            for site, curr_status, resp_time, check_error in results:
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
                 # Site check complete
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
-                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time)
+                                     last_status, fail_count, last_latency_map, thresholds, first_fail_time,
+                                     check_error=check_error)
 
             # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
@@ -1639,6 +1693,11 @@ def check_worker():
             failed_now = sum(1 for _, st, *_ in results if st != 200)
             cycle_time = round(time.time() - t_start, 1)
             print(f"[CHECK SUMMARY] checked={len(results)} failed={failed_now} cycle_time={cycle_time}s")
+            # Дублируем причины рядом со сводкой: они останутся видны в хвосте логов.
+            for site, status, elapsed, reason in results:
+                if reason:
+                    print(f"[CHECK SUMMARY ERROR] {site}: status={status} "
+                          f"elapsed={elapsed:.2f}s reason={reason}", flush=True)
 
         except Exception as e:
             print(f"[WORKER ERROR] {type(e).__name__}: {e}")
@@ -1827,7 +1886,7 @@ def rotation_worker():
 @app.on_event("startup")
 async def startup_event():
     # Неблокирующий запуск тяжёлых операций в отдельных потоках
-    print("[STARTUP] Starting init_db, backfill, workers...")
+    print(f"[STARTUP] version={APP_VERSION} Starting init_db, backfill, workers...", flush=True)
     await asyncio.to_thread(init_db)
     # Cleanup self-monitoring — одноразовый (после миграции self-monitoring в отдельную группу)
     try:
@@ -2876,17 +2935,17 @@ async def health():
             last_tick = datetime.datetime.fromisoformat(str(row[0]))
             if (datetime.datetime.now() - last_tick).total_seconds() > 120:
                 return JSONResponse(
-                    {"status": "degraded", "reason": "worker stale"},
+                    {"status": "degraded", "reason": "worker stale", "version": APP_VERSION},
                     status_code=503
                 )
-            return {"status": "ok", "last_worker_tick": str(row[1])}
+            return {"status": "ok", "last_worker_tick": str(row[1]), "version": APP_VERSION}
         return JSONResponse(
-            {"status": "starting", "reason": "no heartbeat yet"},
+            {"status": "starting", "reason": "no heartbeat yet", "version": APP_VERSION},
             status_code=503
         )
     except Exception as e:
         return JSONResponse(
-            {"status": "error", "reason": str(e)},
+            {"status": "error", "reason": str(e), "version": APP_VERSION},
             status_code=500
         )
 
@@ -3849,6 +3908,9 @@ def _build_head() -> str:
         .txt-err { color: #dc2626; font-weight: bold; }
         .txt-ok { color: #16a34a; font-weight: bold; }
         .txt-warn { color: #d97706; font-weight: bold; }
+        .check-error { display: block; margin-top: 4px; min-width: 220px; max-width: 340px;
+                       white-space: normal; overflow-wrap: anywhere;
+                       font-size: 12px; line-height: 1.4; }
         .refresh-btn { background: #00717a; color: white; border: none;
                         padding: 8px 15px; border-radius: 6px; cursor: pointer; }
         .btn-test { background: #00717a; color: white; border: none;
@@ -3920,7 +3982,7 @@ def _build_body(data: dict) -> str:
     all_warn_list = []
     for s in incidents:
         st = latest[s]['status']
-        desc = status_desc.get(st, f"Код {st}")
+        desc = escape(latest[s].get('check_error') or status_desc.get(st, f"Код {st}"))
         line = f"❌ {s} ({desc}){inc_lookup.pop(s, '')}"
         all_warn_list.append(line)
     # Добавляем оставшиеся инциденты (не связанные с offline)
@@ -4016,7 +4078,8 @@ def _build_body(data: dict) -> str:
     <div class="container">
         <div style="display:flex; justify-content:space-between;
                      align-items:center; margin-bottom:20px;">
-            <h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
+            <div><h1 style="color:#00717a; margin:0;">📊 Мониторинг сайтов</h1>
+                <small style="color:#64748b;">Версия {APP_VERSION}</small></div>
             <button class="refresh-btn" onclick="location.reload()">
                 🔄 Обновить: {now_msk}
             </button>
@@ -4086,10 +4149,12 @@ def _build_body(data: dict) -> str:
             status_label = 'Offline'
             status_class = 'txt-err'
 
+        reason = v.get('check_error') if v['status'] != 200 else None
+        reason_html = f'<span class="check-error">{escape(reason)}</span>' if reason else ''
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
-            <td><span class="{status_class}">{status_label}</span></td>
+            <td><span class="{status_class}">{status_label}</span>{reason_html}</td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
                         <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
