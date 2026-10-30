@@ -7,7 +7,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
 # Устанавливаем системную библиотеку для работы с PostgreSQL
-RUN apt-get update && apt-get install -y libpq-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libpq-dev openssl && rm -rf /var/lib/apt/lists/*
 
 # Обновляем pip и устанавливаем зависимости Python
 COPY requirements.txt .

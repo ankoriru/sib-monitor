@@ -19,6 +19,7 @@ import re
 from io import StringIO
 from string import Template
 from html import escape
+from network_diagnostics import run_diagnostics
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -31,7 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.10.30-diagnostics.1"
+APP_VERSION = "2026.10.30-netprobe.1"
 
 SELF_MONITORING_SITES = [
     "sib-monitor-ankori.amvera.io"
@@ -2008,6 +2009,9 @@ async def startup_event():
     threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
+    # Временный диагностический проход: отдельный поток, без записи рабочих результатов.
+    if os.getenv("NETWORK_DIAGNOSTICS_ENABLED", "1") == "1":
+        threading.Thread(target=run_diagnostics, name="network-diagnostics", daemon=True).start()
     # Telegram config check
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
