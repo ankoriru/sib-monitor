@@ -50,14 +50,46 @@ class SSLReportTests(unittest.TestCase):
     def test_failed_check_never_reuses_old_countdown(self):
         with patch.object(app, "_check_ssl_sync", return_value=(-1, None)):
             app._send_daily_ssl_report()
-        message = self.sender.call_args.args[0]
-        self.assertIn("актуальный срок неизвестен", message)
-        self.assertNotIn("осталось", message)
+        self.sender.assert_not_called()
 
-    def test_invalid_certificate_reported_explicitly(self):
-        with patch.object(app, "_check_ssl_sync", return_value=(-1, False)):
+    def test_invalid_certificate_with_unknown_expiry_is_only_logged(self):
+        with patch.object(app, "_check_ssl_sync", return_value=(-1, False)), \
+                patch("builtins.print") as log:
             app._send_daily_ssl_report()
-        self.assertIn("ошибка проверки сертификата", self.sender.call_args.args[0])
+        self.sender.assert_not_called()
+        self.assertIn("[SSL REPORT SKIP]", log.call_args.args[0])
+        self.assertIn("ошибка проверки сертификата", log.call_args.args[0])
+
+    def test_none_expiry_is_not_sent(self):
+        with patch.object(app, "_check_ssl_sync", return_value=(None, None)):
+            app._send_daily_ssl_report()
+        self.sender.assert_not_called()
+
+    def test_mixed_checks_send_only_confirmed_expiry(self):
+        self.cursor.fetchall.return_value = [
+            ("unknown.example",), ("broken.example",), ("soon.example",), ("renewed.example",)
+        ]
+        with patch.object(app, "_check_ssl_sync",
+                          side_effect=[(-1, None), (-1, False), (4, True), (90, True)]):
+            app._send_daily_ssl_report()
+        self.sender.assert_called_once()
+        message = self.sender.call_args.args[0]
+        self.assertIn("soon.example — осталось 4д.", message)
+        for excluded in ("unknown.example", "broken.example", "renewed.example",
+                         "актуальный срок неизвестен", "Проблемы проверки SSL"):
+            self.assertNotIn(excluded, message)
+
+    def test_exception_does_not_prevent_remaining_site_alert(self):
+        self.cursor.fetchall.return_value = [("failed.example",), ("soon.example",)]
+        with patch.object(app, "_check_ssl_sync",
+                          side_effect=[TimeoutError("private detail"), (5, True)]), \
+                patch("builtins.print") as log:
+            app._send_daily_ssl_report()
+        self.sender.assert_called_once()
+        self.assertIn("soon.example", self.sender.call_args.args[0])
+        self.assertNotIn("failed.example", self.sender.call_args.args[0])
+        self.assertIn("TimeoutError", log.call_args.args[0])
+        self.assertNotIn("private detail", log.call_args.args[0])
 
     def test_threshold_boundaries(self):
         for days in (0, 20, 21):
@@ -99,14 +131,14 @@ class SSLReportTests(unittest.TestCase):
             app._send_daily_ssl_report()
         check.assert_called_once_with("example.org", "example.org/cp/")
 
-    def test_many_failures_fit_telegram_limit(self):
-        self.cursor.fetchall.return_value = [(f"host-{i}.example.org",) for i in range(100)]
-        with patch.object(app, "_check_ssl_sync", return_value=(-1, None)):
+    def test_many_expiry_alerts_fit_telegram_limit(self):
+        self.cursor.fetchall.return_value = [(f"host-{i}.example.org",) for i in range(200)]
+        with patch.object(app, "_check_ssl_sync", return_value=(5, True)):
             app._send_daily_ssl_report()
         messages = [call.args[0] for call in self.sender.call_args_list]
         self.assertGreater(len(messages), 1)
         self.assertTrue(all(len(message) <= 4000 for message in messages))
-        for i in range(100):
+        for i in range(200):
             self.assertEqual("\n".join(messages).count(f"host-{i}.example.org"), 1)
         for call in self.sender.call_args_list:
             self.assertEqual(call.kwargs["category"], "ssl_report")

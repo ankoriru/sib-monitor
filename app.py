@@ -32,7 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.10.30-ssl-roster.1"
+APP_VERSION = "2026.10.31-ssl-report.1"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -1883,23 +1883,26 @@ def _send_daily_ssl_report():
         conn.close()
 
     ssl_alerts = []
-    check_errors = []
     for site in sites:
         # Не ждём медленного WHOIS-цикла и не выдаём старое ssl_days за свежее.
-        ssl_days, chain_valid = _check_ssl_sync(site.split('/')[0], site)
+        try:
+            ssl_days, chain_valid = _check_ssl_sync(site.split('/')[0], site)
+        except Exception as exc:
+            print(f"[SSL REPORT SKIP] {site}: check failed ({type(exc).__name__})",
+                  flush=True)
+            continue
         if ssl_days is not None and 0 <= ssl_days <= 20:
             ssl_alerts.append(f"🔒 {site} — осталось {ssl_days}д.")
         elif ssl_days is None or ssl_days < 0:
             reason = ("ошибка проверки сертификата"
                       if chain_valid is False else "не удалось проверить сертификат")
-            check_errors.append(f"⚠️ {site} — {reason}; актуальный срок неизвестен.")
+            print(f"[SSL REPORT SKIP] {site}: {reason}; актуальный срок неизвестен.",
+                  flush=True)
 
     sections = []
     if ssl_alerts:
         sections.append("🔔 Утренний отчет по SSL (20 дней и менее):\n\n"
                         + "\n".join(ssl_alerts))
-    if check_errors:
-        sections.append("Проблемы проверки SSL:\n\n" + "\n".join(check_errors))
     if sections:
         # Telegram ограничивает текст сообщения 4096 символами.
         message = "\n\n".join(sections)
