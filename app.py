@@ -33,7 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-globalping.2"
+APP_VERSION = "2026.11.05-globalping.3"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -4342,7 +4342,7 @@ def _build_body(data: dict) -> str:
             links = []
             for mid in external.get('measurements', []):
                 if re.fullmatch(r"[A-Za-z0-9_-]{8,80}", str(mid)):
-                    links.append(f'<a href="https://globalping.io/measurements/{mid}" '
+                    links.append(f'<a href="https://api.globalping.io/v1/measurements/{mid}" '
                                  f'target="_blank" rel="noopener">Измерение</a>')
             reason_html += ('<details class="check-error"><summary>Точки проверки</summary>'
                             + '<br>'.join(rows + links) + '</details>')
