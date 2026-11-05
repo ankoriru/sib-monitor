@@ -33,7 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-globalping.1"
+APP_VERSION = "2026.11.05-globalping.2"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -3066,8 +3066,12 @@ async def health():
         cur.close()
         conn.close()
         if row:
-            last_tick = datetime.datetime.fromisoformat(str(row[0]))
-            if (datetime.datetime.now() - last_tick).total_seconds() > 120:
+            # PostgreSQL emits "+00"; Python 3.10 requires "+00:00".
+            stamp = re.sub(r"([+-]\d{2})$", r"\1:00", str(row[0]).replace("Z", "+00:00"))
+            last_tick = datetime.datetime.fromisoformat(stamp)
+            if last_tick.tzinfo is None:
+                last_tick = last_tick.replace(tzinfo=datetime.timezone.utc)
+            if (datetime.datetime.now(datetime.timezone.utc) - last_tick).total_seconds() > 300:
                 return JSONResponse(
                     {"status": "degraded", "reason": "worker stale", "version": APP_VERSION},
                     status_code=503

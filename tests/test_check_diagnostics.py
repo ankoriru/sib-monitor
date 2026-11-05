@@ -217,6 +217,23 @@ class HealthVersionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["version"], app.APP_VERSION)
         self.assertEqual(result["status"], "ok")
 
+    async def test_health_accepts_postgres_short_timezone(self):
+        conn = MagicMock()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        conn.cursor.return_value.fetchone.return_value = (
+            now.strftime("%Y-%m-%d %H:%M:%S.%f+00"), now)
+        with patch.object(app, "get_db_connection", return_value=conn):
+            result = await app.health()
+        self.assertEqual(result["status"], "ok")
+
+    async def test_health_rejects_stale_aware_timestamp(self):
+        conn = MagicMock()
+        old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)
+        conn.cursor.return_value.fetchone.return_value = (old.isoformat(), old)
+        with patch.object(app, "get_db_connection", return_value=conn):
+            result = await app.health()
+        self.assertEqual(result.status_code, 503)
+
 
 if __name__ == "__main__":
     unittest.main()

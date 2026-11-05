@@ -1,6 +1,6 @@
 # Резервная проверка Globalping
 
-Версия: 2026.11.05-globalping.1. Рабочая публикация: существующее приложение
+Версия: 2026.11.05-globalping.2. Рабочая публикация: существующее приложение
 sib-monitor в Amvera Moscow-1, домен https://sib-monitor-ankori.msk1.amvera.tech/.
 
 ## Область применения
