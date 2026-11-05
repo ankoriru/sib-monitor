@@ -56,11 +56,13 @@
    - 🧪 Тест скриншот: по кнопке (rate limit 30 сек/сайт)
    - Retry 3x, exponential backoff, логирование каждого вызова
 
-7. SELF-MONITORING (sib-monitor-ankori.amvera.io)
+7. SELF-MONITORING (https://sib-monitor-ankori.msk1.amvera.tech/)
    - Изолирован: не в KPI "Доступно", не в общей таблице dashboard, не в группах
    - Проверка: любой HTTP-ответ = Online (200), только timeout = Offline (0)
    - Алерты: порог 10 мин, помечены [SELF-MONITORING] в Telegram
-   - Cleanup при старте: удаляются старые logs/checks_agg/incidents для SM
+   - Прежний адрес amvera.io отключается при старте; его история сохраняется.
+   - Новый адрес проверяется по корневой странице; запрос авторизации (401) также означает Online.
+   - Первичная очистка SM выполняется только один раз по маркеру sm_cleanup_v1, не при каждом старте.
    - Fallback Online: если нет в БД — показывает status=200
    - Вкладка только в Управлении (не на главном dashboard)
 

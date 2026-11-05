@@ -33,7 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-monitor.6"
+APP_VERSION = "2026.11.05-monitor.7"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -43,8 +43,9 @@ TIMEOUT_EXPERIMENT_SITES = (
 )
 
 SELF_MONITORING_SITES = [
-    "sib-monitor-ankori.amvera.io"
+    "sib-monitor-ankori.msk1.amvera.tech"
 ]
+RETIRED_SELF_MONITORING_SITES = ("sib-monitor-ankori.amvera.io",)
 
 # --- Флаги Telegram-оповещений (читаются из app_settings, обновляются каждый цикл воркера) ---
 # TG_ALERTS_ENABLED      — алерты DOWN/UP/задержка (включая скриншоты к ним)
@@ -381,6 +382,23 @@ def _column_exists(cur, table, column):
     return cur.fetchone()[0]
 
 
+def _sync_self_monitoring_sites(cur):
+    """Retire the previous hostname without deleting its measurement history."""
+    cur.execute("""
+        UPDATE monitored_sites SET is_active = FALSE
+        WHERE site = ANY(%s) AND is_active = TRUE
+    """, (list(RETIRED_SELF_MONITORING_SITES),))
+    for site in SELF_MONITORING_SITES:
+        cur.execute("""
+            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
+            VALUES (%s, 'self', 10, TRUE)
+            ON CONFLICT (site) DO UPDATE SET
+                site_group = 'self',
+                is_active = TRUE,
+                alert_threshold = 10
+        """, (site,))
+
+
 def init_db():
     """Инициализация БД с поддержкой партиционирования + incidents + health + ssl_chain"""
     conn = get_db_connection()
@@ -685,17 +703,8 @@ def init_db():
         print(f"[INIT] Inserted/updated {len(default_sites)} default sites")
 
     # Self-monitoring сайты — отдельная группа 'self'
-    for s in SELF_MONITORING_SITES:
-        cur.execute("""
-            INSERT INTO monitored_sites (site, site_group, alert_threshold, is_active)
-            VALUES (%s, 'self', 10, TRUE)
-            ON CONFLICT (site) DO UPDATE SET
-                site_group = 'self',
-                is_active = TRUE,
-                alert_threshold = 10
-        """, (s,))
-        if cur.rowcount > 0:
-            print(f"[INIT] Added/updated self-monitoring site: {s}")
+    _sync_self_monitoring_sites(cur)
+    print(f"[INIT] Self-monitoring targets: {', '.join(SELF_MONITORING_SITES)}")
 
     # Таблица миграций
     cur.execute("""
@@ -1145,7 +1154,7 @@ async def check_self_monitoring():
             start = time.perf_counter()
             try:
                 timeout = aiohttp.ClientTimeout(total=8)
-                async with session.get(f"https://{site}", timeout=timeout, allow_redirects=True) as resp:
+                async with session.get(f"https://{site}/", timeout=timeout, allow_redirects=True) as resp:
                     # Любой HTTP-ответ (200, 401, 403, 404, 500...) = сервер отвечает
                     status = 200 if resp.status > 0 else 0
             except Exception:
@@ -1776,7 +1785,7 @@ def check_worker():
             http_time = round(time.time() - t_start, 1)
             print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
 
-            # Проверка self-monitoring через /health
+            # Проверка доступности самого приложения; HTTP 401 также означает Online.
             self_results = loop.run_until_complete(check_self_monitoring())
             print(f"[WORKER] Self-monitoring: {len(self_results)} sites")
 
