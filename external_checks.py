@@ -16,6 +16,7 @@ from collections import deque
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from check_targets import check_target
 
 UNKNOWN = 702
 TLS_ERROR = 703
@@ -215,7 +216,7 @@ class ExternalChecker:
         raise TimeoutError("measurement_deadline")
 
     async def fresh(self, session, site, verify_ssl, pattern):
-        host, _, suffix = site.partition("/")
+        host, _, suffix = check_target(site).partition("/")
         paths, seen, rows, ids, times = ["/" + suffix], set(), [], [], []
         for _ in range(MAX_HOPS):
             if not paths:
@@ -243,7 +244,7 @@ class ExternalChecker:
                     probes=rows, measurements=ids, cached=False)
 
     async def get(self, session, site, verify_ssl=True, pattern=None):
-        key = (site, verify_ssl, pattern.pattern if pattern else None,
+        key = (site, check_target(site), verify_ssl, pattern.pattern if pattern else None,
                pattern.flags if pattern else None)
         saved = self.cache.get(key)
         if saved and time.monotonic() - saved[0] < INTERVAL:
@@ -256,7 +257,8 @@ class ExternalChecker:
                 return cached
         started = time.monotonic()
         try:
-            if site not in self.allowed_sites or not public_site(site):
+            if (site not in self.allowed_sites or not public_site(site)
+                    or not public_site(check_target(site))):
                 raise ValueError("site_not_approved")
             result = await asyncio.wait_for(self.fresh(session, site, verify_ssl, pattern), 50)
         except Exception as exc:
@@ -276,14 +278,16 @@ class ExternalChecker:
         if not ENABLED:
             return results
         # Only the actual active roster passed by the HTTP worker is approved.
-        self.allowed_sites = {row[0] for row in results if public_site(row[0])}
+        self.allowed_sites = {row[0] for row in results
+                              if public_site(row[0]) and public_site(check_target(row[0]))}
         semaphore = asyncio.Semaphore(3)
 
         async def one(row):
             site, status, elapsed, reason = row
             if site not in self.allowed_sites or not network_failure(status, reason):
                 return row
-            direct = dict(status=status, response_time=elapsed, error=reason, checked_at=utcnow())
+            direct = dict(status=status, response_time=elapsed, error=reason,
+                          checked_at=utcnow(), url="https://" + check_target(site))
             async with semaphore:
                 external = await self.get(
                     session, site, ssl_map.get(site, True), pattern if site in cm_sites else None)
@@ -300,6 +304,7 @@ class ExternalChecker:
                 note += ". TLS-проверка отключена в настройках сайта"
             print(f"[GLOBALPING] {site} verdict={external['verdict']} "
                   f"status={external['status']} cached={external['cached']} "
+                  f"target={check_target(site)} "
                   f"measurements={','.join(external['measurements'])} "
                   f"api_error={external.get('api_error', '-')}", flush=True)
             return (site, external["status"], external["response_time"], note, details)

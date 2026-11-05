@@ -21,6 +21,7 @@ from string import Template
 from html import escape
 from network_diagnostics import run_diagnostics
 from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
+from check_targets import check_target
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -33,7 +34,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-globalping.3"
+APP_VERSION = "2026.11.05-monitor.4"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -143,7 +144,7 @@ def _take_screenshot_sync(site):
         try:
             page = await context.new_page()
             try:
-                await page.goto(f"https://{site}", timeout=20000, wait_until="domcontentloaded")
+                await page.goto(f"https://{check_target(site)}", timeout=20000, wait_until="domcontentloaded")
             except Exception as e:
                 print(f"[SCREEN WARN] {site} goto timeout/error: {e}")
             await _asyncio.sleep(3)
@@ -1040,12 +1041,30 @@ def _http_error_reason(status):
     return f"HTTP {status}: {names.get(status, 'неожиданный код ответа')}"
 
 
+def _public_check_error(value):
+    """Expose the result, not the network-routing mechanism or cached diagnostics."""
+    status = value.get("status")
+    if status == 200:
+        return None
+    if (value.get("check_details") or {}).get("source") != "globalping":
+        return value.get("check_error")
+    if status == CHECK_UNKNOWN:
+        return "Не удалось получить результат проверки"
+    if status == 703:
+        return "TLS: сертификат не прошёл проверку"
+    if status == 701:
+        return "Content Match: нет совпадения с шаблоном"
+    if isinstance(status, int) and 100 <= status <= 599:
+        return _http_error_reason(status)
+    return "Не удалось получить результат проверки"
+
+
 async def check_single_site(session, site, semaphore, verify_ssl=True,
                             timeout_seconds=DEFAULT_HTTP_TIMEOUT):
     """Быстрая HTTP-проверка сайта. Content match для сайтов с content_match_enabled.
     SSL+WHOIS обновляются отдельным циклом.
     verify_ssl=True → обычная проверка SSL; verify_ssl=False → SSL не проверяется."""
-    check_url = f"https://{site}"
+    check_url = f"https://{check_target(site)}"
     timeout_seconds = _effective_http_timeout(timeout_seconds)
     curr_status, resp_time, check_error = 0, 0.0, None
 
@@ -1127,7 +1146,7 @@ async def check_self_monitoring():
             start = time.perf_counter()
             try:
                 timeout = aiohttp.ClientTimeout(total=8)
-                async with session.get(f"https://{site}", timeout=timeout, allow_redirects=True) as resp:
+                async with session.get(f"https://{check_target(site)}", timeout=timeout, allow_redirects=True) as resp:
                     # Любой HTTP-ответ (200, 401, 403, 404, 500...) = сервер отвечает
                     status = 200 if resp.status > 0 else 0
             except Exception:
@@ -1560,10 +1579,9 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 print(f"[INCIDENT START] {site} fail={fail_count[site]} thr={alert_threshold} status={curr_status} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[ALERT TRIGGER] {site} fail={fail_count[site]} thr={alert_threshold}")
-                qualifier = f"\n{check_error}" if check_details else ""
-                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status}){qualifier}")
+                ok = send_tg_msg(f"🚨 DOWN: {check_target(site)} (Код: {curr_status})")
                 print(f"[ALERT RESULT] {site} DOWN send_tg_msg={'OK' if ok else 'FAIL'}")
-                _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
+                _send_screenshot_async(site, f"📸 Скриншот при падении: {check_target(site)}")
                 last_status[site] = curr_status
                 _invalidate_dashboard_cache()
             elif fail_count[site] > alert_threshold:
@@ -1589,14 +1607,10 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if last_status.get(site, 200) != 200:
                 duration = fc
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min")
-                qualifier = f"\n{check_error}" if check_details else ""
-                recovery = ("Доступность подтверждена внешней точкой"
-                            if check_details and check_details.get("source") == "globalping"
-                            else f"Был недоступен: {duration} мин.")
-                ok = send_tg_msg(f"✅ UP: {site} ({recovery}){qualifier}")
+                ok = send_tg_msg(f"✅ UP: {check_target(site)} (Был недоступен: {duration} мин.)")
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
                 if not check_details or check_details.get("source") != "globalping":
-                    _send_screenshot_async(site, f"📸 Скриншот при восстановлении: {site}")
+                    _send_screenshot_async(site, f"📸 Скриншот при восстановлении: {check_target(site)}")
                 _invalidate_dashboard_cache()
 
             last_status[site] = 200
@@ -3334,7 +3348,7 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
         timeout_seconds = _effective_http_timeout(row[1] if row else None)
         # Make HTTP request
         import aiohttp
-        check_url = f"https://{site}"
+        check_url = f"https://{check_target(site)}"
         connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -4119,9 +4133,6 @@ def _build_body(data: dict) -> str:
                  if s in active_sites_set and v['status'] not in (200, CHECK_UNKNOWN)]
     unknown_sites = [s for s, v in latest.items()
                      if s in active_sites_set and v['status'] == CHECK_UNKNOWN]
-    external_sites = [s for s, v in latest.items()
-                      if s in active_sites_set and v['status'] == 200
-                      and (v.get('check_details') or {}).get('source') == 'globalping']
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s, v in latest.items()
                     if s in active_sites_set and v['response_time'] > 20 and v['status'] == 200]
@@ -4147,15 +4158,12 @@ def _build_body(data: dict) -> str:
     all_warn_list = []
     for s in incidents:
         st = latest[s]['status']
-        desc = escape(latest[s].get('check_error') or status_desc.get(st, f"Код {st}"))
-        line = f"❌ {s} ({desc}){inc_lookup.pop(s, '')}"
+        desc = escape(_public_check_error(latest[s]) or status_desc.get(st, f"Код {st}"))
+        line = f"❌ {escape(check_target(s))} ({desc}){inc_lookup.pop(s, '')}"
         all_warn_list.append(line)
     for s in unknown_sites:
-        all_warn_list.append(f"Не подтверждено: {escape(s)} "
-                             f"({escape(latest[s].get('check_error') or 'Нет данных')})")
-    for s in external_sites:
-        all_warn_list.append(f"Внешняя точка: {escape(s)} "
-                             f"({escape(latest[s].get('check_error') or '')})")
+        all_warn_list.append(f"Не подтверждено: {escape(check_target(s))} "
+                             f"({escape(_public_check_error(latest[s]) or 'Нет данных')})")
     # Добавляем оставшиеся инциденты (не связанные с offline)
     for r in active_incidents:
         if r['site'] not in incidents:
@@ -4258,7 +4266,6 @@ def _build_body(data: dict) -> str:
         <div class="kpi-grid">
             <div class="kpi-card {'danger-card' if online_count < total_sites else ''}">
                 <span>Доступно</span><strong><br>{online_count} / {total_sites}</strong>
-                <div style="font-size:12px">Внешняя точка: {len(external_sites)}; не подтверждено: {len(unknown_sites)}</div>
             </div>
             <div class="kpi-card">
                 <span>Uptime (24ч / 30д)</span>
@@ -4312,9 +4319,8 @@ def _build_body(data: dict) -> str:
             status_label = '⏳ Ожидает проверки'
             status_class = 'txt-warn'
         elif v['status'] == 200:
-            via_external = (v.get('check_details') or {}).get('source') == 'globalping'
-            status_label = 'Online (внешняя точка)' if via_external else 'Online'
-            status_class = 'txt-warn' if via_external else 'txt-ok'
+            status_label = 'Online'
+            status_class = 'txt-ok'
         elif v['status'] == CHECK_UNKNOWN:
             status_label = 'Не подтверждено'
             status_class = 'txt-warn'
@@ -4328,27 +4334,11 @@ def _build_body(data: dict) -> str:
             status_label = 'Offline'
             status_class = 'txt-err'
 
-        has_external = (v.get('check_details') or {}).get('source') == 'globalping'
-        reason = v.get('check_error') if v['status'] != 200 or has_external else None
+        reason = _public_check_error(v)
         reason_html = f'<span class="check-error">{escape(reason)}</span>' if reason else ''
-        if has_external:
-            external = v['check_details'].get('external') or {}
-            rows = []
-            for probe in external.get('probes', []):
-                rows.append(escape(
-                    f"{probe.get('country', '?')} / {probe.get('network', '?')}: "
-                    f"HTTP {probe.get('http') or 'нет ответа'}; "
-                    f"TLS={probe.get('tls_authorized')}; {probe.get('reason', '')}"))
-            links = []
-            for mid in external.get('measurements', []):
-                if re.fullmatch(r"[A-Za-z0-9_-]{8,80}", str(mid)):
-                    links.append(f'<a href="https://api.globalping.io/v1/measurements/{mid}" '
-                                 f'target="_blank" rel="noopener">Измерение</a>')
-            reason_html += ('<details class="check-error"><summary>Точки проверки</summary>'
-                            + '<br>'.join(rows + links) + '</details>')
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
-            <td>{prefix}<a href="https://{s}" target="_blank"
-                style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
+            <td>{prefix}<a href="https://{escape(check_target(s))}" target="_blank"
+                style="text-decoration:none; color:inherit;"><strong>{escape(check_target(s))}</strong></a></td>
             <td><span class="{status_class}">{status_label}</span>{reason_html}</td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
                         <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}</td>

@@ -280,14 +280,27 @@ class PersistenceAndPresentationTests(unittest.TestCase):
                 {"source": "globalping", "external": {"cached": False}})
         resolve.assert_called_once_with(HOST)
 
-    def test_dashboard_external_not_silent_green(self):
+    def test_dashboard_success_same_as_direct_without_routing_details(self):
         data = dashboard_fixture()
         row = data["latest"]["offline.example"]
         row.update(status=200, check_error="Amvera: Таймаут; Globalping: OK",
                    check_details={"source": "globalping", "external": {"probes": [], "measurements": []}})
         html = app._build_body(data)
-        self.assertIn("Online (внешняя точка)", html)
-        self.assertIn("Amvera: Таймаут", html)
+        self.assertIn('class="txt-ok">Online</span>', html)
+        for text in ("внешняя точка", "Внешняя точка", "Точки проверки", "Amvera:", "Globalping"):
+            self.assertNotIn(text, html)
+
+    def test_direct_and_external_success_html_identical(self):
+        data = dashboard_fixture()
+        row = data["latest"]["offline.example"]
+        row.update(status=200, check_error=None)
+        direct_html = app._build_body(data)
+        row.update(check_error="Amvera: timeout, Globalping: OK; cached=True",
+                   check_details={"source": "globalping", "external": {
+                       "cached": True, "checked_at": ec.utcnow(),
+                       "probes": [{"network": "Timeweb", "http": 200}],
+                       "measurements": ["testMeasurement"]}})
+        self.assertEqual(app._build_body(data), direct_html)
 
     def test_dashboard_unknown_is_not_offline(self):
         data = dashboard_fixture()
@@ -295,9 +308,8 @@ class PersistenceAndPresentationTests(unittest.TestCase):
         html = app._build_body(data)
         self.assertIn("Не подтверждено", html)
         self.assertNotIn(">Offline<", html)
-        self.assertIn("не подтверждено: 1", html)
 
-    def test_external_probe_metadata_is_escaped(self):
+    def test_external_probe_metadata_not_rendered(self):
         data = dashboard_fixture()
         data["latest"]["offline.example"].update(
             status=200, check_details={"source": "globalping", "external": {
@@ -305,7 +317,43 @@ class PersistenceAndPresentationTests(unittest.TestCase):
                 "measurements": ['"><script>']}})
         html = app._build_body(data)
         self.assertNotIn("<script>alert(1)</script>", html)
-        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("&lt;script&gt;", html)
+
+    def test_public_error_hides_mechanism_but_not_http_failure(self):
+        data = dashboard_fixture()
+        data["latest"]["offline.example"].update(
+            status=403, check_error="Amvera: timeout. Globalping: HTTP 403; кэш",
+            check_details={"source": "globalping"})
+        html = app._build_body(data)
+        self.assertIn("HTTP 403: доступ запрещён", html)
+        for text in ("Amvera", "Globalping", "кэш", "Точки проверки"):
+            self.assertNotIn(text, html)
+
+    def test_unknown_error_does_not_expose_internal_api_failure(self):
+        value = dict(status=702, check_error="Globalping: api_rate_limit",
+                     check_details={"source": "globalping"})
+        self.assertEqual(app._public_check_error(value), "Не удалось получить результат проверки")
+
+    def test_notifications_same_as_direct_results(self):
+        with patch.object(app, "batch_buffer", []), \
+                patch.object(app, "_db_incident_start"), \
+                patch.object(app, "_db_incident_resolve"), \
+                patch.object(app, "_send_screenshot_async"), \
+                patch.object(app, "send_tg_msg", return_value=True) as send:
+            last, failures, first = {HOST: 200}, {}, {}
+            details = {"source": "globalping", "external": {"cached": False}}
+            app._process_site_result(HOST, 403, .1, 90, 100, True,
+                                     last, failures, {}, {HOST: 1}, first,
+                                     "Amvera timeout; Globalping HTTP 403", details)
+            app._process_site_result(HOST, 200, .1, 90, 100, True,
+                                     last, failures, {}, {HOST: 1}, first,
+                                     "Доступен из внешней точки", details)
+        messages = [call.args[0] for call in send.call_args_list]
+        self.assertTrue(any("DOWN:" in msg for msg in messages))
+        self.assertTrue(any("UP:" in msg for msg in messages))
+        for msg in messages:
+            for text in ("Globalping", "Amvera", "внешн", "кэш"):
+                self.assertNotIn(text, msg)
 
 
 if __name__ == "__main__":
