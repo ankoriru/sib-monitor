@@ -15,7 +15,7 @@ TLS_SITES = ("sibur.ru", "shop.sibur.ru", "rusvinyl.ru", "greencity-sibur.ru")
 TIMEOUT_SITES = (
     "eshop.sibur.ru", "lsdts.sibur.ru", "sharefile.sibur.ru", "srm.sibur.ru",
     "tms.sibur.ru", "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
-    "tst-stdo.tdms.sibur.ru/cp/", "resti.club",
+    "resti.club",
 )
 PROBE_TIMEOUT = 30
 PREFIX = "[NET DIAG]"

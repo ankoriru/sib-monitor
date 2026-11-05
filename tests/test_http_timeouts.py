@@ -25,10 +25,10 @@ class TimeoutValidationTests(unittest.TestCase):
         for value in (None, 0, -1, 10000, True):
             self.assertEqual(app._effective_http_timeout(value), 8)
 
-    def test_exact_ten_experiment_sites(self):
+    def test_experiment_sites_exclude_retired_tst_stdo(self):
         self.assertEqual(set(app.TIMEOUT_EXPERIMENT_SITES), {
             "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
-            "tst-stdo.tdms.sibur.ru/cp/", "bopp.sibur.ru", "eshop.sibur.ru",
+            "bopp.sibur.ru", "eshop.sibur.ru",
             "srm.sibur.ru", "resti.club", "lsdts.sibur.ru", "tms.sibur.ru",
             "sharefile.sibur.ru",
         })
@@ -169,7 +169,7 @@ class TimeoutPostgresTests(unittest.TestCase):
 
     def test_only_requested_sites_receive_thirty_seconds(self):
         rows = self.query("SELECT site, http_timeout_seconds, ssl_verify FROM monitored_sites")
-        self.assertEqual(sum(r[1] == 30 for r in rows), 10)
+        self.assertEqual(sum(r[1] == 30 for r in rows), 9)
         self.assertTrue(all(r[2] is False for r in rows))
         self.assertEqual(self.query("""
             SELECT http_timeout_seconds FROM monitored_sites WHERE site='normal.example'

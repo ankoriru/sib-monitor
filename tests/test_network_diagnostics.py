@@ -176,7 +176,7 @@ class RunTests(unittest.TestCase):
         self.assertCountEqual([c.args[0] for c in http.call_args_list], diag.TIMEOUT_SITES)
         recorded = events(output.getvalue())
         self.assertEqual(recorded[0]["concurrency"], 2)
-        self.assertEqual(recorded[-1], {"site": "all", "stage": "DONE", "probes": 13})
+        self.assertEqual(recorded[-1], {"site": "all", "stage": "DONE", "probes": 12})
 
 
 if __name__ == "__main__":
