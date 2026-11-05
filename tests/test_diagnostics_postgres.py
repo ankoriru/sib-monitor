@@ -109,6 +109,30 @@ class PostgreSQLDiagnosticsTests(unittest.TestCase):
             SELECT SUM(checks_count), SUM(status_200_count) FROM checks_agg
         """), [(2, 1)])
 
+    def test_external_details_migration_unknown_and_direct_recovery(self):
+        self.migrate()
+        with self.connection() as conn, conn.cursor() as cur:
+            app._ensure_check_details_column(cur)
+            app._ensure_check_details_column(cur)
+        details = {"source": "globalping", "direct": {"status": 0},
+                   "external": {"status": 702, "verdict": "unknown"}}
+        with patch.object(app, "get_db_connection", side_effect=self.connection), \
+                patch.object(app, "batch_buffer",
+                             [("example.org", 702, 0, 5, 100, False, "Нет данных", details)]):
+            app._flush_batch_unlocked()
+        self.assertEqual(self.read("SELECT COUNT(*) FROM latest_status"), [(1,)])
+        self.assertEqual(self.read("SELECT status, check_details FROM latest_status"), [(702, details)])
+        self.assertEqual(self.read("SELECT COUNT(*) FROM logs"), [(0,)])
+        self.assertEqual(self.read("SELECT COUNT(*) FROM checks_agg"), [(0,)])
+        with patch.object(app, "get_db_connection", side_effect=self.connection), \
+                patch.object(app, "batch_buffer",
+                             [("example.org", 200, .1, 5, 100, False, None, {})]):
+            app._flush_batch_unlocked()
+        self.assertEqual(self.read("SELECT status, check_details FROM latest_status"), [(200, None)])
+        self.assertEqual(self.read("SELECT COUNT(*) FROM logs"), [(1,)])
+        self.assertEqual(self.read("SELECT SUM(checks_count), SUM(status_200_count) FROM checks_agg"),
+                         [(1, 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

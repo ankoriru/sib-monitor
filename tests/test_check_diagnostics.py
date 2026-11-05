@@ -101,9 +101,9 @@ class RequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[1], 701)
         self.assertIn("ошибка чтения", result[3])
 
-    async def test_401_policy_unchanged(self):
+    async def test_401_is_available_even_with_content_match_enabled(self):
         self.assertEqual((await self.probe(status=401))[1], 200)
-        self.assertEqual((await self.probe(status=401, body="", content_match=True))[1], 701)
+        self.assertEqual((await self.probe(status=401, body="", content_match=True))[1], 200)
 
     async def test_redirect_policy_unchanged(self):
         for status in (307, 308):

@@ -20,6 +20,7 @@ from io import StringIO
 from string import Template
 from html import escape
 from network_diagnostics import run_diagnostics
+from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -32,7 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.10.31-ssl-report.1"
+APP_VERSION = "2026.11.05-globalping.1"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -526,6 +527,7 @@ def init_db():
         )
     """)
     _ensure_check_error_column(cur)
+    _ensure_check_details_column(cur)
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
     except psycopg2.Error:
@@ -960,6 +962,10 @@ def _ensure_check_error_column(cur):
     cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS check_error TEXT")
 
 
+def _ensure_check_details_column(cur):
+    cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS check_details JSONB")
+
+
 def _validated_http_timeout(value):
     if isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value):
         value = int(value)
@@ -1068,7 +1074,7 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
                 if curr_status != 200:
                     check_error = _http_error_reason(curr_status)
                 # Content match для сайтов с content match enabled (только для 200)
-                if site in _cm_sites_set and curr_status == 200:
+                if site in _cm_sites_set and curr_status == 200 and resp.status != 401:
                     try:
                         # ClientTimeout.total covers connect + redirects + body.
                         text = await resp.text()
@@ -1142,6 +1148,8 @@ def _update_checks_agg(cur, batch_data):
     })
     for row in batch_data:
         site, status, resp, ssl_d, dom_d, ssl_chain_valid = row[:6]
+        if status == CHECK_UNKNOWN:
+            continue  # Unknown is neither uptime nor downtime.
         now = datetime.datetime.now()
         bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         k = (site, bucket)
@@ -1190,13 +1198,15 @@ def _flush_batch_unlocked():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        execute_values(
-            cur,
-            """INSERT INTO logs
-               (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
-               VALUES %s""",
-            [row[:6] for row in batch_buffer]
-        )
+        measured_rows = [row[:6] for row in batch_buffer if row[1] != CHECK_UNKNOWN]
+        if measured_rows:
+            execute_values(
+                cur,
+                """INSERT INTO logs
+                   (site, status, response_time, ssl_days, domain_days, ssl_chain_valid)
+                   VALUES %s""",
+                measured_rows
+            )
         _update_checks_agg(cur, batch_buffer)
 
         # Обновляем latest_status напрямую (избегаем блокирующего REFRESH MATERIALIZED VIEW)
@@ -1215,6 +1225,11 @@ def _flush_batch_unlocked():
                     check_error = EXCLUDED.check_error,
                     timestamp = EXCLUDED.timestamp
             """, (site, status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
+            # Preserve both viewpoints; a later direct success clears stale fallback.
+            # Old tuple callers retain their original persistence contract.
+            if len(row) > 7:
+                cur.execute("UPDATE latest_status SET check_details = %s::jsonb WHERE site = %s",
+                            (json.dumps(row[7], ensure_ascii=False) if row[7] else None, site))
 
         conn.commit()
         cur.close()
@@ -1241,6 +1256,8 @@ def _db_incident_start(site, status, ssl_chain_valid=None, start_time=None):
         cur = conn.cursor()
         description = {
             0: 'Timeout',
+            403: 'Access Forbidden',
+            703: 'TLS verification failed',
             502: 'Bad Gateway',
             503: 'Service Unavailable',
             701: 'Content Mismatch'
@@ -1281,6 +1298,8 @@ def _db_incident_update(site, status, ssl_chain_valid=None):
         cur = conn.cursor()
         description = {
             0: 'Timeout',
+            403: 'Access Forbidden',
+            703: 'TLS verification failed',
             502: 'Bad Gateway',
             503: 'Service Unavailable',
             701: 'Content Mismatch'
@@ -1506,11 +1525,21 @@ def _send_screenshot_async(site, caption):
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                          last_status, fail_count, last_latency_map, thresholds, first_fail_time,
-                         check_error=None):
+                         check_error=None, check_details=None):
     """Алерт + инцидент только при превышении порога (alert_threshold, default 5 мин).
     TG-алерт и _db_incident_start — при fail_count >= threshold.
     Скриншот в фоне — не блокирует worker."""
     try:
+        sample = (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error)
+        if check_details is not None:
+            sample += (check_details,)
+        if curr_status == CHECK_UNKNOWN:
+            # Break consecutive failures; do not declare DOWN or UP, or close incidents.
+            fail_count[site] = 0
+            first_fail_time.pop(site, None)
+            with BATCH_LOCK:
+                batch_buffer.append(sample)
+            return
         changed = (curr_status != 200) or (last_status.get(site, 200) != 200)
         if changed:
             print(f"[WORKER] {site} status={curr_status} resp={round(resp_time,2)}s fail={fail_count.get(site, 0)} last={last_status.get(site, 200)}")
@@ -1531,7 +1560,8 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 print(f"[INCIDENT START] {site} fail={fail_count[site]} thr={alert_threshold} status={curr_status} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[ALERT TRIGGER] {site} fail={fail_count[site]} thr={alert_threshold}")
-                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
+                qualifier = f"\n{check_error}" if check_details else ""
+                ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status}){qualifier}")
                 print(f"[ALERT RESULT] {site} DOWN send_tg_msg={'OK' if ok else 'FAIL'}")
                 _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
                 last_status[site] = curr_status
@@ -1540,26 +1570,33 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 _db_incident_update(site, curr_status, ssl_chain_valid)
 
             with BATCH_LOCK:
-                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
+                batch_buffer.append(sample)
                 if len(batch_buffer) >= BATCH_SIZE:
                     _flush_batch_unlocked()
         else:
             with BATCH_LOCK:
-                batch_buffer.append((site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error))
+                batch_buffer.append(sample)
                 if len(batch_buffer) >= BATCH_SIZE:
                     _flush_batch_unlocked()
 
             fc = fail_count.get(site, 0)
-            if fc >= thresholds.get(site, 5):
+            if (fc >= thresholds.get(site, 5) or last_status.get(site, 200) != 200 or
+                    (check_details and check_details.get("source") == "globalping"
+                     and not check_details["external"]["cached"])):
                 print(f"[INCIDENT RESOLVE] {site} after {fc} min down")
                 _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
                 duration = fc
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min")
-                ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
+                qualifier = f"\n{check_error}" if check_details else ""
+                recovery = ("Доступность подтверждена внешней точкой"
+                            if check_details and check_details.get("source") == "globalping"
+                            else f"Был недоступен: {duration} мин.")
+                ok = send_tg_msg(f"✅ UP: {site} ({recovery}){qualifier}")
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
-                _send_screenshot_async(site, f"📸 Скриншот при восстановлении: {site}")
+                if not check_details or check_details.get("source") != "globalping":
+                    _send_screenshot_async(site, f"📸 Скриншот при восстановлении: {site}")
                 _invalidate_dashboard_cache()
 
             last_status[site] = 200
@@ -1717,6 +1754,12 @@ def check_worker():
 
             # Быстрые HTTP-проверки обычных сайтов
             results = loop.run_until_complete(check_all_sites(SITES, ssl_verify_map, timeout_map))
+            async def with_external_fallback():
+                async with aiohttp.ClientSession() as external_session:
+                    return await external_checker.apply(
+                        external_session, results, ssl_verify_map,
+                        _cm_sites_set, _content_match_regex)
+            results = loop.run_until_complete(with_external_fallback())
             http_time = round(time.time() - t_start, 1)
             print(f"[WORKER] HTTP checks done: {len(results)} sites in {http_time}s")
 
@@ -1733,12 +1776,14 @@ def check_worker():
             conn.close()
 
             # Обработка обычных сайтов
-            for site, curr_status, resp_time, check_error in results:
+            for result in results:
+                site, curr_status, resp_time, check_error = result[:4]
+                check_details = result[4] if len(result) > 4 else {}
                 ssl_d, dom_d, ssl_chain_valid = _get_ssl_whois_data(site, latest_data)
                 # Site check complete
                 _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                                      last_status, fail_count, last_latency_map, thresholds, first_fail_time,
-                                     check_error=check_error)
+                                     check_error=check_error, check_details=check_details)
 
             # Обработка self-monitoring сайтов (алерты с порогом 10 мин)
             for site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid in self_results:
@@ -1751,7 +1796,8 @@ def check_worker():
             cycle_time = round(time.time() - t_start, 1)
             print(f"[CHECK SUMMARY] checked={len(results)} failed={failed_now} cycle_time={cycle_time}s")
             # Дублируем причины рядом со сводкой: они останутся видны в хвосте логов.
-            for site, status, elapsed, reason in results:
+            for result in results:
+                site, status, elapsed, reason = result[:4]
                 if reason:
                     print(f"[CHECK SUMMARY ERROR] {site}: status={status} "
                           f"elapsed={elapsed:.2f}s reason={reason}", flush=True)
@@ -2042,16 +2088,8 @@ async def startup_event():
         """)
         if cur.rowcount > 0:
             print(f"[STARTUP] Closed {cur.rowcount} stale unresolved incidents for online sites")
-        # 2. Force-close для sharefile.sibur.ru (401 = online)
-        cur.execute("""
-            UPDATE incidents
-            SET end_time = NOW(),
-                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
-                resolved = TRUE
-            WHERE resolved = FALSE AND site = 'sharefile.sibur.ru'
-        """)
-        if cur.rowcount > 0:
-            print(f"[STARTUP] Force-closed {cur.rowcount} incidents for sharefile.sibur.ru (401=online)")
+        # Never close sharefile incidents by hostname alone. A fresh successful
+        # direct/external result is required, just like for every other site.
         # 3. Закрыть инциденты для удалённых/неактивных сайтов
         cur.execute("""
             UPDATE incidents
@@ -2532,6 +2570,10 @@ async def _admin_page_inner(request, response):
             if (d.status === 'ok') {
                 var matchColor = d.match_found ? 'color:#16a34a' : 'color:#dc2626';
                 var matchText = d.match_found ? '✅ Совпадение найдено' : '❌ Совпадений нет';
+                if (d.content_check_skipped) {
+                    matchColor = 'color:#16a34a';
+                    matchText = 'HTTP 401: доступен, требуется авторизация; Content Match не нужен';
+                }
                 var authNote = d.auth_note ? '<div style="color:#d97706;margin-top:4px;">⚠️ ' + d.auth_note + '</div>' : '';
                 var origStatus = d.original_status !== d.http_status ? ' (было ' + d.original_status + ')' : '';
                 var matchesHtml = d.matches.length ? '<details style="margin-top:4px;"><summary>Найденные фрагменты (' + d.matches.length + ')</summary><pre style="background:#f1f5f9;padding:6px;border-radius:4px;overflow:auto;max-height:100px;">' + d.matches.map(function(m) { return '...' + m + '...'; }).join('<br>') + '</pre></details>' : '';
@@ -3325,6 +3367,8 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
                     "auth_note": auth_note,
                     "pattern": pattern,
                     "match_found": bool(match_found),
+                    "availability_ok": original_status == 401 or (status == 200 and bool(match_found)),
+                    "content_check_skipped": original_status == 401,
                     "matches": matches[:5],
                     "text_preview": text[:800] if text else "(empty response)"
                 }
@@ -4067,7 +4111,13 @@ def _build_body(data: dict) -> str:
         active_sites_set = set(SITES)
     # Build body from active sites
 
-    incidents = [s for s, v in latest.items() if s in active_sites_set and v['status'] != 200]
+    incidents = [s for s, v in latest.items()
+                 if s in active_sites_set and v['status'] not in (200, CHECK_UNKNOWN)]
+    unknown_sites = [s for s, v in latest.items()
+                     if s in active_sites_set and v['status'] == CHECK_UNKNOWN]
+    external_sites = [s for s, v in latest.items()
+                      if s in active_sites_set and v['status'] == 200
+                      and (v.get('check_details') or {}).get('source') == 'globalping']
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s, v in latest.items()
                     if s in active_sites_set and v['response_time'] > 20 and v['status'] == 200]
@@ -4078,7 +4128,7 @@ def _build_body(data: dict) -> str:
     inc_lookup = {r['site']: f", Инцидент {r['dur']} мин, {r['description']}" for r in active_incidents}
     # Описания статусов
     status_desc = {
-        0: "Недоступен",
+        0: "Недоступен из точки проверки",
         401: "Требуется авторизация",
         403: "Доступ запрещён",
         404: "Не найден",
@@ -4087,6 +4137,8 @@ def _build_body(data: dict) -> str:
         503: "Сервис недоступен",
         504: "Gateway Timeout",
         701: "Контент не совпадает",
+        702: "Доступность не подтверждена",
+        703: "TLS: сертификат не подтверждён",
     }
     all_warn_list = []
     for s in incidents:
@@ -4094,6 +4146,12 @@ def _build_body(data: dict) -> str:
         desc = escape(latest[s].get('check_error') or status_desc.get(st, f"Код {st}"))
         line = f"❌ {s} ({desc}){inc_lookup.pop(s, '')}"
         all_warn_list.append(line)
+    for s in unknown_sites:
+        all_warn_list.append(f"Не подтверждено: {escape(s)} "
+                             f"({escape(latest[s].get('check_error') or 'Нет данных')})")
+    for s in external_sites:
+        all_warn_list.append(f"Внешняя точка: {escape(s)} "
+                             f"({escape(latest[s].get('check_error') or '')})")
     # Добавляем оставшиеся инциденты (не связанные с offline)
     for r in active_incidents:
         if r['site'] not in incidents:
@@ -4196,6 +4254,7 @@ def _build_body(data: dict) -> str:
         <div class="kpi-grid">
             <div class="kpi-card {'danger-card' if online_count < total_sites else ''}">
                 <span>Доступно</span><strong><br>{online_count} / {total_sites}</strong>
+                <div style="font-size:12px">Внешняя точка: {len(external_sites)}; не подтверждено: {len(unknown_sites)}</div>
             </div>
             <div class="kpi-card">
                 <span>Uptime (24ч / 30д)</span>
@@ -4239,7 +4298,7 @@ def _build_body(data: dict) -> str:
         is_new_site = s not in latest
         v = latest.get(s, {'status': 0, 'response_time': 0, 'ssl_days': -1, 'domain_days': -1, 'ssl_chain_valid': None})
         st30 = stats.get(s, {'upt': 0, 'down_sec': 0})
-        is_err = (not is_new_site and v['status'] != 200) or (0 <= v['ssl_days'] <= 20) or \
+        is_err = (not is_new_site and v['status'] not in (200, CHECK_UNKNOWN)) or (0 <= v['ssl_days'] <= 20) or \
                  (0 <= v['domain_days'] <= 30) or v.get('ssl_chain_valid') == False
         g_idx = get_site_group(s)
         prefix = "⭐ " if g_idx == 0 else ("🛡️ " if g_idx == 1 else "")
@@ -4249,8 +4308,15 @@ def _build_body(data: dict) -> str:
             status_label = '⏳ Ожидает проверки'
             status_class = 'txt-warn'
         elif v['status'] == 200:
-            status_label = 'Online'
-            status_class = 'txt-ok'
+            via_external = (v.get('check_details') or {}).get('source') == 'globalping'
+            status_label = 'Online (внешняя точка)' if via_external else 'Online'
+            status_class = 'txt-warn' if via_external else 'txt-ok'
+        elif v['status'] == CHECK_UNKNOWN:
+            status_label = 'Не подтверждено'
+            status_class = 'txt-warn'
+        elif v['status'] == 703:
+            status_label = 'TLS Error'
+            status_class = 'txt-err'
         elif v['status'] == 701:
             status_label = 'Content Mismatch'
             status_class = 'txt-err'
@@ -4258,8 +4324,24 @@ def _build_body(data: dict) -> str:
             status_label = 'Offline'
             status_class = 'txt-err'
 
-        reason = v.get('check_error') if v['status'] != 200 else None
+        has_external = (v.get('check_details') or {}).get('source') == 'globalping'
+        reason = v.get('check_error') if v['status'] != 200 or has_external else None
         reason_html = f'<span class="check-error">{escape(reason)}</span>' if reason else ''
+        if has_external:
+            external = v['check_details'].get('external') or {}
+            rows = []
+            for probe in external.get('probes', []):
+                rows.append(escape(
+                    f"{probe.get('country', '?')} / {probe.get('network', '?')}: "
+                    f"HTTP {probe.get('http') or 'нет ответа'}; "
+                    f"TLS={probe.get('tls_authorized')}; {probe.get('reason', '')}"))
+            links = []
+            for mid in external.get('measurements', []):
+                if re.fullmatch(r"[A-Za-z0-9_-]{8,80}", str(mid)):
+                    links.append(f'<a href="https://globalping.io/measurements/{mid}" '
+                                 f'target="_blank" rel="noopener">Измерение</a>')
+            reason_html += ('<details class="check-error"><summary>Точки проверки</summary>'
+                            + '<br>'.join(rows + links) + '</details>')
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{s}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{s}</strong></a></td>
