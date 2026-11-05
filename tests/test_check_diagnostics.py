@@ -234,6 +234,27 @@ class HealthVersionTests(unittest.IsolatedAsyncioTestCase):
             result = await app.health()
         self.assertEqual(result.status_code, 503)
 
+    async def test_health_accepts_trimmed_fractional_seconds(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for fraction in ("1", "12", "123", "1234", "49801", "123456"):
+            for offset in ("+00", "+00:00", "Z", ""):
+                with self.subTest(fraction=fraction, offset=offset):
+                    conn = MagicMock()
+                    stamp = now.strftime("%Y-%m-%d %H:%M:%S") + "." + fraction + offset
+                    conn.cursor.return_value.fetchone.return_value = (stamp, now)
+                    with patch.object(app, "get_db_connection", return_value=conn):
+                        result = await app.health()
+                    self.assertEqual(result["status"], "ok")
+
+    async def test_health_accepts_timestamp_without_fraction(self):
+        conn = MagicMock()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        conn.cursor.return_value.fetchone.return_value = (
+            now.strftime("%Y-%m-%d %H:%M:%S+00"), now)
+        with patch.object(app, "get_db_connection", return_value=conn):
+            result = await app.health()
+        self.assertEqual(result["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

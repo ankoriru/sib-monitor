@@ -33,7 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-monitor.5"
+APP_VERSION = "2026.11.05-monitor.6"
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -3079,8 +3079,14 @@ async def health():
         cur.close()
         conn.close()
         if row:
-            # PostgreSQL emits "+00"; Python 3.10 requires "+00:00".
+            # PostgreSQL trims fractional trailing zeros and emits "+00".
+            # Python 3.10 needs 3/6 fractional digits and a full UTC offset.
             stamp = re.sub(r"([+-]\d{2})$", r"\1:00", str(row[0]).replace("Z", "+00:00"))
+            stamp = re.sub(
+                r"\.(\d{1,6})(?=[+-]\d{2}:\d{2}$|$)",
+                lambda match: "." + match.group(1).ljust(6, "0"),
+                stamp,
+            )
             last_tick = datetime.datetime.fromisoformat(stamp)
             if last_tick.tzinfo is None:
                 last_tick = last_tick.replace(tzinfo=datetime.timezone.utc)
