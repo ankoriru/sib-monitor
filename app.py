@@ -33,7 +33,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.05-monitor.7"
+APP_VERSION = "2026.11.06-monitor.8"
+LATENCY_ALERT_THRESHOLD_SECONDS = 25
+# Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
+LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
 DEFAULT_HTTP_TIMEOUT = 8
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
@@ -1625,10 +1628,10 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             fail_count[site] = 0
             first_fail_time.pop(site, None)
 
-            if resp_time > 20 and not last_latency_map.get(site, False):
+            if resp_time > LATENCY_ALERT_THRESHOLD_SECONDS and not last_latency_map.get(site, False):
                 ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = True
-            elif resp_time < 10 and last_latency_map.get(site, False):
+            elif resp_time < LATENCY_RECOVERY_THRESHOLD_SECONDS and last_latency_map.get(site, False):
                 ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = False
     except Exception as e:
@@ -4149,7 +4152,9 @@ def _build_body(data: dict) -> str:
                      if s in active_sites_set and v['status'] == CHECK_UNKNOWN]
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
     latency_warn = [s for s, v in latest.items()
-                    if s in active_sites_set and v['response_time'] > 20 and v['status'] == 200]
+                    if s in active_sites_set
+                    and v['response_time'] > LATENCY_ALERT_THRESHOLD_SECONDS
+                    and v['status'] == 200]
     active_incidents = [r for r in data.get("active_incidents", []) if r['site'] in active_sites_set]
 
     # Сборка предупреждений: объединяем ❌ + ⚠️ в одну строку
@@ -4184,7 +4189,7 @@ def _build_body(data: dict) -> str:
             all_warn_list.append(f"⚠️ {r['site']} (Инцидент {r['dur']} мин, {r['description']})")
     all_warn_list += (
         [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
-        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 1)}с)"
+        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 2)}с)"
            for s in latency_warn]
     )
 
