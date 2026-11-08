@@ -44,6 +44,18 @@ if [ -n "$(git diff --name-only origin/main -- '*.py' requirements.txt Dockerfil
 else
   ok "QA-4 версия $ver (в main: ${prev:-нет})"
 fi
+# QA-4a. Документация релиза: версия в описании функционала и запись в CHANGELOG.
+grep -q "^Версия: $ver\$" FUNCTIONAL.md || bad "QA-4 FUNCTIONAL.md: строка «Версия:» не равна $ver"
+for sec in "HLD" "РАЗВЁРТЫВАНИЯ" "C4 — УРОВЕНЬ 1" "C4 — УРОВЕНЬ 2" "C4 — УРОВЕНЬ 3" "ДЕТАЛЬНОЕ ОПИСАНИЕ"; do
+  grep -q "$sec" FUNCTIONAL.md || bad "QA-4 FUNCTIONAL.md: нет раздела «$sec»"
+done
+if grep -qE "^## $ver — [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md 2>/dev/null; then
+  ok "QA-4 CHANGELOG.md содержит запись $ver"
+else
+  bad "QA-4 CHANGELOG.md: нет записи «## $ver — ГГГГ-ММ-ДД»"
+fi
+python3 -c "import release_digest as r; assert any(x['version']=='$ver' for x in r.load_releases())" 2>/dev/null \
+  || bad "QA-4 release_digest не разбирает запись $ver в CHANGELOG.md"
 for doc in GLOBALPING.md QA_QC.md; do
   if [ -f "$doc" ] && grep -qE "monitor\.[0-9]+" "$doc" && ! grep -q "$ver" "$doc"; then
     bad "QA-4 $doc ссылается на другую версию (ожидается $ver)"

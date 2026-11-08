@@ -21,6 +21,7 @@ from string import Template
 from html import escape
 from network_diagnostics import run_diagnostics
 import tls_chain
+import release_digest
 from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
 import external_checks
 from psycopg2.extras import DictCursor, execute_values
@@ -35,7 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.08-monitor.10"
+APP_VERSION = "2026.11.08-monitor.11"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -274,8 +275,13 @@ def admin_auth(request: Request, response: Response, admin_session: str = Cookie
     raise HTTPException(status_code=401, detail="Admin authentication required")
 
 
+DB_CONNECT_TIMEOUT = 10  # с: недоступная БД не должна вешать воркеры и /health
+
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT,
+                            keepalives=1, keepalives_idle=30, keepalives_interval=10,
+                            keepalives_count=3)
 
 
 def load_active_sites():
@@ -2272,6 +2278,48 @@ def daily_report_worker():
         time.sleep(30)
 
 
+def _send_release_digest(now=None):
+    """Сводка релизов за день; отправляется один раз, только если релизы были."""
+    now = now or datetime.datetime.now(TZ_MOSCOW)
+    day = now.date()
+    key = f"release_digest_{day.isoformat()}"
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_meta WHERE key = %s", (key,))
+        if cur.fetchone():
+            return None
+        text = release_digest.build_digest(release_digest.load_releases(), day)
+        if text is None:
+            print(f"[RELEASE DIGEST] {day}: релизов не было, сводка не отправляется", flush=True)
+            state = "no_releases"
+        else:
+            sent = send_tg_msg(text, category='release_digest')
+            state = "sent" if sent else None
+            print(f"[RELEASE DIGEST] {day}: отправлено={bool(sent)}", flush=True)
+        if state:
+            cur.execute("INSERT INTO app_meta (key, value) VALUES (%s, %s) "
+                        "ON CONFLICT (key) DO NOTHING", (key, state))
+            conn.commit()
+        return text
+    finally:
+        conn.close()
+
+
+def release_digest_worker():
+    """23:30 МСК — сводка изменений за день в Telegram (если были релизы)."""
+    while True:
+        now = datetime.datetime.now(TZ_MOSCOW)
+        if release_digest.due(now):
+            try:
+                _send_release_digest(now)
+            except Exception as e:
+                print(f"[RELEASE DIGEST ERROR] {type(e).__name__}: {e}", flush=True)
+            time.sleep(300)  # повтор при ошибке отправки — не чаще раза в 5 минут
+        else:
+            time.sleep(30)
+
+
 # ============================================================================
 # ROTATION WORKER (Этап 1)
 # ============================================================================
@@ -2410,6 +2458,7 @@ async def startup_event():
     threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
+    threading.Thread(target=release_digest_worker, daemon=True).start()
     # Временный диагностический проход: отдельный поток, без записи рабочих результатов.
     if os.getenv("NETWORK_DIAGNOSTICS_ENABLED", "1") == "1":
         threading.Thread(target=run_diagnostics, name="network-diagnostics", daemon=True).start()
@@ -2750,7 +2799,7 @@ async def _admin_page_inner(request, response):
     <div id="docs-tab" class="tab-content">
         <h3 style="color:#00717a;margin-top:0;">📖 Описание функционала</h3>
         <div id="docs-loading" style="padding:20px;color:#999;">Загрузка...</div>
-        <pre id="docs-content" style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;white-space:pre-wrap;font-family:'Segoe UI',sans-serif;font-size:13px;line-height:1.6;max-height:70vh;overflow-y:auto;display:none;"></pre>
+        <pre id="docs-content" style="background:#f8fafc;padding:15px;border-radius:8px;border:1px solid #e2e8f0;white-space:pre-wrap;font-family:Consolas,'Courier New',monospace;font-size:12.5px;overflow-x:auto;line-height:1.6;max-height:70vh;overflow-y:auto;display:none;"></pre>
     </div>
     </div>
     <div id="toast" class="toast"></div>
@@ -3348,7 +3397,16 @@ async def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
 
 @app.get("/health")
 async def health():
-    """Health-check: проверяет heartbeat worker'а"""
+    """Health-check: проверяет heartbeat worker'а. Запрос к БД — в отдельном потоке,
+    чтобы зависшая база не блокировала остальные запросы приложения."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_health_sync), DB_CONNECT_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        return JSONResponse({"status": "error", "reason": "database timeout", "version": APP_VERSION},
+                            status_code=503)
+
+
+def _health_sync():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
