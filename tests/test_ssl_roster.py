@@ -15,6 +15,9 @@ class SSLRosterTests(unittest.TestCase):
         p = patch.dict(app.tls_chain.tls_state, clear=True)
         p.start()
         self.addCleanup(p.stop)
+        p = patch.object(app, "_check_ssl_external", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_roster_reads_active_database_sites_and_closes_connection(self):
         conn = MagicMock()

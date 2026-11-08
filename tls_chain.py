@@ -345,16 +345,39 @@ def is_self_signed_error(exc):
         or "self signed certificate" in str(getattr(err, "verify_message", "") or "").lower()
 
 
+pending_changes = {}  # host -> bool (самоподписанный?), для записи в БД HTTP-воркером
+
+
 def mark_self_signed(host):
     with _lock:
+        if tls_state.get(host) != "self_signed":
+            pending_changes[host] = True
         tls_state[host] = "self_signed"
 
 
 def mark_trusted(host):
     with _lock:
         if tls_state.get(host) != "trusted":
+            pending_changes[host] = False
             tls_state[host] = "trusted"
             _self_signed_info.pop(host, None)
+
+
+def drain_changes():
+    with _lock:
+        changes = dict(pending_changes)
+        pending_changes.clear()
+    return changes
+
+
+def accept_private(host):
+    """Цепочку нельзя довести до публичного корня (самоподписанный сертификат или
+    частный/корпоративный CA). True — срок действует и имя совпадает: это не ошибка."""
+    info = inspect_self_signed(host)
+    if info and info["acceptable"]:
+        mark_self_signed(host)
+        return True, info
+    return False, info
 
 
 def is_self_signed(host, default=False):

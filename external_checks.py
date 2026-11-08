@@ -139,12 +139,37 @@ def self_signed_acceptable(tls, host):
         import tls_chain
     except Exception:
         return False
-    if tls.get("error") not in tls_chain.GLOBALPING_SELF_SIGNED_ERRORS:
+    error = tls.get("error")
+    private_ca = (error == "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+                  and not tls_chain.known_issuer(tls.get("issuer")))
+    if error not in tls_chain.GLOBALPING_SELF_SIGNED_ERRORS and not private_ca:
         return False
     if not _tls_fresh_and_named(tls, host):
         return False
     tls_chain.mark_self_signed(host)
     return True
+
+
+def tls_verdict(tls, host):
+    """TLS-данные точки Globalping -> (дней до окончания, цепочка валидна, самоподписанный).
+    None, если TLS-соединение не подтверждено."""
+    if not isinstance(tls, dict) or not str(tls.get("protocol", "")).startswith("TLS"):
+        return None
+    try:
+        expires = datetime.datetime.fromisoformat(str(tls.get("expiresAt")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    days = int((expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 86400)
+    if tls.get("authorized") is True or incomplete_chain_only(tls, host):
+        try:
+            import tls_chain
+            tls_chain.mark_trusted(host)
+        except Exception:
+            pass
+        return days, True, False
+    if self_signed_acceptable(tls, host):
+        return days, None, True
+    return days, False, False
 
 
 def parse_measurement(data, host, path, verify_ssl, pattern):
@@ -272,6 +297,17 @@ class ExternalChecker:
                 return mid, data
         raise TimeoutError("measurement_deadline")
 
+    async def tls_snapshot(self, session, host):
+        """Одно измерение для SSL-цикла, когда сайт недоступен из сети монитора."""
+        if not ENABLED or not public_site(host) or "/" in host:
+            return None
+        _, data = await self.measurement(session, host, "/")
+        for entry in data.get("results", []):
+            verdict = tls_verdict((entry.get("result") or {}).get("tls"), host)
+            if verdict is not None:
+                return verdict
+        return None
+
     async def fresh(self, session, site, verify_ssl, pattern):
         host, _, suffix = site.partition("/")
         paths, seen, rows, ids, times = ["/" + suffix], set(), [], [], []
@@ -368,3 +404,4 @@ class ExternalChecker:
 
 
 checker = ExternalChecker()
+ssl_checker = ExternalChecker()  # отдельный экземпляр для SSL-цикла (другой поток и event loop)

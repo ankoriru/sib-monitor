@@ -317,3 +317,78 @@ class SelfSignedDashboardTests(unittest.TestCase):
         self.assertNotIn("❌", part)
         with patch.dict(tls_chain.tls_state, {"offline.example": "trusted"}, clear=True):
             self.assertNotIn("самоподписанный сертификат", app._build_body(data))
+
+
+class PrivateCaTests(unittest.TestCase):
+    def setUp(self):
+        for target in ("tls_state", "_self_signed_info", "pending_changes"):
+            p = patch.dict(getattr(tls_chain, target), clear=True)
+            p.start(); self.addCleanup(p.stop)
+
+    def tls(self, **kw):
+        base = {"protocol": "TLSv1.3", "authorized": False, "error": "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+                "issuer": {"CN": "SiburInfrastructureCAG1"},
+                "subject": {"CN": "cp.tdms.sibur.ru", "alt": "DNS:cp.tdms.sibur.ru"},
+                "expiresAt": (NOW + datetime.timedelta(days=375)).isoformat()}
+        base.update(kw)
+        return base
+
+    def test_globalping_private_ca_is_self_signed_not_error(self):
+        days, chain, self_signed = external_checks.tls_verdict(self.tls(), "cp.tdms.sibur.ru")
+        self.assertGreaterEqual(days, 374)
+        self.assertIsNone(chain)
+        self.assertTrue(self_signed)
+        self.assertEqual(tls_chain.drain_changes(), {"cp.tdms.sibur.ru": True})
+
+    def test_known_public_intermediate_is_trusted_not_self_signed(self):
+        tls = self.tls(issuer={"C": "BE", "O": "GlobalSign nv-sa", "CN": "GlobalSign RSA OV SSL CA 2018"},
+                       subject={"CN": "lsdts.sibur.ru", "alt": "DNS:lsdts.sibur.ru"})
+        self.assertEqual(external_checks.tls_verdict(tls, "lsdts.sibur.ru")[1:], (True, False))
+
+    def test_authorized_and_failed_verdicts(self):
+        self.assertEqual(external_checks.tls_verdict(self.tls(authorized=True, error=None),
+                                                     "cp.tdms.sibur.ru")[1:], (True, False))
+        self.assertEqual(external_checks.tls_verdict(self.tls(error="CERT_HAS_EXPIRED"),
+                                                     "cp.tdms.sibur.ru")[1:], (False, False))
+        self.assertIsNone(external_checks.tls_verdict({"protocol": ""}, "x.ru"))
+
+    def test_direct_ssl_check_private_ca_after_failed_aia(self):
+        import app
+        err = ssl.SSLCertVerificationError("unable to get local issuer certificate")
+        err.verify_code = 20
+        bad = unittest.mock.MagicMock()
+        bad.wrap_socket.side_effect = err
+        with patch.object(app.socket, "create_connection"), \
+                patch.object(app.tls_chain, "context", return_value=bad), \
+                patch.object(app.tls_chain, "repair", return_value=False), \
+                patch.object(app.tls_chain, "inspect_self_signed",
+                             return_value={"acceptable": True, "days": 300}):
+            self.assertEqual(app._check_ssl_sync("cp.tdms.sibur.ru", "cp.tdms.sibur.ru/cp/"), (300, None))
+        self.assertTrue(tls_chain.is_self_signed("cp.tdms.sibur.ru"))
+
+    def test_ssl_worker_uses_external_when_unreachable(self):
+        import app
+        with patch.object(app, "_check_ssl_sync", return_value=(-1, None)), \
+                patch.object(app, "_check_ssl_external", return_value=(120, True, False)) as ext:
+            self.assertEqual(app._check_ssl_with_fallback("srm.sibur.ru", "srm.sibur.ru", verify_ssl=True),
+                             (120, True))
+            ext.assert_called_once_with("srm.sibur.ru")
+            # Отключённая проверка SSL и реальная ошибка сертификата не подменяются.
+            ext.reset_mock()
+            app._check_ssl_with_fallback("srm.sibur.ru", "srm.sibur.ru", verify_ssl=False)
+        with patch.object(app, "_check_ssl_sync", return_value=(-1, False)), \
+                patch.object(app, "_check_ssl_external") as ext2:
+            app._check_ssl_with_fallback("srm.sibur.ru", "srm.sibur.ru")
+            ext2.assert_not_called()
+        ext.assert_not_called()
+
+    def test_marks_persisted_for_sites_with_paths(self):
+        import app
+        tls_chain.mark_self_signed("cp.tdms.sibur.ru")
+        conn = unittest.mock.MagicMock()
+        with patch.object(app, "get_db_connection", return_value=conn), \
+                patch.object(app, "_invalidate_dashboard_cache"):
+            app._persist_tls_marks(["cp.tdms.sibur.ru/cp/", "sibur.ru"])
+        conn.cursor.return_value.execute.assert_called_once_with(
+            "UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s", (True, "cp.tdms.sibur.ru/cp/"))
+        self.assertEqual(tls_chain.drain_changes(), {})

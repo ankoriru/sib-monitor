@@ -22,6 +22,7 @@ from html import escape
 from network_diagnostics import run_diagnostics
 import tls_chain
 from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
+import external_checks
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Cookie
@@ -34,7 +35,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.06-monitor.8"
+APP_VERSION = "2026.11.08-monitor.9"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -957,19 +958,46 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
     except ssl.SSLCertVerificationError as exc:
         if tls_chain.is_self_signed_error(exc):
             return _self_signed(exc)
-        # Сервер не отдал промежуточный сертификат: достраиваем цепочку по AIA, как браузер.
-        if tls_chain.is_missing_issuer(exc) and tls_chain.repair(domain_only):
-            try:
-                result = _probe()
-                tls_chain.mark_trusted(domain_only)
-                return result
-            except ssl.SSLCertVerificationError:
-                return -1, False
-            except Exception:
-                return -1, None
+        if tls_chain.is_missing_issuer(exc):
+            # Сервер не отдал промежуточный сертификат: достраиваем цепочку по AIA, как браузер.
+            if tls_chain.repair(domain_only):
+                try:
+                    result = _probe()
+                    tls_chain.mark_trusted(domain_only)
+                    return result
+                except ssl.SSLCertVerificationError:
+                    return -1, False
+                except Exception:
+                    return -1, None
+            # До публичного корня не дойти — частный (корпоративный) CA, как самоподписанный.
+            return _self_signed(exc)
         return -1, False
     except Exception:
         return -1, None
+
+
+def _check_ssl_external(domain_only):
+    """Срок и статус сертификата по данным Globalping, если из сети монитора сайт недоступен."""
+    async def run():
+        async with aiohttp.ClientSession() as session:
+            return await external_checks.ssl_checker.tls_snapshot(session, domain_only)
+    try:
+        return asyncio.run(asyncio.wait_for(run(), 45))
+    except Exception as exc:
+        print(f"[SSL EXTERNAL] {domain_only}: нет данных ({type(exc).__name__})", flush=True)
+        return None
+
+
+def _check_ssl_with_fallback(domain_only, site, **kwargs):
+    verify_ssl = kwargs.get("verify_ssl", True)
+    ssl_d, chain_valid = _check_ssl_sync(domain_only, site, **kwargs)
+    if verify_ssl and ssl_d == -1 and chain_valid is None and external_checks.public_site(domain_only):
+        verdict = _check_ssl_external(domain_only)
+        if verdict:
+            ssl_d, chain_valid, self_signed = verdict
+            print(f"[SSL EXTERNAL] {domain_only}: ssl_days={ssl_d} chain_valid={chain_valid} "
+                  f"self_signed={self_signed}", flush=True)
+    return ssl_d, chain_valid
 
 
 def _check_whois_sync(domain_only):
@@ -1170,12 +1198,20 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
                         raise _SelfSignedRejected(problem) from cert_exc
                     tls_chain.mark_self_signed(host)
                     curr_status, check_error = await _request(False, remaining)
-                elif (verify_ssl and tls_chain.is_missing_issuer(cert_exc)
-                        and await asyncio.to_thread(tls_chain.repair, host)):
-                    # Сервер (или цель перенаправления) не отдал промежуточный сертификат:
-                    # цепочка достроена по AIA, как в браузере; повторяем один раз.
-                    curr_status, check_error = await _request(tls_chain.context(), remaining)
-                    tls_chain.mark_trusted(host)
+                elif verify_ssl and tls_chain.is_missing_issuer(cert_exc):
+                    if await asyncio.to_thread(tls_chain.repair, host):
+                        # Сервер (или цель перенаправления) не отдал промежуточный сертификат:
+                        # цепочка достроена по AIA, как в браузере; повторяем один раз.
+                        curr_status, check_error = await _request(tls_chain.context(), remaining)
+                        tls_chain.mark_trusted(host)
+                    else:
+                        # Публичной цепочки нет — частный (корпоративный) CA: как самоподписанный.
+                        accepted, info = await asyncio.to_thread(tls_chain.accept_private, host)
+                        if not accepted:
+                            if info is None:
+                                raise
+                            raise _SelfSignedRejected(tls_chain.self_signed_problem(info)) from cert_exc
+                        curr_status, check_error = await _request(False, remaining)
                 else:
                     raise
         except Exception as e:
@@ -1629,6 +1665,32 @@ def _send_screenshot_async(site, caption):
     print(f"[SCREEN QUEUE] {site} added (queue size: {_screenshot_queue.qsize()})")
 
 
+def _persist_tls_marks(sites):
+    """Пишет в latest_status изменения признака «самоподписанный сертификат»."""
+    changes = tls_chain.drain_changes()
+    if not changes:
+        return
+    rows = [(value, site) for site in sites for host, value in changes.items()
+            if site.split('/')[0] == host]
+    if not rows:
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        for value, site in rows:
+            cur.execute("UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s", (value, site))
+        conn.commit()
+        cur.close()
+        conn.close()
+        _invalidate_dashboard_cache()
+        print(f"[TLS MARK] {', '.join(f'{s}={v}' for v, s in rows)}", flush=True)
+    except Exception as e:
+        # Не теряем изменения: повторим в следующем цикле.
+        for value, site in rows:
+            tls_chain.pending_changes.setdefault(site.split('/')[0], value)
+        print(f"[TLS MARK ERR] {e}", flush=True)
+
+
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
                          last_status, fail_count, last_latency_map, thresholds, first_fail_time,
                          check_error=None, check_details=None):
@@ -1896,6 +1958,7 @@ def check_worker():
                                                 last_status, fail_count, last_latency_map, first_fail_time)
 
             flush_batch()
+            _persist_tls_marks(SITES)
             _update_worker_heartbeat()
             failed_now = sum(1 for _, st, *_ in results if st != 200)
             cycle_time = round(time.time() - t_start, 1)
@@ -1960,7 +2023,7 @@ def ssl_whois_worker():
             for site, verify_ssl in ssl_sites:
                 domain_only = site.split('/')[0]
                 try:
-                    ssl_d, ssl_chain_valid = _check_ssl_sync(domain_only, site, verify_ssl=verify_ssl)
+                    ssl_d, ssl_chain_valid = _check_ssl_with_fallback(domain_only, site, verify_ssl=verify_ssl)
                 except Exception:
                     ssl_d, ssl_chain_valid = -1, None
 
@@ -2040,7 +2103,7 @@ def _send_daily_ssl_report():
     for site in sites:
         # Не ждём медленного WHOIS-цикла и не выдаём старое ssl_days за свежее.
         try:
-            ssl_days, chain_valid = _check_ssl_sync(site.split('/')[0], site)
+            ssl_days, chain_valid = _check_ssl_with_fallback(site.split('/')[0], site)
         except Exception as exc:
             print(f"[SSL REPORT SKIP] {site}: check failed ({type(exc).__name__})",
                   flush=True)

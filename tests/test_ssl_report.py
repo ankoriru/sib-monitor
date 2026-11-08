@@ -18,6 +18,8 @@ class SSLReportTests(unittest.TestCase):
         self.sender = self.send.start()
         self.enabled.start()
         self.addCleanup(patch.stopall)
+        # Без внешних измерений в тестах.
+        patch.object(app, "_check_ssl_external", return_value=None).start()
 
     def test_consecutive_mornings_recalculate_from_certificate(self):
         class Clock(datetime.datetime):
