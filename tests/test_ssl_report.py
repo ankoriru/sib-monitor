@@ -33,7 +33,7 @@ class SSLReportTests(unittest.TestCase):
         }
         with patch.object(app.datetime, "datetime", Clock), \
                 patch.object(app.socket, "create_connection"), \
-                patch.object(app.ssl, "create_default_context", return_value=context):
+                patch.object(app.tls_chain, "context", return_value=context):
             app._send_daily_ssl_report()
             Clock.current += datetime.timedelta(days=1)
             app._send_daily_ssl_report()

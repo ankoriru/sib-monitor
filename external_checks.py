@@ -90,6 +90,35 @@ def public_redirect(host, current_path, location):
         return None
 
 
+def _host_matches(pattern, host):
+    pattern, host = pattern.lower().rstrip("."), host.lower().rstrip(".")
+    if pattern.startswith("*."):
+        return host.count(".") == pattern.count(".") and host.endswith(pattern[1:])
+    return pattern == host
+
+
+def incomplete_chain_only(tls, host):
+    """Точка Globalping не смогла проверить подпись конечного сертификата только потому,
+    что сервер не отдал промежуточный (UNABLE_TO_VERIFY_LEAF_SIGNATURE). Считаем TLS
+    подтверждённым, если выдавший CA — проверенный промежуточный из нашего хранилища,
+    срок не истёк и имя хоста совпадает с сертификатом."""
+    if tls.get("error") != "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+        return False
+    try:
+        import tls_chain
+        if not tls_chain.known_issuer(tls.get("issuer")):
+            return False
+        expires = datetime.datetime.fromisoformat(str(tls.get("expiresAt")).replace("Z", "+00:00"))
+        if expires <= datetime.datetime.now(datetime.timezone.utc):
+            return False
+    except Exception:
+        return False
+    subject = tls.get("subject") or {}
+    names = [n.strip()[4:] for n in str(subject.get("alt", "")).split(",")
+             if n.strip().startswith("DNS:")] or [subject.get("CN") or ""]
+    return any(_host_matches(n, host) for n in names if n)
+
+
 def parse_measurement(data, host, path, verify_ssl, pattern):
     """Interpret probe data; require TLS evidence even if verification is disabled."""
     checked_at = data.get("createdAt")
@@ -125,7 +154,7 @@ def parse_measurement(data, host, path, verify_ssl, pattern):
             continue
         if not str(tls.get("protocol", "")).startswith("TLS"):
             row["reason"] = "Нет подтверждения TLS-соединения"
-        elif verify_ssl and tls.get("authorized") is not True:
+        elif verify_ssl and tls.get("authorized") is not True and not incomplete_chain_only(tls, host):
             row.update(status=TLS_ERROR, reason="TLS: цепочка сертификата не подтверждена")
         elif http in (301, 302, 303, 307, 308):
             location = (result.get("headers") or {}).get("location")

@@ -20,6 +20,7 @@ from io import StringIO
 from string import Template
 from html import escape
 from network_diagnostics import run_diagnostics
+import tls_chain
 from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
 from psycopg2.extras import DictCursor, execute_values
 from playwright.async_api import async_playwright
@@ -933,15 +934,24 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
     verify_ssl=False — полностью пропускаем проверку (не открываем socket)."""
     if not verify_ssl:
         return -1, None
-    try:
-        ctx = ssl.create_default_context()
+    def _probe():
         with socket.create_connection((domain_only, 443), timeout=3) as sock:
-            with ctx.wrap_socket(sock, server_hostname=domain_only) as ssock:
+            with tls_chain.context().wrap_socket(sock, server_hostname=domain_only) as ssock:
                 cert = ssock.getpeercert()
                 exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                ssl_d = (exp - datetime.datetime.utcnow()).days
-                return ssl_d, True
-    except ssl.SSLCertVerificationError:
+                return (exp - datetime.datetime.utcnow()).days, True
+
+    try:
+        return _probe()
+    except ssl.SSLCertVerificationError as exc:
+        # Сервер не отдал промежуточный сертификат: достраиваем цепочку по AIA, как браузер.
+        if tls_chain.is_missing_issuer(exc) and tls_chain.repair(domain_only):
+            try:
+                return _probe()
+            except ssl.SSLCertVerificationError:
+                return -1, False
+            except Exception:
+                return -1, None
         return -1, False
     except Exception:
         return -1, None
@@ -1091,33 +1101,49 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
             else:
                 actual_session = session
 
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-            async with actual_session.get(check_url, timeout=timeout, allow_redirects=True) as resp:
-                curr_status = resp.status
-                # Сначала преобразуем специальные статусы
-                if curr_status in (307, 308):
-                    # 307/308 = редирект, сервер работает — считаем OK
-                    curr_status = 200
-                elif curr_status == 401:
-                    # 401 = сервер работает, требует авторизацию — считаем OK
-                    curr_status = 200
-                if curr_status != 200:
-                    check_error = _http_error_reason(curr_status)
-                # Content match для сайтов с content match enabled (только для 200)
-                if site in _cm_sites_set and curr_status == 200 and resp.status != 401:
-                    try:
-                        # ClientTimeout.total covers connect + redirects + body.
-                        text = await resp.text()
-                        text_lower = text.lower()
-                        match_found = _content_match_regex.search(text_lower)
-                        if match_found:
-                            print(f"[CONTENT MATCH OK] {site}")
-                        else:
+            async def _request(ssl_arg, total):
+                curr_status, check_error = 0, None
+                async with actual_session.get(check_url, timeout=aiohttp.ClientTimeout(total=total),
+                                              allow_redirects=True, ssl=ssl_arg) as resp:
+                    curr_status = resp.status
+                    # Сначала преобразуем специальные статусы
+                    if curr_status in (307, 308):
+                        # 307/308 = редирект, сервер работает — считаем OK
+                        curr_status = 200
+                    elif curr_status == 401:
+                        # 401 = сервер работает, требует авторизацию — считаем OK
+                        curr_status = 200
+                    if curr_status != 200:
+                        check_error = _http_error_reason(curr_status)
+                    # Content match для сайтов с content match enabled (только для 200)
+                    if site in _cm_sites_set and curr_status == 200 and resp.status != 401:
+                        try:
+                            # ClientTimeout.total covers connect + redirects + body.
+                            text = await resp.text()
+                            text_lower = text.lower()
+                            match_found = _content_match_regex.search(text_lower)
+                            if match_found:
+                                print(f"[CONTENT MATCH OK] {site}")
+                            else:
+                                curr_status = 701
+                                check_error = f"Content Match: в ответе HTTP {resp.status} нет совпадения с шаблоном"
+                        except Exception as e:
                             curr_status = 701
-                            check_error = f"Content Match: в ответе HTTP {resp.status} нет совпадения с шаблоном"
-                    except Exception as e:
-                        curr_status = 701
-                        check_error = f"Content Match: ошибка чтения ответа ({_describe_check_error(e, timeout_seconds)})"
+                            check_error = f"Content Match: ошибка чтения ответа ({_describe_check_error(e, timeout_seconds)})"
+                return curr_status, check_error
+
+            try:
+                curr_status, check_error = await _request(
+                    tls_chain.context() if verify_ssl else False, timeout_seconds)
+            except aiohttp.ClientConnectorCertificateError as cert_exc:
+                # Сервер (или цель перенаправления) не отдал промежуточный сертификат:
+                # достраиваем цепочку по AIA, как браузер, и повторяем один раз.
+                host = getattr(cert_exc, "host", None) or site.split('/')[0]
+                if not (verify_ssl and tls_chain.is_missing_issuer(cert_exc)
+                        and await asyncio.to_thread(tls_chain.repair, host)):
+                    raise
+                remaining = max(1.0, timeout_seconds - (time.perf_counter() - start))
+                curr_status, check_error = await _request(tls_chain.context(), remaining)
         except Exception as e:
             curr_status = 0
             check_error = _describe_check_error(e, timeout_seconds)
@@ -3389,7 +3415,8 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
         connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(check_url, allow_redirects=True) as resp:
+            async with session.get(check_url, allow_redirects=True,
+                                   ssl=tls_chain.context() if verify_ssl else False) as resp:
                 status = resp.status
                 original_status = status
                 auth_note = ""
