@@ -1359,12 +1359,28 @@ def _db_incident_resolve(site):
                 duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT),
                 resolved = TRUE
             WHERE site = %s AND resolved = FALSE
+            RETURNING duration_min
         """, (site,))
+        rows = cur.fetchall()
         conn.commit()
         cur.close()
         conn.close()
+        durations = [r[0] for r in rows if r and isinstance(r[0], int)]
+        return max(durations) if durations else None
     except Exception as e:
         print(f"[INCIDENT RESOLVE ERR] {site}: {e}")
+    return None
+
+
+def _downtime_minutes(resolved_min=None, started_at=None, fallback_checks=0):
+    """Длительность простоя для UP-уведомления: по времени, а не по счётчику проверок.
+    Приоритет: длительность закрытого инцидента из БД -> время первого сбоя -> число проверок."""
+    if isinstance(resolved_min, int) and not isinstance(resolved_min, bool) and resolved_min > 0:
+        return resolved_min
+    if isinstance(started_at, datetime.datetime):
+        secs = (datetime.datetime.now() - started_at).total_seconds()
+        return max(1, int(secs // 60))
+    return max(1, int(fallback_checks or 0))
 
 
 def _db_incident_resolve_by_id(incident_id):
@@ -1566,7 +1582,9 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
         if curr_status == CHECK_UNKNOWN:
             # Break consecutive failures; do not declare DOWN or UP, or close incidents.
             fail_count[site] = 0
-            first_fail_time.pop(site, None)
+            if last_status.get(site, 200) == 200:
+                # Во время активного инцидента время его начала сохраняем.
+                first_fail_time.pop(site, None)
             with BATCH_LOCK:
                 batch_buffer.append(sample)
             return
@@ -1578,7 +1596,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             was_up = last_status.get(site, 200) == 200
             fail_count[site] = fail_count.get(site, 0) + 1
 
-            if fail_count[site] == 1:
+            if fail_count[site] == 1 and (was_up or site not in first_fail_time):
                 first_fail_time[site] = datetime.datetime.now()
                 print(f"[FIRST FAIL] {site} at {first_fail_time[site]}")
 
@@ -1609,14 +1627,15 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                     _flush_batch_unlocked()
 
             fc = fail_count.get(site, 0)
+            resolved_min = None
             if (fc >= thresholds.get(site, 5) or last_status.get(site, 200) != 200 or
                     (check_details and check_details.get("source") == "globalping"
                      and not check_details["external"]["cached"])):
-                print(f"[INCIDENT RESOLVE] {site} after {fc} min down")
-                _db_incident_resolve(site)
+                print(f"[INCIDENT RESOLVE] {site} after {fc} failed checks")
+                resolved_min = _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
-                duration = fc
+                duration = _downtime_minutes(resolved_min, first_fail_time.get(site), fc)
                 print(f"[ALERT TRIGGER] {site} UP after {duration} min")
                 ok = send_tg_msg(f"✅ UP: {site} (Был недоступен: {duration} мин.)")
                 print(f"[ALERT RESULT] {site} UP send_tg_msg={'OK' if ok else 'FAIL'}")
@@ -1677,11 +1696,12 @@ def _process_self_monitoring_result(site, curr_status, resp_time, ssl_d, dom_d, 
                     _flush_batch_unlocked()
 
             fc = fail_count.get(site, 0)
-            if fc >= SM_THRESHOLD:
-                _db_incident_resolve(site)
+            resolved_min = None
+            if fc >= SM_THRESHOLD or last_status.get(site, 200) != 200:
+                resolved_min = _db_incident_resolve(site)
 
             if last_status.get(site, 200) != 200:
-                duration = fc
+                duration = _downtime_minutes(resolved_min, first_fail_time.get(site), fc)
                 print(f"[SM ALERT] {site} UP after {duration} min")
                 ok = send_tg_msg(f"✅ [SELF-MONITORING] UP: {site} (Был недоступен: {duration} мин.)")
                 print(f"[SM ALERT RESULT] UP {'OK' if ok else 'FAIL'}")
