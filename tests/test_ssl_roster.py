@@ -15,7 +15,7 @@ class SSLRosterTests(unittest.TestCase):
         p = patch.dict(app.tls_chain.tls_state, clear=True)
         p.start()
         self.addCleanup(p.stop)
-        p = patch.object(app, "_check_ssl_external", return_value=None)
+        p = patch.object(app, "_check_ssl_external", return_value=(None, "no_tls_data"))
         p.start()
         self.addCleanup(p.stop)
 
@@ -43,7 +43,8 @@ class SSLRosterTests(unittest.TestCase):
         conn = MagicMock()
 
         def sleep(seconds):
-            if seconds == 4 * 3600:
+            # Любая длинная пауза воркера (повтор или следующий полный цикл) завершает тест.
+            if seconds >= 60:
                 raise StopWorker()
 
         with patch.object(app, "SITES", ["legacy.example"]), \
@@ -60,7 +61,7 @@ class SSLRosterTests(unittest.TestCase):
                 app.ssl_whois_worker()
         check.assert_called_once_with("ksot.nipigas.ru", "ksot.nipigas.ru", verify_ssl=True)
         self.assertEqual(conn.cursor.return_value.execute.call_args.args[1],
-                         ("ksot.nipigas.ru", 3, 100, True))
+                         ("ksot.nipigas.ru", 3, 100, True, None, 100))
         conn.commit.assert_called_once()
         invalidate.assert_called_once()
 

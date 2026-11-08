@@ -369,7 +369,7 @@ class PrivateCaTests(unittest.TestCase):
     def test_ssl_worker_uses_external_when_unreachable(self):
         import app
         with patch.object(app, "_check_ssl_sync", return_value=(-1, None)), \
-                patch.object(app, "_check_ssl_external", return_value=(120, True, False)) as ext:
+                patch.object(app, "_check_ssl_external", return_value=((120, True, False), None)) as ext:
             self.assertEqual(app._check_ssl_with_fallback("srm.sibur.ru", "srm.sibur.ru", verify_ssl=True),
                              (120, True))
             ext.assert_called_once_with("srm.sibur.ru")

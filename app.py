@@ -35,11 +35,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.08-monitor.9"
+APP_VERSION = "2026.11.08-monitor.10"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
 DEFAULT_HTTP_TIMEOUT = 8
+SSL_CONNECT_TIMEOUT = 8  # было 3 с: медленные сайты ошибочно попадали в «нет данных»
+SSL_FULL_CYCLE_SECONDS = 4 * 3600
+SSL_RETRY_SECONDS = 15 * 60  # повтор для сайтов без данных SSL, не ждём 4 часа
 TIMEOUT_EXPERIMENT_SITES = (
     "transportorder.sibur.ru", "cp.tdms.sibur.ru/cp/",
     "bopp.sibur.ru", "eshop.sibur.ru",
@@ -552,6 +555,7 @@ def init_db():
     _ensure_check_error_column(cur)
     _ensure_check_details_column(cur)
     cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS ssl_self_signed BOOLEAN")
+    cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS ssl_note TEXT")
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
     except psycopg2.Error:
@@ -931,13 +935,44 @@ def send_tg_msg(text, photo_path=None, category='alert'):
 # ============================================================================
 # WHOIS
 # ============================================================================
+SSL_NOTE_DISABLED = "Проверка SSL отключена в настройках сайта"
+_ssl_notes = {}  # domain -> пояснение, почему срок сертификата не определён
+
+
+def _ssl_network_error(exc):
+    """Сайт недоступен по сети (основная проверка невозможна): только тогда допустим Globalping.
+    Ошибки TLS при установленном соединении — результат основной проверки, а не недоступность."""
+    if isinstance(exc, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return True  # соединение оборвано посреди рукопожатия (фильтрация по пути)
+    if isinstance(exc, ssl.SSLError):
+        return False
+    return isinstance(exc, (OSError, TimeoutError))
+
+
+def _ssl_error_text(exc):
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "таймаут подключения к порту 443"
+    if isinstance(exc, socket.gaierror):
+        return "DNS не разрешает имя"
+    if isinstance(exc, ConnectionRefusedError):
+        return "порт 443 закрыт"
+    if isinstance(exc, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return "соединение оборвано во время TLS-рукопожатия"
+    if isinstance(exc, ssl.SSLError):
+        return f"ошибка TLS-рукопожатия ({getattr(exc, 'reason', None) or type(exc).__name__})"
+    return f"ошибка подключения ({type(exc).__name__})"
+
+
 def _check_ssl_sync(domain_only, site, verify_ssl=True):
     """Синхронная SSL-проверка (для вызова через asyncio.to_thread).
-    verify_ssl=False — полностью пропускаем проверку (не открываем socket)."""
+    verify_ssl=False — полностью пропускаем проверку (не открываем socket).
+    (-1, None) — только когда сайт недоступен по сети; причина — в _ssl_notes."""
+    _ssl_notes.pop(domain_only, None)
     if not verify_ssl:
+        _ssl_notes[domain_only] = SSL_NOTE_DISABLED
         return -1, None
     def _probe():
-        with socket.create_connection((domain_only, 443), timeout=3) as sock:
+        with socket.create_connection((domain_only, 443), timeout=SSL_CONNECT_TIMEOUT) as sock:
             with tls_chain.context().wrap_socket(sock, server_hostname=domain_only) as ssock:
                 cert = ssock.getpeercert()
                 exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
@@ -949,7 +984,23 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
         if info and info["acceptable"]:
             tls_chain.mark_self_signed(domain_only)
             return info["days"], None
+        if info is None:
+            _ssl_notes[domain_only] = "Не удалось прочитать сертификат"
+        else:
+            _ssl_notes[domain_only] = tls_chain.self_signed_problem(info)
         return (info["days"] if info else -1), False
+
+    def _verification_failed(exc):
+        _ssl_notes[domain_only] = ("Сертификат не прошёл проверку: "
+                                   + str(getattr(exc, "verify_message", "") or "цепочка, срок или имя"))
+        return -1, False
+
+    def _unreachable(exc):
+        if _ssl_network_error(exc):
+            _ssl_notes[domain_only] = "Нет связи из сети монитора: " + _ssl_error_text(exc)
+            return -1, None
+        _ssl_notes[domain_only] = _ssl_error_text(exc).capitalize()
+        return -1, False
 
     try:
         result = _probe()
@@ -965,39 +1016,67 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
                     result = _probe()
                     tls_chain.mark_trusted(domain_only)
                     return result
-                except ssl.SSLCertVerificationError:
-                    return -1, False
-                except Exception:
-                    return -1, None
+                except ssl.SSLCertVerificationError as exc2:
+                    return _verification_failed(exc2)
+                except Exception as exc2:
+                    return _unreachable(exc2)
             # До публичного корня не дойти — частный (корпоративный) CA, как самоподписанный.
             return _self_signed(exc)
-        return -1, False
-    except Exception:
-        return -1, None
+        return _verification_failed(exc)
+    except Exception as exc:
+        return _unreachable(exc)
 
 
 def _check_ssl_external(domain_only):
-    """Срок и статус сертификата по данным Globalping, если из сети монитора сайт недоступен."""
+    """Срок и статус сертификата по данным Globalping, если из сети монитора сайт недоступен.
+    Возвращает (verdict | None, код ошибки | None)."""
     async def run():
         async with aiohttp.ClientSession() as session:
             return await external_checks.ssl_checker.tls_snapshot(session, domain_only)
     try:
-        return asyncio.run(asyncio.wait_for(run(), 45))
+        verdict = asyncio.run(asyncio.wait_for(run(), 45))
+        return verdict, (None if verdict else "no_tls_data")
     except Exception as exc:
-        print(f"[SSL EXTERNAL] {domain_only}: нет данных ({type(exc).__name__})", flush=True)
-        return None
+        code = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,60}", code or ""):
+            code = type(exc).__name__
+        print(f"[SSL EXTERNAL] {domain_only}: нет данных ({code})", flush=True)
+        return None, code
+
+
+_EXTERNAL_ERROR_TEXT = {
+    "no_tls_data": "внешние точки не получили TLS-ответ",
+    "api_rate_limit": "лимит запросов Globalping",
+    "api_cooldown": "пауза после лимита Globalping",
+    "local_hourly_budget": "исчерпан часовой лимит Globalping",
+    "TimeoutError": "таймаут Globalping",
+    "measurement_deadline": "таймаут Globalping",
+}
 
 
 def _check_ssl_with_fallback(domain_only, site, **kwargs):
+    """Основная SSL-проверка из сети монитора. Globalping — только если сайт недоступен по сети
+    ((-1, None) при включённой проверке), а не при ошибке сертификата."""
     verify_ssl = kwargs.get("verify_ssl", True)
     ssl_d, chain_valid = _check_ssl_sync(domain_only, site, **kwargs)
-    if verify_ssl and ssl_d == -1 and chain_valid is None and external_checks.public_site(domain_only):
-        verdict = _check_ssl_external(domain_only)
+    if verify_ssl and ssl_d == -1 and chain_valid is None:
+        if not external_checks.ENABLED or not external_checks.public_site(domain_only):
+            return ssl_d, chain_valid
+        verdict, code = _check_ssl_external(domain_only)
         if verdict:
             ssl_d, chain_valid, self_signed = verdict
+            _ssl_notes.pop(domain_only, None)
             print(f"[SSL EXTERNAL] {domain_only}: ssl_days={ssl_d} chain_valid={chain_valid} "
                   f"self_signed={self_signed}", flush=True)
+        else:
+            base = _ssl_notes.get(domain_only, "Нет связи из сети монитора")
+            _ssl_notes[domain_only] = (f"{base}; резервная проверка: "
+                                       f"{_EXTERNAL_ERROR_TEXT.get(code, code)}. Повтор через 15 мин")
     return ssl_d, chain_valid
+
+
+def ssl_note(domain_only):
+    return _ssl_notes.get(domain_only)
 
 
 def _check_whois_sync(domain_only):
@@ -1674,6 +1753,7 @@ def _persist_tls_marks(sites):
             if site.split('/')[0] == host]
     if not rows:
         return
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1681,7 +1761,6 @@ def _persist_tls_marks(sites):
             cur.execute("UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s", (value, site))
         conn.commit()
         cur.close()
-        conn.close()
         _invalidate_dashboard_cache()
         print(f"[TLS MARK] {', '.join(f'{s}={v}' for v, s in rows)}", flush=True)
     except Exception as e:
@@ -1689,6 +1768,12 @@ def _persist_tls_marks(sites):
         for value, site in rows:
             tls_chain.pending_changes.setdefault(site.split('/')[0], value)
         print(f"[TLS MARK ERR] {e}", flush=True)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()  # не оставляем открытую транзакцию при ошибке
+            except Exception:
+                pass
 
 
 def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid,
@@ -2002,10 +2087,18 @@ def ssl_whois_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    pending_retry = set()
+    next_full = 0.0
     while True:
+        now = time.time()
+        full = now >= next_full
         try:
+            if not full and not pending_retry:
+                time.sleep(max(1.0, min(SSL_RETRY_SECONDS, next_full - now)))
+                continue
             t_start = time.time()
-            print(f"[SSL WORKER] Starting SSL+WHOIS checks at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
+            print(f"[SSL WORKER] Starting {'SSL+WHOIS' if full else 'SSL retry'} checks at "
+                  f"{datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
 
             # Не используем SITES: при старте HTTP-поток может ещё не загрузить БД.
             # Активные self-monitoring записи также входят в эту выборку.
@@ -2014,66 +2107,93 @@ def ssl_whois_worker():
                 print(f"[SSL WORKER] Loaded {len(ssl_sites)} active sites from database")
             except Exception as e:
                 print(f"[SSL WORKER] DB error loading settings: {e}")
-                # ===== НЕ СБРАСЫВАЕМ В ПУСТОЙ СЛОВАРЬ =====
                 print("[SSL WORKER] Skipping cycle — will retry in 60 sec")
                 time.sleep(60)
                 continue
-                # ============================================
 
+            if not full:
+                ssl_sites = [(s_, v_) for s_, v_ in ssl_sites if s_ in pending_retry]
+            retry_next = set()
             for site, verify_ssl in ssl_sites:
-                domain_only = site.split('/')[0]
-                try:
-                    ssl_d, ssl_chain_valid = _check_ssl_with_fallback(domain_only, site, verify_ssl=verify_ssl)
-                except Exception:
-                    ssl_d, ssl_chain_valid = -1, None
-
-                try:
-                    dom_d = _check_whois_sync(domain_only)
-                except Exception:
-                    dom_d = -1
-
-                # Обновляем latest_status (теперь обычная таблица) — только SSL-поля
-                try:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE logs
-                        SET ssl_days = %s, domain_days = %s, ssl_chain_valid = %s
-                        WHERE site = %s
-                          AND timestamp = (SELECT MAX(timestamp) FROM logs WHERE site = %s)
-                    """, (ssl_d, dom_d, ssl_chain_valid, site, site))
-                    # Обновляем таблицу latest_status (UPSERT только SSL-поля, status не трогаем)
-                    cur.execute("""
-                        INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days, ssl_chain_valid, timestamp)
-                        VALUES (%s, 200, 0.5, %s, %s, %s, NOW())
-                        ON CONFLICT (site) DO UPDATE SET
-                            ssl_days = EXCLUDED.ssl_days,
-                            domain_days = EXCLUDED.domain_days,
-                            ssl_chain_valid = EXCLUDED.ssl_chain_valid,
-                            timestamp = EXCLUDED.timestamp
-                    """, (site, ssl_d, dom_d, ssl_chain_valid))
-                    if verify_ssl and domain_only in tls_chain.tls_state:
-                        cur.execute("UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s",
-                                    (tls_chain.is_self_signed(domain_only), site))
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-                    _invalidate_dashboard_cache()
-                    print(f"[SSL RESULT] {site}: ssl_days={ssl_d} "
-                          f"chain_valid={ssl_chain_valid} enabled={verify_ssl} saved=true",
-                          flush=True)
-                except Exception as e:
-                    print(f"[SSL WORKER] Failed to save SSL/WHOIS for {site}: {e}")
-
+                if _ssl_check_and_save(site, verify_ssl, with_whois=full):
+                    retry_next.add(site)
                 time.sleep(0.5)  # Небольшая пауза между сайтами
+            pending_retry = retry_next
+            if full:
+                next_full = t_start + SSL_FULL_CYCLE_SECONDS
 
             elapsed = round(time.time() - t_start, 1)
-            print(f"[SSL WORKER] Completed in {elapsed}s, sleeping 4 hours")
+            print(f"[SSL WORKER] Completed in {elapsed}s; без данных: {len(pending_retry)} "
+                  f"(повтор через {SSL_RETRY_SECONDS // 60} мин)", flush=True)
 
         except Exception as e:
             print(f"[SSL WORKER ERROR] {e}")
+            if full:
+                next_full = time.time() + SSL_RETRY_SECONDS
 
-        time.sleep(4 * 3600)
+        time.sleep(SSL_RETRY_SECONDS if pending_retry or not full else 1)
+
+
+def _ssl_check_and_save(site, verify_ssl, with_whois=True):
+    """SSL (+WHOIS) одного сайта и запись в БД. True — данных SSL нет, нужен повтор.
+    Пустой результат не затирает последний известный срок: запоминается причина."""
+    domain_only = site.split('/')[0]
+    try:
+        ssl_d, ssl_chain_valid = _check_ssl_with_fallback(domain_only, site, verify_ssl=verify_ssl)
+    except Exception as exc:
+        ssl_d, ssl_chain_valid = -1, None
+        _ssl_notes[domain_only] = f"Ошибка проверки SSL ({type(exc).__name__})"
+    note = ssl_note(domain_only) if ssl_d < 0 else None
+    missing = verify_ssl and ssl_d < 0 and ssl_chain_valid is None
+    dom_d = None
+    if with_whois:
+        try:
+            dom_d = _check_whois_sync(domain_only)
+        except Exception:
+            dom_d = -1
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if missing:
+            # Сайт временно недоступен для SSL-проверки: срок и цепочку не сбрасываем.
+            cur.execute("""
+                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days,
+                                           ssl_chain_valid, ssl_note, timestamp)
+                VALUES (%s, 200, 0.5, -1, COALESCE(%s, -1), NULL, %s, NOW())
+                ON CONFLICT (site) DO UPDATE SET
+                    domain_days = COALESCE(%s, latest_status.domain_days),
+                    ssl_note = EXCLUDED.ssl_note
+            """, (site, dom_d, note, dom_d))
+        else:
+            cur.execute("""
+                UPDATE logs
+                SET ssl_days = %s, domain_days = COALESCE(%s, domain_days), ssl_chain_valid = %s
+                WHERE site = %s
+                  AND timestamp = (SELECT MAX(timestamp) FROM logs WHERE site = %s)
+            """, (ssl_d, dom_d, ssl_chain_valid, site, site))
+            cur.execute("""
+                INSERT INTO latest_status (site, status, response_time, ssl_days, domain_days,
+                                           ssl_chain_valid, ssl_note, timestamp)
+                VALUES (%s, 200, 0.5, %s, COALESCE(%s, -1), %s, %s, NOW())
+                ON CONFLICT (site) DO UPDATE SET
+                    ssl_days = EXCLUDED.ssl_days,
+                    domain_days = COALESCE(%s, latest_status.domain_days),
+                    ssl_chain_valid = EXCLUDED.ssl_chain_valid,
+                    ssl_note = EXCLUDED.ssl_note,
+                    timestamp = EXCLUDED.timestamp
+            """, (site, ssl_d, dom_d, ssl_chain_valid, note, dom_d))
+        if verify_ssl and domain_only in tls_chain.tls_state:
+            cur.execute("UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s",
+                        (tls_chain.is_self_signed(domain_only), site))
+        conn.commit()
+        cur.close()
+        conn.close()
+        _invalidate_dashboard_cache()
+        print(f"[SSL RESULT] {site}: ssl_days={ssl_d} chain_valid={ssl_chain_valid} "
+              f"enabled={verify_ssl} note={note or '-'} saved=true", flush=True)
+    except Exception as e:
+        print(f"[SSL WORKER] Failed to save SSL/WHOIS for {site}: {e}")
+    return missing
 
 
 
@@ -4243,6 +4363,7 @@ def _build_head() -> str:
         .txt-err { color: #dc2626; font-weight: bold; }
         .txt-ok { color: #16a34a; font-weight: bold; }
         .txt-warn { color: #d97706; font-weight: bold; }
+        .ssl-note { color: #8a8f98; cursor: help; font-size: 0.85em; }
         .self-signed-badge { display: inline-block; margin-left: 8px; padding: 1px 7px;
                              border-radius: 10px; background: #fef3c7; color: #92400e;
                              font-size: 11px; font-weight: 600; white-space: nowrap; }
@@ -4509,12 +4630,15 @@ def _build_body(data: dict) -> str:
         self_signed_html = ('<span class="self-signed-badge" title="Цепочка доверия не проверяется; '
                             'срок и имя сайта проверяются">🔓 самоподписанный сертификат</span>'
                             if self_signed else '')
+        ssl_note_text = v.get('ssl_note')
+        ssl_title = f' title="{escape(ssl_note_text)}"' if ssl_note_text else ''
+        ssl_hint = ' <span class="ssl-note" aria-hidden="true">ⓘ</span>' if ssl_note_text else ''
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{escape(s)}" target="_blank"
                 style="text-decoration:none; color:inherit;"><strong>{escape(s)}</strong></a>{self_signed_html}</td>
             <td><span class="{status_class}">{status_label}</span>{reason_html}</td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
-                        <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}</td>
+                        <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}"{ssl_title}>{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}{ssl_hint}</td>
             <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-warn' if self_signed else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}"{' title="Самоподписанный сертификат"' if self_signed and v.get('ssl_chain_valid') != False else ''}>
                 {'❌' if v.get('ssl_chain_valid') == False else '⚠️' if self_signed else '✅' if v.get('ssl_chain_valid') == True else '—'}</td>
             <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{'—' if v['domain_days'] < 0 else str(v['domain_days'])+'д'}</td>
