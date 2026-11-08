@@ -322,3 +322,104 @@ def known_issuer(issuer):
 
 
 load_bundle()
+
+
+# ---------------------------------------------------------------------------
+# Самоподписанные сертификаты и частные (непубличные) корни
+# ---------------------------------------------------------------------------
+X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT = 18
+X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN = 19
+SELF_SIGNED_CODES = (X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT, X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN)
+GLOBALPING_SELF_SIGNED_ERRORS = ("DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN")
+SELF_SIGNED_CACHE_SECONDS = 600
+
+tls_state = {}       # host -> "self_signed" | "trusted" (последний подтверждённый результат)
+_self_signed_info = {}  # host -> (monotonic, info)
+
+
+def is_self_signed_error(exc):
+    err = getattr(exc, "certificate_error", exc)
+    if getattr(err, "verify_code", None) in SELF_SIGNED_CODES:
+        return True
+    return "self-signed certificate" in str(getattr(err, "verify_message", "") or "").lower() \
+        or "self signed certificate" in str(getattr(err, "verify_message", "") or "").lower()
+
+
+def mark_self_signed(host):
+    with _lock:
+        tls_state[host] = "self_signed"
+
+
+def mark_trusted(host):
+    with _lock:
+        if tls_state.get(host) != "trusted":
+            tls_state[host] = "trusted"
+            _self_signed_info.pop(host, None)
+
+
+def is_self_signed(host, default=False):
+    with _lock:
+        state = tls_state.get(host)
+    return default if state is None else state == "self_signed"
+
+
+def hostname_matches(cert, host):
+    host = host.lower().rstrip(".")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    names, ips = [], []
+    try:
+        san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+        names = san.get_values_for_type(x509.DNSName)
+        ips = san.get_values_for_type(x509.IPAddress)
+    except x509.ExtensionNotFound:
+        names = [a.value for a in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
+    if ip is not None:
+        return ip in ips or str(ip) in names
+    for pattern in names:
+        pattern = str(pattern).lower().rstrip(".")
+        if pattern.startswith("*."):
+            if host.count(".") == pattern.count(".") and host.endswith(pattern[1:]):
+                return True
+        elif pattern == host:
+            return True
+    return False
+
+
+def inspect_self_signed(host, port=443):
+    """Читает сертификат без проверки цепочки и проверяет то, что можно проверить:
+    срок действия и соответствие имени сайта. Возвращает dict или None (нет связи)."""
+    now = time.monotonic()
+    with _lock:
+        cached = _self_signed_info.get(host)
+    if cached and now - cached[0] < SELF_SIGNED_CACHE_SECONDS:
+        return cached[1]
+    try:
+        cert = x509.load_der_x509_certificate(_leaf_der(host, port))
+    except Exception:
+        return None
+    not_after = cert.not_valid_after_utc
+    info = {
+        "days": int((not_after - _now()).total_seconds() // 86400),
+        "valid_now": _valid_now(cert),
+        "hostname_ok": hostname_matches(cert, host),
+        "leaf_self_signed": cert.subject == cert.issuer,
+        "issuer": _cn(cert.issuer),
+    }
+    info["acceptable"] = info["valid_now"] and info["hostname_ok"]
+    with _lock:
+        _self_signed_info[host] = (now, info)
+    return info
+
+
+def self_signed_problem(info):
+    """Текст ошибки для самоподписанного сертификата, который всё же нельзя принять."""
+    if info is None:
+        return "TLS: не удалось прочитать самоподписанный сертификат"
+    if not info["valid_now"]:
+        return "TLS: самоподписанный сертификат просрочен или ещё не действует"
+    if not info["hostname_ok"]:
+        return "TLS: самоподписанный сертификат не соответствует имени сайта"
+    return None

@@ -10,6 +10,12 @@ class StopWorker(BaseException):
 
 
 class SSLRosterTests(unittest.TestCase):
+    def setUp(self):
+        # Состояние TLS из других тестов не должно влиять на запись SSL-полей.
+        p = patch.dict(app.tls_chain.tls_state, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_roster_reads_active_database_sites_and_closes_connection(self):
         conn = MagicMock()
         cur = conn.cursor.return_value.__enter__.return_value

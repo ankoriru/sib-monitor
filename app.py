@@ -550,6 +550,7 @@ def init_db():
     """)
     _ensure_check_error_column(cur)
     _ensure_check_details_column(cur)
+    cur.execute("ALTER TABLE latest_status ADD COLUMN IF NOT EXISTS ssl_self_signed BOOLEAN")
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_latest_status_site ON latest_status (site)")
     except psycopg2.Error:
@@ -941,13 +942,27 @@ def _check_ssl_sync(domain_only, site, verify_ssl=True):
                 exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
                 return (exp - datetime.datetime.utcnow()).days, True
 
+    def _self_signed(exc):
+        # Самоподписанный сертификат не ошибка: проверяем срок и имя сайта.
+        info = tls_chain.inspect_self_signed(domain_only)
+        if info and info["acceptable"]:
+            tls_chain.mark_self_signed(domain_only)
+            return info["days"], None
+        return (info["days"] if info else -1), False
+
     try:
-        return _probe()
+        result = _probe()
+        tls_chain.mark_trusted(domain_only)
+        return result
     except ssl.SSLCertVerificationError as exc:
+        if tls_chain.is_self_signed_error(exc):
+            return _self_signed(exc)
         # Сервер не отдал промежуточный сертификат: достраиваем цепочку по AIA, как браузер.
         if tls_chain.is_missing_issuer(exc) and tls_chain.repair(domain_only):
             try:
-                return _probe()
+                result = _probe()
+                tls_chain.mark_trusted(domain_only)
+                return result
             except ssl.SSLCertVerificationError:
                 return -1, False
             except Exception:
@@ -1024,8 +1039,14 @@ def _migrate_http_timeouts(cur):
               flush=True)
 
 
+class _SelfSignedRejected(Exception):
+    """Самоподписанный сертификат, который нельзя принять (срок или имя сайта)."""
+
+
 def _describe_check_error(exc, timeout_seconds=DEFAULT_HTTP_TIMEOUT):
     """Без URL, заголовков и тела ответа: не сохраняем секреты из исключений."""
+    if isinstance(exc, _SelfSignedRejected):
+        return str(exc)
     if isinstance(exc, (aiohttp.ClientConnectorCertificateError,
                         ssl.SSLCertVerificationError)):
         cert_error = getattr(exc, "certificate_error", exc)
@@ -1135,15 +1156,28 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
             try:
                 curr_status, check_error = await _request(
                     tls_chain.context() if verify_ssl else False, timeout_seconds)
+                if verify_ssl:
+                    tls_chain.mark_trusted(site.split('/')[0])
             except aiohttp.ClientConnectorCertificateError as cert_exc:
-                # Сервер (или цель перенаправления) не отдал промежуточный сертификат:
-                # достраиваем цепочку по AIA, как браузер, и повторяем один раз.
                 host = getattr(cert_exc, "host", None) or site.split('/')[0]
-                if not (verify_ssl and tls_chain.is_missing_issuer(cert_exc)
-                        and await asyncio.to_thread(tls_chain.repair, host)):
-                    raise
                 remaining = max(1.0, timeout_seconds - (time.perf_counter() - start))
-                curr_status, check_error = await _request(tls_chain.context(), remaining)
+                if verify_ssl and tls_chain.is_self_signed_error(cert_exc):
+                    # Самоподписанный сертификат — не ошибка, если срок действует и имя
+                    # совпадает; доступность проверяем без проверки цепочки доверия.
+                    info = await asyncio.to_thread(tls_chain.inspect_self_signed, host)
+                    problem = tls_chain.self_signed_problem(info)
+                    if problem:
+                        raise _SelfSignedRejected(problem) from cert_exc
+                    tls_chain.mark_self_signed(host)
+                    curr_status, check_error = await _request(False, remaining)
+                elif (verify_ssl and tls_chain.is_missing_issuer(cert_exc)
+                        and await asyncio.to_thread(tls_chain.repair, host)):
+                    # Сервер (или цель перенаправления) не отдал промежуточный сертификат:
+                    # цепочка достроена по AIA, как в браузере; повторяем один раз.
+                    curr_status, check_error = await _request(tls_chain.context(), remaining)
+                    tls_chain.mark_trusted(host)
+                else:
+                    raise
         except Exception as e:
             curr_status = 0
             check_error = _describe_check_error(e, timeout_seconds)
@@ -1955,6 +1989,9 @@ def ssl_whois_worker():
                             ssl_chain_valid = EXCLUDED.ssl_chain_valid,
                             timestamp = EXCLUDED.timestamp
                     """, (site, ssl_d, dom_d, ssl_chain_valid))
+                    if verify_ssl and domain_only in tls_chain.tls_state:
+                        cur.execute("UPDATE latest_status SET ssl_self_signed = %s WHERE site = %s",
+                                    (tls_chain.is_self_signed(domain_only), site))
                     conn.commit()
                     cur.close()
                     conn.close()
@@ -4143,6 +4180,9 @@ def _build_head() -> str:
         .txt-err { color: #dc2626; font-weight: bold; }
         .txt-ok { color: #16a34a; font-weight: bold; }
         .txt-warn { color: #d97706; font-weight: bold; }
+        .self-signed-badge { display: inline-block; margin-left: 8px; padding: 1px 7px;
+                             border-radius: 10px; background: #fef3c7; color: #92400e;
+                             font-size: 11px; font-weight: 600; white-space: nowrap; }
         .check-error { display: block; margin-top: 4px; min-width: 220px; max-width: 340px;
                        white-space: normal; overflow-wrap: anywhere;
                        font-size: 12px; line-height: 1.4; }
@@ -4402,14 +4442,18 @@ def _build_body(data: dict) -> str:
 
         reason = _public_check_error(v)
         reason_html = f'<span class="check-error">{escape(reason)}</span>' if reason else ''
+        self_signed = tls_chain.is_self_signed(s.split('/')[0], default=bool(v.get('ssl_self_signed')))
+        self_signed_html = ('<span class="self-signed-badge" title="Цепочка доверия не проверяется; '
+                            'срок и имя сайта проверяются">🔓 самоподписанный сертификат</span>'
+                            if self_signed else '')
         H.append(f"""<tr class="{'row-err' if is_err else ''}">
             <td>{prefix}<a href="https://{escape(s)}" target="_blank"
-                style="text-decoration:none; color:inherit;"><strong>{escape(s)}</strong></a></td>
+                style="text-decoration:none; color:inherit;"><strong>{escape(s)}</strong></a>{self_signed_html}</td>
             <td><span class="{status_class}">{status_label}</span>{reason_html}</td>
             <td>{st30['upt']}%</td><td>{_fmt_downtime(st30.get('down_sec', 0))}</td><td>{round(v['response_time'], 2)}с</td>
                         <td class="{'txt-err' if 0<=v['ssl_days']<=20 else ''}">{'—' if v['ssl_days'] < 0 else str(v['ssl_days'])+'д'}</td>
-            <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}">
-                {'✅' if v.get('ssl_chain_valid') == True else '❌' if v.get('ssl_chain_valid') == False else '—'}</td>
+            <td class="{'txt-err' if v.get('ssl_chain_valid') == False else 'txt-warn' if self_signed else 'txt-ok' if v.get('ssl_chain_valid') == True else ''}"{' title="Самоподписанный сертификат"' if self_signed and v.get('ssl_chain_valid') != False else ''}>
+                {'❌' if v.get('ssl_chain_valid') == False else '⚠️' if self_signed else '✅' if v.get('ssl_chain_valid') == True else '—'}</td>
             <td class="{'txt-err' if 0<=v['domain_days']<=30 else ''}">{'—' if v['domain_days'] < 0 else str(v['domain_days'])+'д'}</td>
 
             <td><button class="btn-test" onclick="runTest('{s}', this)">

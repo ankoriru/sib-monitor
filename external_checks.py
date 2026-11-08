@@ -119,6 +119,34 @@ def incomplete_chain_only(tls, host):
     return any(_host_matches(n, host) for n in names if n)
 
 
+def _tls_fresh_and_named(tls, host):
+    try:
+        expires = datetime.datetime.fromisoformat(str(tls.get("expiresAt")).replace("Z", "+00:00"))
+        if expires <= datetime.datetime.now(datetime.timezone.utc):
+            return False
+    except (TypeError, ValueError):
+        return False
+    subject = tls.get("subject") or {}
+    names = [n.strip()[4:] for n in str(subject.get("alt", "")).split(",")
+             if n.strip().startswith("DNS:")] or [subject.get("CN") or ""]
+    return any(_host_matches(n, host) for n in names if n)
+
+
+def self_signed_acceptable(tls, host):
+    """Самоподписанный сертификат (или частный корень) не считается ошибкой, если срок
+    действует и имя сайта совпадает. Сайт помечается как самоподписанный."""
+    try:
+        import tls_chain
+    except Exception:
+        return False
+    if tls.get("error") not in tls_chain.GLOBALPING_SELF_SIGNED_ERRORS:
+        return False
+    if not _tls_fresh_and_named(tls, host):
+        return False
+    tls_chain.mark_self_signed(host)
+    return True
+
+
 def parse_measurement(data, host, path, verify_ssl, pattern):
     """Interpret probe data; require TLS evidence even if verification is disabled."""
     checked_at = data.get("createdAt")
@@ -154,7 +182,8 @@ def parse_measurement(data, host, path, verify_ssl, pattern):
             continue
         if not str(tls.get("protocol", "")).startswith("TLS"):
             row["reason"] = "Нет подтверждения TLS-соединения"
-        elif verify_ssl and tls.get("authorized") is not True and not incomplete_chain_only(tls, host):
+        elif verify_ssl and tls.get("authorized") is not True and not incomplete_chain_only(tls, host) \
+                and not self_signed_acceptable(tls, host):
             row.update(status=TLS_ERROR, reason="TLS: цепочка сертификата не подтверждена")
         elif http in (301, 302, 303, 307, 308):
             location = (result.get("headers") or {}).get("location")

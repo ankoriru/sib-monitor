@@ -166,3 +166,154 @@ class SslWorkerRetryTests(unittest.TestCase):
                 patch.object(app.tls_chain, "repair") as repair:
             self.assertEqual(app._check_ssl_sync("site.example", "site.example"), (-1, False))
         repair.assert_not_called()
+
+
+class SelfSignedTests(unittest.TestCase):
+    def setUp(self):
+        key = ec.generate_private_key(ec.SECP256R1())
+        self.cert, _ = make(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "intra.example")]),
+                            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "intra.example")]),
+                            key, False, key, san="intra.example", days=100)
+        for target in ("tls_state", "_self_signed_info"):
+            p = patch.dict(getattr(tls_chain, target), clear=True)
+            p.start(); self.addCleanup(p.stop)
+        p = patch.object(tls_chain, "_leaf_der", return_value=self.cert.public_bytes(Encoding.DER))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_self_signed_error_detection(self):
+        err = ssl.SSLCertVerificationError()
+        err.verify_code, err.verify_message = 18, "self-signed certificate"
+        self.assertTrue(tls_chain.is_self_signed_error(err))
+        err.verify_code, err.verify_message = 19, "self-signed certificate in certificate chain"
+        self.assertTrue(tls_chain.is_self_signed_error(err))
+        err.verify_code, err.verify_message = 20, "unable to get local issuer certificate"
+        self.assertFalse(tls_chain.is_self_signed_error(err))
+
+    def test_valid_self_signed_is_acceptable(self):
+        info = tls_chain.inspect_self_signed("intra.example")
+        self.assertTrue(info["acceptable"])
+        self.assertGreaterEqual(info["days"], 99)
+        self.assertIsNone(tls_chain.self_signed_problem(info))
+
+    def test_hostname_mismatch_rejected(self):
+        info = tls_chain.inspect_self_signed("other.example")
+        self.assertFalse(info["acceptable"])
+        self.assertIn("имени сайта", tls_chain.self_signed_problem(info))
+
+    def test_expired_self_signed_rejected(self):
+        key = ec.generate_private_key(ec.SECP256R1())
+        old, _ = make(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "intra.example")]),
+                      x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "intra.example")]),
+                      key, False, key, san="intra.example", days=-1)
+        with patch.object(tls_chain, "_leaf_der", return_value=old.public_bytes(Encoding.DER)):
+            info = tls_chain.inspect_self_signed("intra.example")
+        self.assertIn("просрочен", tls_chain.self_signed_problem(info))
+
+    def test_ssl_worker_returns_days_and_marks_site(self):
+        import app
+        err = ssl.SSLCertVerificationError("self-signed certificate")
+        err.verify_code = 18
+        bad = unittest.mock.MagicMock()
+        bad.wrap_socket.side_effect = err
+        with patch.object(app.socket, "create_connection"), \
+                patch.object(app.tls_chain, "context", return_value=bad):
+            days, chain = app._check_ssl_sync("intra.example", "intra.example")
+        self.assertGreaterEqual(days, 99)
+        self.assertIsNone(chain)  # не ошибка цепочки
+        self.assertTrue(tls_chain.is_self_signed("intra.example"))
+        tls_chain.mark_trusted("intra.example")
+        self.assertFalse(tls_chain.is_self_signed("intra.example"))
+
+    def test_globalping_self_signed_accepted_and_marked(self):
+        tls = {"authorized": False, "error": "DEPTH_ZERO_SELF_SIGNED_CERT",
+               "subject": {"CN": "intra.example", "alt": "DNS:intra.example"},
+               "expiresAt": (NOW + datetime.timedelta(days=30)).isoformat()}
+        self.assertTrue(external_checks.self_signed_acceptable(tls, "intra.example"))
+        self.assertTrue(tls_chain.is_self_signed("intra.example"))
+        self.assertFalse(external_checks.self_signed_acceptable(tls, "x.example"))
+        self.assertFalse(external_checks.self_signed_acceptable(
+            dict(tls, expiresAt=(NOW - datetime.timedelta(days=1)).isoformat()), "intra.example"))
+        self.assertFalse(external_checks.self_signed_acceptable(
+            dict(tls, error="CERT_HAS_EXPIRED"), "intra.example"))
+
+
+class SelfSignedHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_check_online_with_badge_state(self):
+        import aiohttp
+        import app
+        err = ssl.SSLCertVerificationError("self-signed certificate")
+        err.verify_code = 18
+        exc = aiohttp.ClientConnectorCertificateError(
+            unittest.mock.MagicMock(host="intra.example", port=443, ssl=True), err)
+        ok = unittest.mock.MagicMock(status=200)
+        calls = []
+
+        class CM:
+            def __init__(self, ssl_arg):
+                self.ssl_arg = ssl_arg
+
+            async def __aenter__(self):
+                calls.append(self.ssl_arg)
+                if self.ssl_arg is not False:
+                    raise exc
+                return ok
+
+            async def __aexit__(self, *a):
+                return False
+
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = lambda *a, **kw: CM(kw["ssl"])
+        with patch.dict(tls_chain.tls_state, clear=True), \
+                patch.object(app.tls_chain, "inspect_self_signed",
+                             return_value={"acceptable": True, "valid_now": True,
+                                           "hostname_ok": True, "days": 50}):
+            site, status, _, error = await app.check_single_site(
+                session, "intra.example", __import__("asyncio").Semaphore(1))
+            self.assertTrue(tls_chain.is_self_signed("intra.example"))
+        self.assertEqual((status, error), (200, None))
+        self.assertEqual(calls[-1], False)
+
+    async def test_http_check_rejects_expired_self_signed(self):
+        import aiohttp
+        import app
+        err = ssl.SSLCertVerificationError("self-signed certificate")
+        err.verify_code = 18
+        exc = aiohttp.ClientConnectorCertificateError(
+            unittest.mock.MagicMock(host="intra.example", port=443, ssl=True), err)
+
+        class CM:
+            async def __aenter__(self):
+                raise exc
+
+            async def __aexit__(self, *a):
+                return False
+
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = lambda *a, **kw: CM()
+        with patch.dict(tls_chain.tls_state, clear=True), \
+                patch.object(app.tls_chain, "inspect_self_signed",
+                             return_value={"acceptable": False, "valid_now": False,
+                                           "hostname_ok": True, "days": -3}):
+            _, status, _, error = await app.check_single_site(
+                session, "intra.example", __import__("asyncio").Semaphore(1))
+        self.assertEqual(status, 0)
+        self.assertIn("просрочен", error)
+
+
+class SelfSignedDashboardTests(unittest.TestCase):
+    def test_row_shows_badge_and_is_not_error(self):
+        import app
+        from test_check_diagnostics import dashboard_fixture
+        data = dashboard_fixture()
+        row = data["latest"]["offline.example"]
+        row.update(status=200, check_error=None, ssl_chain_valid=None, ssl_self_signed=True, ssl_days=200)
+        with patch.dict(tls_chain.tls_state, clear=True):
+            html = app._build_body(data)
+        self.assertIn("самоподписанный сертификат", html)
+        part = html[html.index("offline.example"):]
+        part = part[:part.index("</tr>")]
+        self.assertIn("Online", part)
+        self.assertIn("⚠️", part)
+        self.assertNotIn("❌", part)
+        with patch.dict(tls_chain.tls_state, {"offline.example": "trusted"}, clear=True):
+            self.assertNotIn("самоподписанный сертификат", app._build_body(data))
