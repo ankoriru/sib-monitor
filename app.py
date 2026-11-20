@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.20-monitor.13"
+APP_VERSION = "2026.11.21-monitor.14"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -2764,14 +2764,15 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         # HTML-редирект + удаление возможной stale cookie с secure=True
         return HTMLResponse("""<script>document.cookie='admin_session=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;';location.href='/admin/login';</script>""")
     try:
-        return await _admin_page_inner(request, response)
+        # Синхронные запросы к БД — в отдельном потоке, чтобы не блокировать сервер.
+        return await asyncio.to_thread(_admin_page_inner, request, response)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         print(f"[ADMIN PAGE FATAL] {e}\n{tb}")
         return HTMLResponse(f"""<html><body style="padding:20px;font-family:monospace"><h2 style="color:#dc2626">Ошибка: {e}</h2><pre style="background:#fee2e2;padding:15px;border-radius:8px;overflow:auto">{tb}</pre><p><a href="/">← Назад</a></p></body></html>""", status_code=500)
 
-async def _admin_page_inner(request, response):
+def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
@@ -3583,7 +3584,7 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(admin_
 
 
 @app.get("/api/categories")
-async def get_categories(auth: bool = Depends(admin_auth)):
+def get_categories(auth: bool = Depends(admin_auth)):
     """Получить сайты по категориям (динамические из БД)"""
     try:
         conn = get_db_connection()
@@ -3617,7 +3618,7 @@ async def get_categories(auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/site-categories")
-async def list_site_categories(auth: bool = Depends(admin_auth)):
+def list_site_categories(auth: bool = Depends(admin_auth)):
     """Получить список категорий сайтов"""
     try:
         conn = get_db_connection()
@@ -3690,7 +3691,7 @@ async def update_site_category(cat_id: str, request: Request, auth: bool = Depen
 
 
 @app.delete("/api/site-categories/{cat_id}")
-async def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
+def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
     """Удалить категорию (сайты перемещаются в 'external')"""
     try:
         conn = get_db_connection()
@@ -3757,7 +3758,7 @@ def _health_sync():
 
 
 @app.get("/api/sites")
-async def list_sites(auth: bool = Depends(admin_auth)):
+def list_sites(auth: bool = Depends(admin_auth)):
     """Список всех сайтов в мониторинге (без self-monitoring)"""
     try:
         conn = get_db_connection()
@@ -3904,7 +3905,7 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(adm
 
 
 @app.post("/api/sites/{site_name:path}/toggle")
-async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / отключить сайт (toggle is_active)"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -3932,7 +3933,7 @@ async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-email")
-async def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / выключить e-mail оповещение для сайта. Включение — только при заданных адресах."""
     conn = None
     try:
@@ -4024,7 +4025,7 @@ async def email_notifications(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-ssl")
-async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить ssl_verify для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4068,7 +4069,7 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-cm")
-async def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить content_match_enabled для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4166,7 +4167,7 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
 
 
 @app.delete("/api/sites/{site_name:path}")
-async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
+def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Деактивация сайта (is_active=FALSE) + закрытие активных инцидентов"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4194,7 +4195,7 @@ async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/incidents")
-async def get_incidents(auth: bool = Depends(admin_auth)):
+def get_incidents(auth: bool = Depends(admin_auth)):
     """Список всех инцидентов (последние 100)"""
     try:
         conn = get_db_connection()
@@ -4236,7 +4237,7 @@ async def resolve_incident_endpoint(incident_id: int, admin_session: str = Cooki
 # API: Self Monitoring (для админ-панели)
 # ============================================================================
 @app.get("/api/self-monitoring")
-async def api_self_monitoring(auth: bool = Depends(check_auth)):
+def api_self_monitoring(auth: bool = Depends(check_auth)):
     """Данные self-monitoring для админ-панели"""
     try:
         conn = get_db_connection()
@@ -4417,7 +4418,7 @@ async def api_functional(auth: bool = Depends(check_auth)):
 # API для графиков — lazy load фоном после first paint
 # ============================================================================
 @app.get("/api/charts")
-async def api_charts(auth: bool = Depends(check_auth)):
+def api_charts(auth: bool = Depends(check_auth)):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
@@ -4471,15 +4472,55 @@ async def api_charts(auth: bool = Depends(check_auth)):
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
-async def _index_stream():
+DASHBOARD_STATEMENT_TIMEOUT = "45s"  # запросы дашборда не должны висеть бесконечно
+
+
+def _index_stream():
     """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
-    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных."""
+    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных.
+    Генератор синхронный: Starlette выполняет его в пуле потоков, поэтому запросы к БД
+    не блокируют остальные запросы приложения (/health, админку, API)."""
     # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
     yield _build_head()
+    # === CHUNK 2: SQL-запросы (троббер уже крутится) ===
+    try:
+        data = _load_dashboard_data()
+    except Exception as e:
+        print(f"[DASHBOARD ERR] {type(e).__name__}: {str(e)[:300]}", flush=True)
+        yield _dashboard_error_html()
+        return
+    # === CHUNK 3: BODY (когда SQL готов) ===
+    yield _build_body(data)
 
-    # === CHUNK 2: SQL-запросы (это занимает время, троббер уже крутится) ===
+
+def _dashboard_error_html():
+    """Понятное сообщение вместо белой страницы, если данные не загрузились."""
+    return """<script>(function(){var o=document.getElementById('load-overlay');if(o)o.remove();})();</script>
+<body style="font-family:'Segoe UI',sans-serif;background:#f8fafc;color:#1e293b;padding:40px;">
+<div style="max-width:560px;margin:60px auto;background:#fff;border-radius:12px;padding:28px;
+box-shadow:0 4px 6px rgba(0,0,0,.1);text-align:center;">
+<h2 style="color:#b91c1c;margin-top:0;">Не удалось загрузить данные мониторинга</h2>
+<p>База данных ответила с ошибкой или слишком долго. Проверки сайтов продолжаются.</p>
+<button onclick="location.reload()" style="background:#00717a;color:#fff;border:0;border-radius:6px;
+padding:10px 18px;font-size:14px;cursor:pointer;">Обновить страницу</button>
+</div></body></html>"""
+
+
+def _load_dashboard_data():
+    """Все SQL-запросы дашборда. Результат кладётся в кэш и возвращается."""
     conn = get_db_connection()
+    try:
+        return _load_dashboard_data_conn(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_dashboard_data_conn(conn):
     cur = conn.cursor(cursor_factory=DictCursor)
+    cur.execute("SET statement_timeout = %s", (DASHBOARD_STATEMENT_TIMEOUT,))
 
     s30 = _get_stats_from_agg(cur, '30 days')
     s24 = _get_stats_from_agg(cur, '24 hours')
@@ -4725,9 +4766,7 @@ async def _index_stream():
     with _dashboard_cache["lock"]:
         _dashboard_cache["data"] = data
         _dashboard_cache["timestamp"] = time.time()
-
-    # === CHUNK 3: BODY (когда SQL готов) ===
-    yield _build_body(data)
+    return data
 
 
 @app.get("/")
@@ -4803,15 +4842,32 @@ def _build_head() -> str:
         }
         var phaseIdx = 0;
         function advance() {
-            if (phaseIdx < phases.length) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
+            // Последняя фаза «Готово» (100%) — только когда пришли данные (finalize в body).
+            if (phaseIdx < phases.length-1) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
         }
         setProg(0); requestAnimationFrame(tick); setTimeout(advance, 100);
         window.__setLoadProg = setProg;
-        /* Safety hide */
+        /* Долгая загрузка: не скрываем троббер (иначе остаётся белая страница),
+           а сообщаем пользователю, что данные ещё идут; через 60 с — кнопка обновления. */
         setTimeout(function(){
             var o = document.getElementById('load-overlay');
-            if (o && !o.classList.contains('hidden')) { setProg(100); o.classList.add('hidden'); setTimeout(function(){o.remove();},600); }
+            if (o && !o.classList.contains('hidden')) {
+                findEl(); target = 95;
+                if (subTxt) subTxt.textContent = 'Данные загружаются дольше обычного…';
+            }
         }, 8000);
+        setTimeout(function(){
+            var o = document.getElementById('load-overlay');
+            if (o && !o.classList.contains('hidden') && !document.getElementById('load-retry')) {
+                findEl();
+                if (subTxt) subTxt.textContent = 'Сервер долго не отвечает. Проверки сайтов продолжаются.';
+                var btn = document.createElement('button');
+                btn.id = 'load-retry'; btn.textContent = 'Обновить страницу';
+                btn.style.cssText = 'margin-top:16px;background:#00717a;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer';
+                btn.onclick = function(){ location.reload(); };
+                o.appendChild(btn);
+            }
+        }, 60000);
     })();
     </script>"""
         """<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
