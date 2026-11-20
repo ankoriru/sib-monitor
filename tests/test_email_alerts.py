@@ -8,6 +8,7 @@ import app
 import email_alerts as ea
 
 T0 = datetime.datetime(2026, 11, 20, 10, 0, 0)
+SITE = "shop.sibur.ru"  # обычный сайт; srm/tms проверяются отдельно
 CFG = {"enabled": True, "recipients": ["sap_sm@sibur.ru"], "after_min": 15}
 SMTP = {"host": "smtp.example", "port": 587, "security": "starttls", "user": "",
         "password": "", "from": "monitor@example.ru", "timeout": 5}
@@ -33,7 +34,7 @@ class AlerterTests(unittest.TestCase):
                                   config=lambda: SMTP, incident_lookup=lambda s: 42)
 
     def tick(self, minute, status=502, cfg=CFG, **kw):
-        return self.al.observe("srm.sibur.ru", status, cfg,
+        return self.al.observe(SITE, status, cfg,
                                now=T0 + datetime.timedelta(minutes=minute),
                                fail_start=T0, reason="HTTP 502: ошибка шлюза", **kw)
 
@@ -44,7 +45,7 @@ class AlerterTests(unittest.TestCase):
         for m in range(16, 40):
             self.assertIsNone(self.tick(m))
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("[ИНЦИДЕНТ] srm.sibur.ru недоступен более 15 мин", self.sent[0]["Subject"])
+        self.assertIn("[ИНЦИДЕНТ] shop.sibur.ru недоступен более 15 мин", self.sent[0]["Subject"])
         self.assertEqual(self.sent[0]["To"], "sap_sm@sibur.ru")
 
     def test_recovery_mail_threads_to_incident(self):
@@ -52,7 +53,7 @@ class AlerterTests(unittest.TestCase):
         self.assertEqual(self.tick(42, status=200), "up")
         self.assertEqual(len(self.sent), 2)
         up = self.sent[1]
-        self.assertIn("[ВОССТАНОВЛЕН] srm.sibur.ru доступен, простой 42 мин", up["Subject"])
+        self.assertIn("[ВОССТАНОВЛЕН] shop.sibur.ru доступен, простой 42 мин", up["Subject"])
         self.assertEqual(up["In-Reply-To"], self.sent[0]["Message-ID"])
         self.assertIsNone(self.tick(43, status=200))
 
@@ -72,7 +73,7 @@ class AlerterTests(unittest.TestCase):
     def test_unknown_result_is_ignored(self):
         self.tick(15)
         self.assertIsNone(self.tick(16, status=-1))
-        self.assertIsNotNone(self.al.state("srm.sibur.ru"))
+        self.assertIsNotNone(self.al.state(SITE))
 
     def test_failed_send_is_retried_after_pause(self):
         self.fail_send = True
@@ -84,7 +85,7 @@ class AlerterTests(unittest.TestCase):
         self.assertEqual([r[4] for r in self.log], [False, True])
 
     def test_seed_after_restart_avoids_duplicate(self):
-        self.al.seed("srm.sibur.ru", T0 - datetime.timedelta(minutes=30), down_sent=True,
+        self.al.seed(SITE, T0 - datetime.timedelta(minutes=30), down_sent=True,
                      message_id="<x@y>", recipients=["sap_sm@sibur.ru"])
         self.assertIsNone(self.tick(1))
         self.assertEqual(self.tick(5, status=200), "up")
@@ -93,6 +94,84 @@ class AlerterTests(unittest.TestCase):
     def test_incident_number_in_mail(self):
         self.tick(15)
         self.assertIn("#42", self.sent[0].get_body(("plain",)).get_content())
+
+
+class NotificationKindTests(AlerterTests):
+    """monitor.13: отдельные флажки «при инциденте» и «при восстановлении»."""
+
+    def test_both_enabled_by_default(self):
+        self.assertTrue(ea.notify_on_down(CFG) and ea.notify_on_up(CFG))
+        self.assertEqual(self.tick(15), "down")
+        self.assertEqual(self.tick(30, status=200), "up")
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("придёт письмо о восстановлении", self.sent[0].get_body(("plain",)).get_content())
+
+    def test_recovery_disabled_sends_only_incident(self):
+        cfg = dict(CFG, on_up=False)
+        self.assertEqual(self.tick(15, cfg=cfg), "down")
+        self.assertIsNone(self.tick(30, status=200, cfg=cfg))
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("[ИНЦИДЕНТ]", self.sent[0]["Subject"])
+        self.assertIn("не отправляется", self.sent[0].get_body(("plain",)).get_content())
+        self.assertIsNone(self.al.state(SITE))  # простой закрыт
+
+    def test_incident_disabled_sends_only_recovery(self):
+        cfg = dict(CFG, on_down=False)
+        for m in range(40):
+            self.assertIsNone(self.tick(m, cfg=cfg))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.tick(41, status=200, cfg=cfg), "up")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("[ВОССТАНОВЛЕН]", self.sent[0]["Subject"])
+        self.assertIsNone(self.sent[0]["In-Reply-To"])
+
+    def test_incident_disabled_short_outage_sends_nothing(self):
+        cfg = dict(CFG, on_down=False)
+        self.tick(5, cfg=cfg)
+        self.assertIsNone(self.tick(6, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def test_both_disabled_sends_nothing(self):
+        cfg = dict(CFG, on_down=False, on_up=False)
+        self.assertIsNone(self.tick(20, cfg=cfg))
+        self.assertIsNone(self.tick(30, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def test_neither_option_is_allowed_and_sends_nothing(self):
+        cfg = dict(CFG, on_down=False, on_up=False)
+        for m in range(60):
+            self.assertIsNone(self.tick(m, cfg=cfg))
+        self.assertIsNone(self.tick(61, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def _site_tick(self, site, minute, status=502, cfg=CFG):
+        return self.al.observe(site, status, cfg, now=T0 + datetime.timedelta(minutes=minute),
+                               fail_start=T0, reason="HTTP 502: ошибка шлюза")
+
+    def test_srm_tms_incident_only_even_if_recovery_requested(self):
+        self.assertEqual(set(app.EMAIL_NO_RECOVERY_SITES), {"srm.sibur.ru", "tms.sibur.ru"})
+        for site in ("srm.sibur.ru", "tms.sibur.ru"):
+            self.sent.clear()
+            cfg = dict(CFG, on_down=True, on_up=True)  # даже если в БД осталось on_up=TRUE
+            self.assertEqual(self._site_tick(site, 15, cfg=cfg), "down")
+            self.assertIsNone(self._site_tick(site, 40, status=200, cfg=cfg))
+            self.assertEqual(len(self.sent), 1, site)
+            self.assertIn(f"[ИНЦИДЕНТ] {site}", self.sent[0]["Subject"])
+            self.assertIn("не отправляется", self.sent[0].get_body(("plain",)).get_content())
+            self.assertIsNone(self.al.state(site))
+
+    def test_srm_without_incident_option_sends_nothing(self):
+        cfg = dict(CFG, on_down=False, on_up=True)
+        self.assertIsNone(self._site_tick("srm.sibur.ru", 20, cfg=cfg))
+        self.assertIsNone(self._site_tick("srm.sibur.ru", 30, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def test_recovery_allowed(self):
+        self.assertFalse(ea.recovery_allowed("srm.sibur.ru"))
+        self.assertFalse(ea.recovery_allowed("TMS.sibur.ru"))
+        self.assertTrue(ea.recovery_allowed("shop.sibur.ru"))
+        self.assertFalse(ea.notify_on_up({"on_up": True}, "tms.sibur.ru"))
+        self.assertTrue(ea.notify_on_up({}, "shop.sibur.ru"))
 
 
 class FormatTests(unittest.TestCase):
@@ -153,7 +232,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         for name, new in (("batch_buffer", []), ("BATCH_SIZE", 1000),
-                          ("EMAIL_ALERT_CFG", {"srm.sibur.ru": CFG}), ("EMAIL_ALERTS_ENABLED", True)):
+                          ("EMAIL_ALERT_CFG", {"shop.sibur.ru": CFG, "srm.sibur.ru": CFG}), ("EMAIL_ALERTS_ENABLED", True)):
             p = patch.object(app, name, new)
             p.start()
             self.addCleanup(p.stop)
@@ -172,19 +251,28 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.addCleanup(p.stop)
         self.last, self.fails, self.first = {}, {}, {}
 
-    def run_check(self, status, site="srm.sibur.ru"):
+    def run_check(self, status, site="shop.sibur.ru"):
         app._process_site_result(site, status, .1, 90, 100, True, self.last, self.fails,
                                  {}, {site: 5}, self.first, check_error="HTTP 502: ошибка шлюза")
 
     def test_mail_after_15_minutes_and_on_recovery(self):
         self.run_check(502)
-        self.first["srm.sibur.ru"] -= datetime.timedelta(minutes=16)
+        self.first["shop.sibur.ru"] -= datetime.timedelta(minutes=16)
         self.run_check(502)
         self.assertEqual(len(self.sent), 1)
         self.assertIn("ИНЦИДЕНТ", self.sent[0]["Subject"])
         self.run_check(200)
         self.assertEqual(len(self.sent), 2)
         self.assertIn("ВОССТАНОВЛЕН", self.sent[1]["Subject"])
+
+    def test_srm_incident_mail_without_recovery(self):
+        self.run_check(502, site="srm.sibur.ru")
+        self.first["srm.sibur.ru"] -= datetime.timedelta(minutes=16)
+        self.run_check(502, site="srm.sibur.ru")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("ИНЦИДЕНТ", self.sent[0]["Subject"])
+        self.run_check(200, site="srm.sibur.ru")
+        self.assertEqual(len(self.sent), 1)
 
     def test_site_without_email_settings_is_untouched(self):
         self.run_check(502, site="other.example")
