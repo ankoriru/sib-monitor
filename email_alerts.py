@@ -1,9 +1,10 @@
 """E-mail оповещения о длительной недоступности сайтов.
 
-Для каждого сайта в админке задаются: переключатель «оповещать», адреса получателей и
-время простоя в минутах, после которого уходит письмо об инциденте. Письмо об инциденте
+Для каждого сайта в админке задаются: переключатель «оповещать», адреса получателей,
+время простоя в минутах, после которого уходит письмо об инциденте, и отдельные флажки
+«при инциденте» и «при восстановлении» (по умолчанию включены оба). Письмо об инциденте
 отправляется один раз за простой; при восстановлении уходит письмо «восстановлен»
-(ответом в ту же цепочку). Отправка идёт в фоновом потоке и не задерживает проверки.
+(ответом в ту же цепочку, если письмо об инциденте было). Отправка идёт в фоновом потоке и не задерживает проверки.
 
 Почтовый сервер задаётся переменными окружения (секреты не хранятся в БД и коде):
 SMTP_HOST, SMTP_PORT (587), SMTP_SECURITY (starttls | ssl | none), SMTP_USER,
@@ -105,6 +106,16 @@ def smtp_public_status(env=None):
     }
 
 
+def notify_on_down(cfg):
+    """Отправлять письмо при возникновении инцидента (по умолчанию — да)."""
+    return cfg.get("on_down", True) is not False
+
+
+def notify_on_up(cfg):
+    """Отправлять письмо при восстановлении (по умолчанию — да)."""
+    return cfg.get("on_up", True) is not False
+
+
 # ---------------------------------------------------------------------------
 # Формирование писем
 # ---------------------------------------------------------------------------
@@ -180,8 +191,12 @@ def build_down_message(info, recipients, sender, tz=None, dashboard_url=DEFAULT_
     ]
     if info.get("incident_id"):
         rows.append(("Номер инцидента", f"#{info['incident_id']}"))
-    note = ("Сайт проверяется каждую минуту. Когда он снова станет доступен, "
-            "в эту же цепочку придёт письмо о восстановлении.")
+    if info.get("notify_up", True):
+        note = ("Сайт проверяется каждую минуту. Когда он снова станет доступен, "
+                "в эту же цепочку придёт письмо о восстановлении.")
+    else:
+        note = ("Сайт проверяется каждую минуту. Письмо о восстановлении для этого сайта "
+                "не отправляется — следите за состоянием в мониторинге.")
     text = _plain(f"ИНЦИДЕНТ: {site} недоступен", rows, note, dashboard_url)
     html_rows = [(k, f'<b style="color:#b91c1c;">{escape(v)}</b>' if k == "Состояние" else escape(v))
                  for k, v in rows]
@@ -342,7 +357,8 @@ class EmailAlerter:
     # --- основной вход -----------------------------------------------------
     def observe(self, site, status, cfg, now=None, fail_start=None, reason=None,
                 category=None, incident_id=None, global_enabled=True):
-        """cfg: {'enabled': bool, 'recipients': [...], 'after_min': int}.
+        """cfg: {'enabled': bool, 'recipients': [...], 'after_min': int,
+        'on_down': bool, 'on_up': bool} (on_down / on_up по умолчанию True).
         Возвращает 'down' / 'up', если поставлена отправка, иначе None."""
         now = now or datetime.datetime.now()
         if self._unknown is not None and status == self._unknown:
@@ -350,7 +366,7 @@ class EmailAlerter:
         if status != 200:
             return self._on_fail(site, status, cfg, now, fail_start, reason, category,
                                  incident_id, global_enabled)
-        return self._on_ok(site, now)
+        return self._on_ok(site, now, cfg)
 
     def _on_fail(self, site, status, cfg, now, fail_start, reason, category, incident_id,
                  global_enabled):
@@ -363,7 +379,9 @@ class EmailAlerter:
                 st["incident_id"] = incident_id
             recipients = list(cfg.get("recipients") or [])
             after_min = int(cfg.get("after_min") or DEFAULT_AFTER_MIN)
-            if not (global_enabled and cfg.get("enabled") and recipients):
+            on_down = notify_on_down(cfg)
+            on_up = notify_on_up(cfg)
+            if not (global_enabled and cfg.get("enabled") and recipients and (on_down or on_up)):
                 return None
             if st["down"] != "none":
                 return None
@@ -371,18 +389,24 @@ class EmailAlerter:
                 return None
             if st["last_try"] and (now - st["last_try"]).total_seconds() < self._retry:
                 return None
+            if not on_down:
+                # Письмо об инциденте выключено: простой засчитан, ждём восстановления.
+                st["down"], st["recipients"] = "skipped", recipients
+                return None
             st["down"], st["last_try"], st["recipients"] = "pending", now, recipients
             info = {"site": site, "status": status, "reason": reason, "started_at": st["start"],
                     "detected_at": now, "after_min": after_min, "category": category,
-                    "incident_id": st["incident_id"]}
+                    "incident_id": st["incident_id"], "notify_up": on_up}
         self._submit(self._deliver_down, site, info, recipients)
         return "down"
 
-    def _on_ok(self, site, now):
+    def _on_ok(self, site, now, cfg=None):
         with self._lock:
             st = self._state.pop(site, None)
         if not st or st["down"] == "none":
             return None
+        if not notify_on_up(cfg or {}):
+            return None  # письмо о восстановлении для сайта выключено
         info = {"site": site, "started_at": st["start"], "resolved_at": now,
                 "last_status": st["last_status"], "last_reason": st["last_reason"],
                 "incident_id": st["incident_id"]}

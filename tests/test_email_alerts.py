@@ -95,6 +95,51 @@ class AlerterTests(unittest.TestCase):
         self.assertIn("#42", self.sent[0].get_body(("plain",)).get_content())
 
 
+class NotificationKindTests(AlerterTests):
+    """monitor.13: отдельные флажки «при инциденте» и «при восстановлении»."""
+
+    def test_both_enabled_by_default(self):
+        self.assertTrue(ea.notify_on_down(CFG) and ea.notify_on_up(CFG))
+        self.assertEqual(self.tick(15), "down")
+        self.assertEqual(self.tick(30, status=200), "up")
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("придёт письмо о восстановлении", self.sent[0].get_body(("plain",)).get_content())
+
+    def test_recovery_disabled_sends_only_incident(self):
+        cfg = dict(CFG, on_up=False)
+        self.assertEqual(self.tick(15, cfg=cfg), "down")
+        self.assertIsNone(self.tick(30, status=200, cfg=cfg))
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("[ИНЦИДЕНТ]", self.sent[0]["Subject"])
+        self.assertIn("не отправляется", self.sent[0].get_body(("plain",)).get_content())
+        self.assertIsNone(self.al.state("srm.sibur.ru"))  # простой закрыт
+
+    def test_incident_disabled_sends_only_recovery(self):
+        cfg = dict(CFG, on_down=False)
+        for m in range(40):
+            self.assertIsNone(self.tick(m, cfg=cfg))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.tick(41, status=200, cfg=cfg), "up")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("[ВОССТАНОВЛЕН]", self.sent[0]["Subject"])
+        self.assertIsNone(self.sent[0]["In-Reply-To"])
+
+    def test_incident_disabled_short_outage_sends_nothing(self):
+        cfg = dict(CFG, on_down=False)
+        self.tick(5, cfg=cfg)
+        self.assertIsNone(self.tick(6, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def test_both_disabled_sends_nothing(self):
+        cfg = dict(CFG, on_down=False, on_up=False)
+        self.assertIsNone(self.tick(20, cfg=cfg))
+        self.assertIsNone(self.tick(30, status=200, cfg=cfg))
+        self.assertEqual(self.sent, [])
+
+    def test_srm_tms_seeded_without_recovery(self):
+        self.assertEqual(set(app.EMAIL_ALERT_NO_RECOVERY_SEED), {"srm.sibur.ru", "tms.sibur.ru"})
+
+
 class FormatTests(unittest.TestCase):
     def test_parse_recipients(self):
         self.assertEqual(ea.parse_recipients("sap_sm@sibur.ru; a@b.ru, A@B.ru"),
