@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.14"
+APP_VERSION = "2026.11.20-monitor.12"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -63,12 +63,10 @@ RETIRED_SELF_MONITORING_SITES = ("sib-monitor-ankori.amvera.io",)
 TG_ALERTS_ENABLED = True
 TG_SSL_REPORT_ENABLED = True
 EMAIL_ALERTS_ENABLED = True  # общий выключатель e-mail оповещений (app_settings)
-EMAIL_ALERT_CFG = {}  # site -> {'enabled', 'recipients', 'after_min', 'on_down', 'on_up'}; обновляется каждый цикл
+EMAIL_ALERT_CFG = {}  # site -> {'enabled', 'recipients', 'after_min'}; обновляется каждый цикл
 EMAIL_SITE_CATEGORY = {}  # site -> название категории для письма
 # Сайты, для которых оповещение по e-mail включается при первом запуске monitor.12
 EMAIL_ALERT_SEED = (("srm.sibur.ru", "sap_sm@sibur.ru", 15), ("tms.sibur.ru", "sap_sm@sibur.ru", 15))
-# monitor.13: для этих сайтов письмо о восстановлении не отправляется (однократно, далее — из админки)
-EMAIL_ALERT_NO_RECOVERY_SEED = ("srm.sibur.ru", "tms.sibur.ru")
 
 # --- Content match для Ключевых сайтов ---
 # re.IGNORECASE: sibur/SIBUR/Sibur/сибур/СИБУР/Сибур — любой регистр
@@ -444,22 +442,6 @@ def _seed_email_alert_sites(cur):
     print(f"[INIT] E-mail alerts enabled for: {', '.join(s for s, _, _ in EMAIL_ALERT_SEED)}")
 
 
-def _seed_email_alert_no_recovery(cur):
-    """Однократно выключает письмо о восстановлении для EMAIL_ALERT_NO_RECOVERY_SEED."""
-    cur.execute("SELECT 1 FROM app_meta WHERE key = 'email_alert_seed_v2'")
-    if cur.fetchone():
-        return
-    cur.execute("""
-        UPDATE monitored_sites SET email_alert_on_down = TRUE, email_alert_on_up = FALSE
-        WHERE site = ANY(%s)
-    """, (list(EMAIL_ALERT_NO_RECOVERY_SEED),))
-    cur.execute("""
-        INSERT INTO app_meta (key, value, updated_at) VALUES ('email_alert_seed_v2', %s, NOW())
-        ON CONFLICT (key) DO NOTHING
-    """, (APP_VERSION,))
-    print(f"[INIT] E-mail recovery notice disabled for: {', '.join(EMAIL_ALERT_NO_RECOVERY_SEED)}")
-
-
 def init_db():
     """Инициализация БД с поддержкой партиционирования + incidents + health + ssl_chain"""
     conn = get_db_connection()
@@ -691,12 +673,6 @@ def init_db():
     if not _column_exists(cur, 'monitored_sites', 'email_alert_after_min'):
         cur.execute(f"ALTER TABLE monitored_sites ADD COLUMN email_alert_after_min INTEGER DEFAULT {email_alerts.DEFAULT_AFTER_MIN}")
         print("[INIT] Migrated: added email_alert_after_min column")
-    # Отдельные письма: при инциденте и при восстановлении (monitor.13), по умолчанию оба.
-    for col in ('email_alert_on_down', 'email_alert_on_up'):
-        if not _column_exists(cur, 'monitored_sites', col):
-            cur.execute(f"ALTER TABLE monitored_sites ADD COLUMN {col} BOOLEAN DEFAULT TRUE")
-            print(f"[INIT] Migrated: added {col} column")
-        cur.execute(f"UPDATE monitored_sites SET {col} = TRUE WHERE {col} IS NULL")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS email_notifications (
             id SERIAL PRIMARY KEY,
@@ -832,7 +808,6 @@ def init_db():
     if cur.rowcount > 0:
         print(f"[INIT] Seeded app_settings: {cur.rowcount} defaults")
     _seed_email_alert_sites(cur)
-    _seed_email_alert_no_recovery(cur)
 
     conn.commit()
     cur.close()
@@ -1899,14 +1874,13 @@ email_alerter = email_alerts.EmailAlerter(
 
 
 def load_email_alert_config():
-    """site -> {'enabled', 'recipients', 'after_min', 'on_down', 'on_up'} и site -> категория."""
+    """site -> {'enabled', 'recipients', 'after_min'} и site -> название категории."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT m.site, m.email_alert_enabled, m.email_alert_to, m.email_alert_after_min,
-                       COALESCE(c.label, m.site_group),
-                       COALESCE(m.email_alert_on_down, TRUE), COALESCE(m.email_alert_on_up, TRUE)
+                       COALESCE(c.label, m.site_group)
                 FROM monitored_sites m LEFT JOIN site_categories c ON c.id = m.site_group
                 WHERE m.is_active = TRUE
             """)
@@ -1914,14 +1888,13 @@ def load_email_alert_config():
     finally:
         conn.close()
     cfg, cats = {}, {}
-    for site, enabled, to, after_min, cat, on_down, on_up in rows:
+    for site, enabled, to, after_min, cat in rows:
         try:
             recipients = email_alerts.parse_recipients(to)
         except ValueError:
             recipients = []
         cfg[site] = {"enabled": bool(enabled), "recipients": recipients,
-                     "after_min": after_min or email_alerts.DEFAULT_AFTER_MIN,
-                     "on_down": bool(on_down), "on_up": bool(on_up)}
+                     "after_min": after_min or email_alerts.DEFAULT_AFTER_MIN}
         cats[site] = cat
     return cfg, cats
 
@@ -2764,19 +2737,18 @@ async def admin_page(request: Request, response: Response, admin_session: str = 
         # HTML-редирект + удаление возможной stale cookie с secure=True
         return HTMLResponse("""<script>document.cookie='admin_session=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;';location.href='/admin/login';</script>""")
     try:
-        # Синхронные запросы к БД — в отдельном потоке, чтобы не блокировать сервер.
-        return await asyncio.to_thread(_admin_page_inner, request, response)
+        return await _admin_page_inner(request, response)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         print(f"[ADMIN PAGE FATAL] {e}\n{tb}")
         return HTMLResponse(f"""<html><body style="padding:20px;font-family:monospace"><h2 style="color:#dc2626">Ошибка: {e}</h2><pre style="background:#fee2e2;padding:15px;border-radius:8px;overflow:auto">{tb}</pre><p><a href="/">← Назад</a></p></body></html>""", status_code=500)
 
-def _admin_page_inner(request, response):
+async def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, email_alert_enabled, email_alert_to, email_alert_after_min, email_alert_on_down, email_alert_on_up, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, email_alert_enabled, email_alert_to, email_alert_after_min, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT id, label FROM site_categories ORDER BY sort_order")
         cat_rows = [dict(r) for r in cur.fetchall()]
@@ -2889,13 +2861,8 @@ def _admin_page_inner(request, response):
         site_esc = r['site'].replace("'", "\\'")
         email_to = r.get('email_alert_to') or ''
         email_after = r.get('email_alert_after_min') or email_alerts.DEFAULT_AFTER_MIN
-        email_on_down = r.get('email_alert_on_down') is not False
-        email_on_up = r.get('email_alert_on_up') is not False
-        email_kinds = (["инцидент"] if email_on_down else []) + (["восстановление"] if email_on_up else [])
-        email_kinds_txt = " + ".join(email_kinds) if email_kinds else "письма не выбраны"
         if r.get('email_alert_enabled') and email_to:
-            email_status = (f"📧 Вкл · &gt;{email_after} мин<br><small style='color:#64748b'>{email_kinds_txt}</small>"
-                            f"<br><small style='color:#64748b'>{escape(email_to)}</small>")
+            email_status = f"📧 Вкл · &gt;{email_after} мин<br><small style='color:#64748b'>{escape(email_to)}</small>"
         elif email_to:
             email_status = f"🔕 Выкл<br><small style='color:#94a3b8'>{escape(email_to)}</small>"
         else:
@@ -2930,14 +2897,7 @@ def _admin_page_inner(request, response):
                                min="1" max="60" step="1" required aria-label="Таймаут HTTP, секунды" style="width:70px;">
                     </label>
                     <label style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
-                        <input type="checkbox" id="email-on-{site_esc}" {'checked' if r.get('email_alert_enabled') else ''}
-                               onchange="emailEnableChanged('{site_esc}')"> 📧 Оповещать по e-mail
-                    </label>
-                    <label style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
-                        <input type="checkbox" id="email-down-{site_esc}" {'checked' if email_on_down else ''}> при возникновении инцидента
-                    </label>
-                    <label style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
-                        <input type="checkbox" id="email-up-{site_esc}" {'checked' if email_on_up else ''}> при восстановлении
+                        <input type="checkbox" id="email-on-{site_esc}" {'checked' if r.get('email_alert_enabled') else ''}> 📧 Оповещать по e-mail
                     </label>
                     <input type="text" id="email-to-{site_esc}" value="{escape(email_to)}" placeholder="адрес@sibur.ru; второй@sibur.ru"
                            aria-label="Адреса e-mail для оповещения" style="width:100%;min-width:200px;box-sizing:border-box;">
@@ -3439,17 +3399,10 @@ def _admin_page_inner(request, response):
         const email_alert_enabled = document.getElementById('email-on-' + site).checked;
         const email_alert_to = document.getElementById('email-to-' + site).value.trim();
         const email_alert_after_min = Number(emailAfterInput.value);
-        const email_alert_on_down = document.getElementById('email-down-' + site).checked;
-        const email_alert_on_up = document.getElementById('email-up-' + site).checked;
-        if (email_alert_enabled && !email_alert_on_down && !email_alert_on_up) {
-            showToast('Выберите хотя бы одно письмо: при инциденте или при восстановлении');
-            return;
-        }
         const r = await fetch('/api/sites/' + encodeURIComponent(site), {
             method:'PUT', credentials: 'include', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({group, threshold, http_timeout_seconds,
-                                  email_alert_enabled, email_alert_to, email_alert_after_min,
-                                  email_alert_on_down, email_alert_on_up})
+                                  email_alert_enabled, email_alert_to, email_alert_after_min})
         });
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
@@ -3466,13 +3419,6 @@ def _admin_page_inner(request, response):
         const data = await r.json();
         if (data.status === 'ok') { location.reload(); }
         else { showToast(data.msg || 'Ошибка'); }
-    }
-    window.emailEnableChanged = function(site) {
-        // По умолчанию при включении оповещения отмечены оба письма.
-        const on = document.getElementById('email-on-' + site).checked;
-        const down = document.getElementById('email-down-' + site);
-        const up = document.getElementById('email-up-' + site);
-        if (on && !down.checked && !up.checked) { down.checked = true; up.checked = true; }
     }
     window.toggleEmail = async function(site) {
         const r = await fetch('/api/sites/' + encodeURIComponent(site) + '/toggle-email', {method:'POST', credentials: 'include'});
@@ -3584,7 +3530,7 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(admin_
 
 
 @app.get("/api/categories")
-def get_categories(auth: bool = Depends(admin_auth)):
+async def get_categories(auth: bool = Depends(admin_auth)):
     """Получить сайты по категориям (динамические из БД)"""
     try:
         conn = get_db_connection()
@@ -3618,7 +3564,7 @@ def get_categories(auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/site-categories")
-def list_site_categories(auth: bool = Depends(admin_auth)):
+async def list_site_categories(auth: bool = Depends(admin_auth)):
     """Получить список категорий сайтов"""
     try:
         conn = get_db_connection()
@@ -3691,7 +3637,7 @@ async def update_site_category(cat_id: str, request: Request, auth: bool = Depen
 
 
 @app.delete("/api/site-categories/{cat_id}")
-def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
+async def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
     """Удалить категорию (сайты перемещаются в 'external')"""
     try:
         conn = get_db_connection()
@@ -3758,12 +3704,12 @@ def _health_sync():
 
 
 @app.get("/api/sites")
-def list_sites(auth: bool = Depends(admin_auth)):
+async def list_sites(auth: bool = Depends(admin_auth)):
     """Список всех сайтов в мониторинге (без self-monitoring)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
-        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, email_alert_enabled, email_alert_to, email_alert_after_min, email_alert_on_down, email_alert_on_up, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
+        cur.execute("SELECT site, site_group, is_active, alert_threshold, ssl_verify, content_match_enabled, http_timeout_seconds, email_alert_enabled, email_alert_to, email_alert_after_min, created_at FROM monitored_sites WHERE site_group != 'self' ORDER BY site_group, site")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -3870,16 +3816,6 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(adm
                 raise ValueError("email_alert_enabled: true или false")
             fields.append("email_alert_enabled = %s")
             values.append(data["email_alert_enabled"])
-        for key in ("email_alert_on_down", "email_alert_on_up"):
-            if key in data:
-                if not isinstance(data[key], bool):
-                    raise ValueError(f"{key}: true или false")
-                fields.append(f"{key} = %s")
-                values.append(data[key])
-        if (data.get("email_alert_enabled") and "email_alert_on_down" in data
-                and "email_alert_on_up" in data
-                and not data["email_alert_on_down"] and not data["email_alert_on_up"]):
-            raise ValueError("Выберите хотя бы одно письмо: при инциденте или при восстановлении")
         if not fields:
             raise ValueError("Не указаны настройки для изменения")
         if site_name in SELF_MONITORING_SITES:
@@ -3905,7 +3841,7 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(adm
 
 
 @app.post("/api/sites/{site_name:path}/toggle")
-def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
+async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / отключить сайт (toggle is_active)"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -3933,7 +3869,7 @@ def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-email")
-def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
+async def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / выключить e-mail оповещение для сайта. Включение — только при заданных адресах."""
     conn = None
     try:
@@ -3942,8 +3878,8 @@ def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
         conn = get_db_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT email_alert_enabled, email_alert_to, email_alert_on_down, email_alert_on_up "
-                            "FROM monitored_sites WHERE site = %s", (site_name,))
+                cur.execute("SELECT email_alert_enabled, email_alert_to FROM monitored_sites WHERE site = %s",
+                            (site_name,))
                 row = cur.fetchone()
                 if row is None:
                     return JSONResponse({"status": "error", "msg": "Site not found"}, status_code=404)
@@ -3954,10 +3890,6 @@ def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
                                         status_code=400)
                 cur.execute("UPDATE monitored_sites SET email_alert_enabled = %s WHERE site = %s",
                             (new_value, site_name))
-                if new_value and row[2] is False and row[3] is False:
-                    # По умолчанию включаются оба письма: при инциденте и при восстановлении.
-                    cur.execute("UPDATE monitored_sites SET email_alert_on_down = TRUE, "
-                                "email_alert_on_up = TRUE WHERE site = %s", (site_name,))
         return {"status": "ok", "email_alert_enabled": new_value,
                 "msg": f"E-mail оповещение для '{site_name}' {'включено' if new_value else 'выключено'}"}
     except ValueError as e:
@@ -4025,7 +3957,7 @@ async def email_notifications(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-ssl")
-def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
+async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить ssl_verify для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4069,7 +4001,7 @@ def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-cm")
-def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
+async def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить content_match_enabled для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4167,7 +4099,7 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
 
 
 @app.delete("/api/sites/{site_name:path}")
-def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
+async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Деактивация сайта (is_active=FALSE) + закрытие активных инцидентов"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4195,7 +4127,7 @@ def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/incidents")
-def get_incidents(auth: bool = Depends(admin_auth)):
+async def get_incidents(auth: bool = Depends(admin_auth)):
     """Список всех инцидентов (последние 100)"""
     try:
         conn = get_db_connection()
@@ -4237,7 +4169,7 @@ async def resolve_incident_endpoint(incident_id: int, admin_session: str = Cooki
 # API: Self Monitoring (для админ-панели)
 # ============================================================================
 @app.get("/api/self-monitoring")
-def api_self_monitoring(auth: bool = Depends(check_auth)):
+async def api_self_monitoring(auth: bool = Depends(check_auth)):
     """Данные self-monitoring для админ-панели"""
     try:
         conn = get_db_connection()
@@ -4418,7 +4350,7 @@ async def api_functional(auth: bool = Depends(check_auth)):
 # API для графиков — lazy load фоном после first paint
 # ============================================================================
 @app.get("/api/charts")
-def api_charts(auth: bool = Depends(check_auth)):
+async def api_charts(auth: bool = Depends(check_auth)):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
@@ -4472,55 +4404,15 @@ def api_charts(auth: bool = Depends(check_auth)):
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
-DASHBOARD_STATEMENT_TIMEOUT = "45s"  # запросы дашборда не должны висеть бесконечно
-
-
-def _index_stream():
+async def _index_stream():
     """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
-    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных.
-    Генератор синхронный: Starlette выполняет его в пуле потоков, поэтому запросы к БД
-    не блокируют остальные запросы приложения (/health, админку, API)."""
+    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных."""
     # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
     yield _build_head()
-    # === CHUNK 2: SQL-запросы (троббер уже крутится) ===
-    try:
-        data = _load_dashboard_data()
-    except Exception as e:
-        print(f"[DASHBOARD ERR] {type(e).__name__}: {str(e)[:300]}", flush=True)
-        yield _dashboard_error_html()
-        return
-    # === CHUNK 3: BODY (когда SQL готов) ===
-    yield _build_body(data)
 
-
-def _dashboard_error_html():
-    """Понятное сообщение вместо белой страницы, если данные не загрузились."""
-    return """<script>(function(){var o=document.getElementById('load-overlay');if(o)o.remove();})();</script>
-<body style="font-family:'Segoe UI',sans-serif;background:#f8fafc;color:#1e293b;padding:40px;">
-<div style="max-width:560px;margin:60px auto;background:#fff;border-radius:12px;padding:28px;
-box-shadow:0 4px 6px rgba(0,0,0,.1);text-align:center;">
-<h2 style="color:#b91c1c;margin-top:0;">Не удалось загрузить данные мониторинга</h2>
-<p>База данных ответила с ошибкой или слишком долго. Проверки сайтов продолжаются.</p>
-<button onclick="location.reload()" style="background:#00717a;color:#fff;border:0;border-radius:6px;
-padding:10px 18px;font-size:14px;cursor:pointer;">Обновить страницу</button>
-</div></body></html>"""
-
-
-def _load_dashboard_data():
-    """Все SQL-запросы дашборда. Результат кладётся в кэш и возвращается."""
+    # === CHUNK 2: SQL-запросы (это занимает время, троббер уже крутится) ===
     conn = get_db_connection()
-    try:
-        return _load_dashboard_data_conn(conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _load_dashboard_data_conn(conn):
     cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute("SET statement_timeout = %s", (DASHBOARD_STATEMENT_TIMEOUT,))
 
     s30 = _get_stats_from_agg(cur, '30 days')
     s24 = _get_stats_from_agg(cur, '24 hours')
@@ -4766,7 +4658,9 @@ def _load_dashboard_data_conn(conn):
     with _dashboard_cache["lock"]:
         _dashboard_cache["data"] = data
         _dashboard_cache["timestamp"] = time.time()
-    return data
+
+    # === CHUNK 3: BODY (когда SQL готов) ===
+    yield _build_body(data)
 
 
 @app.get("/")
@@ -4842,32 +4736,15 @@ def _build_head() -> str:
         }
         var phaseIdx = 0;
         function advance() {
-            // Последняя фаза «Готово» (100%) — только когда пришли данные (finalize в body).
-            if (phaseIdx < phases.length-1) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
+            if (phaseIdx < phases.length) { target = phases[phaseIdx].t; phaseIdx++; setTimeout(advance, 250+Math.random()*400); }
         }
         setProg(0); requestAnimationFrame(tick); setTimeout(advance, 100);
         window.__setLoadProg = setProg;
-        /* Долгая загрузка: не скрываем троббер (иначе остаётся белая страница),
-           а сообщаем пользователю, что данные ещё идут; через 60 с — кнопка обновления. */
+        /* Safety hide */
         setTimeout(function(){
             var o = document.getElementById('load-overlay');
-            if (o && !o.classList.contains('hidden')) {
-                findEl(); target = 95;
-                if (subTxt) subTxt.textContent = 'Данные загружаются дольше обычного…';
-            }
+            if (o && !o.classList.contains('hidden')) { setProg(100); o.classList.add('hidden'); setTimeout(function(){o.remove();},600); }
         }, 8000);
-        setTimeout(function(){
-            var o = document.getElementById('load-overlay');
-            if (o && !o.classList.contains('hidden') && !document.getElementById('load-retry')) {
-                findEl();
-                if (subTxt) subTxt.textContent = 'Сервер долго не отвечает. Проверки сайтов продолжаются.';
-                var btn = document.createElement('button');
-                btn.id = 'load-retry'; btn.textContent = 'Обновить страницу';
-                btn.style.cssText = 'margin-top:16px;background:#00717a;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer';
-                btn.onclick = function(){ location.reload(); };
-                o.appendChild(btn);
-            }
-        }, 60000);
     })();
     </script>"""
         """<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
