@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.16"
+APP_VERSION = "2026.11.21-monitor.17"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -4576,13 +4576,8 @@ def api_charts(auth: bool = Depends(check_auth)):
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
-def _index_stream():
-    """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
-    Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных."""
-    # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
-    yield _build_head()
-
-    # === CHUNK 2: SQL-запросы (это занимает время, троббер уже крутится) ===
+def _build_dashboard_data():
+    """Все SQL-запросы главной страницы; результат кладётся в _dashboard_cache."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
@@ -4654,18 +4649,29 @@ def _index_stream():
         """, (SELF_MONITORING_SITES,))
         self_stats = {r['site']: r for r in cur.fetchall()}
 
+    # Сначала суммы по сайтам, затем один раз подставляем группу (раньше подзапрос
+    # к site_categories выполнялся для каждой из ~400 тыс. строк: 54 с на проде, monitor.17)
     cur.execute("""
-        SELECT 
-            COALESCE((SELECT sort_order FROM site_categories WHERE id = ms.site_group), 2) as grp,
-            ROUND(SUM(ca.status_200_count) * 100.0 
-                  / NULLIF(SUM(ca.checks_count), 0)::numeric, 2) as upt,
-            ROUND((SUM(ca.avg_response_time * ca.checks_count) 
-                  / NULLIF(SUM(ca.checks_count), 0))::numeric, 3) as resp
-        FROM checks_agg ca
-        JOIN monitored_sites ms ON ca.site = ms.site
-        WHERE ca.bucket > NOW() - INTERVAL '30 days'
-          AND ca.site <> ALL(%s)
-        GROUP BY grp
+        WITH per_site AS (
+            SELECT site,
+                SUM(status_200_count) AS ok_cnt,
+                SUM(checks_count) AS cnt,
+                SUM(avg_response_time * checks_count) AS rt_sum
+            FROM checks_agg
+            WHERE bucket > NOW() - INTERVAL '30 days'
+              AND site <> ALL(%s)
+            GROUP BY site
+        )
+        SELECT
+            COALESCE(sc.sort_order, 2) as grp,
+            ROUND(SUM(p.ok_cnt) * 100.0
+                  / NULLIF(SUM(p.cnt), 0)::numeric, 2) as upt,
+            ROUND((SUM(p.rt_sum)
+                  / NULLIF(SUM(p.cnt), 0))::numeric, 3) as resp
+        FROM per_site p
+        JOIN monitored_sites ms ON p.site = ms.site
+        LEFT JOIN site_categories sc ON sc.id = ms.site_group
+        GROUP BY 1
     """, (SELF_MONITORING_SITES,))
     group_agg_rows = cur.fetchall()
     if group_agg_rows and group_agg_rows[0][0] is not None:
@@ -4673,15 +4679,16 @@ def _index_stream():
     else:
         cur.execute("""
             SELECT 
-                COALESCE((SELECT sort_order FROM site_categories WHERE id = ms.site_group), 2) as grp,
+                COALESCE(sc.sort_order, 2) as grp,
                 ROUND(COUNT(*) FILTER (WHERE l.status = 200) * 100.0
                       / NULLIF(COUNT(*), 0)::numeric, 2) as upt,
                 ROUND(AVG(l.response_time)::numeric, 3) as resp
             FROM logs l
             JOIN monitored_sites ms ON l.site = ms.site
+            LEFT JOIN site_categories sc ON sc.id = ms.site_group
             WHERE l.timestamp > NOW() - INTERVAL '30 days'
               AND l.site <> ALL(%s)
-            GROUP BY grp
+            GROUP BY 1
         """, (SELF_MONITORING_SITES,))
         group_agg = {r['grp']: r for r in cur.fetchall()}
 
@@ -4830,6 +4837,32 @@ def _index_stream():
     with _dashboard_cache["lock"]:
         _dashboard_cache["data"] = data
         _dashboard_cache["timestamp"] = time.time()
+
+    # === CHUNK 3: BODY (когда SQL готов) ===
+    return data
+
+
+_dashboard_build_lock = threading.Lock()
+
+
+def _index_stream():
+    """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
+    Расчёт данных выполняется одним запросом за раз: если страницу одновременно открыли
+    несколько пользователей, остальные ждут готовый результат, а не запускают те же
+    тяжёлые SQL параллельно (это перегружало БД, monitor.17)."""
+    # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
+    yield _build_head()
+
+    # === CHUNK 2: SQL (троббер уже крутится) ===
+    requested_at = time.time()
+    with _dashboard_build_lock:
+        with _dashboard_cache["lock"]:
+            ready = _dashboard_cache["data"]
+            ready_at = _dashboard_cache["timestamp"]
+        if ready and ready_at >= requested_at:
+            data = ready          # собрано параллельным запросом, пока мы ждали
+        else:
+            data = _build_dashboard_data()
 
     # === CHUNK 3: BODY (когда SQL готов) ===
     yield _build_body(data)
