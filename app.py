@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.17"
+APP_VERSION = "2026.11.21-monitor.18"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -151,6 +151,37 @@ class _SlowRequestLog:
 app.add_middleware(_SlowRequestLog)
 
 
+def _log_db_table_stats():
+    """Одна строка [DB STATS] на таблицу при старте: размер, живые/мёртвые строки, автоочистка."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT relname, pg_size_pretty(pg_total_relation_size(relid)), n_live_tup, n_dead_tup,
+                   last_autovacuum, last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE relname IN ('checks_agg', 'logs', 'incidents', 'latest_status')
+            ORDER BY pg_total_relation_size(relid) DESC
+        """)
+        for name, size, live, dead, vac, ana in cur.fetchall():
+            print(f"[DB STATS] {name}: size={size} live={live} dead={dead} "
+                  f"last_autovacuum={vac} last_autoanalyze={ana}", flush=True)
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[DB STATS] недоступно: {type(e).__name__}: {e}", flush=True)
+
+
+def _warm_dashboard_caches():
+    """Прогрев тяжёлой статистики при старте, чтобы первый посетитель не ждал."""
+    _log_db_table_stats()
+    for cache in (_heavy_stats, _charts_cache):
+        try:
+            cache.get()
+        except Exception as e:
+            print(f"[CACHE ERROR] {cache.name}: {type(e).__name__}: {e}", flush=True)
+
+
 _loop_lag_task = None
 
 
@@ -174,6 +205,55 @@ BATCH_LOCK = threading.Lock()
 # КЭШ DASHBOARD — храним dict с данными (не HTML-строку)
 _dashboard_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
 CACHE_TTL = 30
+HEAVY_STATS_TTL = int(os.getenv("HEAVY_STATS_TTL", "300"))  # с: обновление 30-дневной статистики
+
+
+class _StaleCache:
+    """Результат тяжёлого расчёта в памяти (monitor.18).
+    Если он старше ttl — отдаётся имеющийся, а обновление идёт в фоне (не больше одного
+    одновременно). Синхронно считается только самый первый раз после старта."""
+
+    def __init__(self, name, compute, ttl, on_refresh=None):
+        self.name, self.compute, self.ttl, self.on_refresh = name, compute, ttl, on_refresh
+        self.data, self.timestamp = None, 0.0
+        self._first_lock = threading.Lock()
+        self._refreshing = threading.Lock()
+
+    def _run(self):
+        t0 = time.monotonic()
+        data = self.compute()
+        self.data, self.timestamp = data, time.time()
+        print(f"[CACHE] {self.name} обновлено за {time.monotonic() - t0:.1f}s", flush=True)
+        return data
+
+    def refresh_in_background(self):
+        if not self._refreshing.acquire(blocking=False):
+            return False
+
+        def _bg():
+            try:
+                self._run()
+                if self.on_refresh:
+                    self.on_refresh()
+            except Exception as e:
+                print(f"[CACHE ERROR] {self.name}: {type(e).__name__}: {e}", flush=True)
+            finally:
+                self._refreshing.release()
+        threading.Thread(target=_bg, name=f"cache-{self.name}", daemon=True).start()
+        return True
+
+    def get(self):
+        data = self.data
+        if data is None:
+            with self._first_lock:
+                if self.data is None:
+                    return self._run()
+                return self.data
+        if time.time() - self.timestamp > self.ttl:
+            self.refresh_in_background()
+        return data
+
+
 
 # ============================================================================
 # PLAYWRIGHT SCREENSHOT QUEUE — thread-safe воркер
@@ -2746,6 +2826,7 @@ async def startup_event():
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
     threading.Thread(target=release_digest_worker, daemon=True).start()
+    threading.Thread(target=_warm_dashboard_caches, name="cache-warmup", daemon=True).start()
     global _loop_lag_task
     _loop_lag_task = asyncio.create_task(_loop_lag_watchdog())
     # Временный диагностический проход: отдельный поток, без записи рабочих результатов.
@@ -4523,6 +4604,11 @@ def api_functional(auth: bool = Depends(check_auth)):
 # ============================================================================
 @app.get("/api/charts")
 def api_charts(auth: bool = Depends(check_auth)):
+    return JSONResponse(_charts_cache.get())
+
+
+def _compute_charts():
+    """Дневные графики аптайма и времени ответа за 30 дней (кэшируются, monitor.18)."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
@@ -4569,20 +4655,120 @@ def api_charts(auth: bool = Depends(check_auth)):
 
     cur.close()
     conn.close()
-    return JSONResponse(data)
+    return data
+
+
+_charts_cache = _StaleCache("charts-30d", _compute_charts, HEAVY_STATS_TTL)
 
 
 # ============================================================================
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
+def _compute_heavy_stats():
+    """Тяжёлые агрегаты главной страницы по checks_agg за 24 часа и 30 дней (monitor.18).
+    Запросы те же, что раньше выполнялись при каждом открытии главной; на проде каждый
+    занимал ~10 с, поэтому результат держится в памяти и обновляется в фоне."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor(cursor_factory=DictCursor)
+        s30 = _get_stats_from_agg(cur, '30 days')
+        s24 = _get_stats_from_agg(cur, '24 hours')
+
+        cur.execute("""
+            SELECT site,
+                ROUND(SUM(status_200_count) * 100.0
+                      / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
+                COALESCE(SUM(down_sec), 0) as down_sec
+            FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
+              AND site <> ALL(%s)
+            GROUP BY site
+        """, (SELF_MONITORING_SITES,))
+        stats_rows = cur.fetchall()
+        if stats_rows and stats_rows[0][0] is not None:
+            stats = {r['site']: r for r in stats_rows}
+        else:
+            cur.execute("""
+                SELECT site,
+                    ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
+                           / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
+                    COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
+                FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
+                  AND site <> ALL(%s)
+                GROUP BY site
+            """, (SELF_MONITORING_SITES,))
+            stats = {r['site']: r for r in cur.fetchall()}
+
+        # Сначала суммы по сайтам, затем один раз подставляем группу (раньше подзапрос
+        # к site_categories выполнялся для каждой из ~400 тыс. строк: 54 с на проде, monitor.17)
+        cur.execute("""
+            WITH per_site AS (
+                SELECT site,
+                    SUM(status_200_count) AS ok_cnt,
+                    SUM(checks_count) AS cnt,
+                    SUM(avg_response_time * checks_count) AS rt_sum
+                FROM checks_agg
+                WHERE bucket > NOW() - INTERVAL '30 days'
+                  AND site <> ALL(%s)
+                GROUP BY site
+            )
+            SELECT
+                COALESCE(sc.sort_order, 2) as grp,
+                ROUND(SUM(p.ok_cnt) * 100.0
+                      / NULLIF(SUM(p.cnt), 0)::numeric, 2) as upt,
+                ROUND((SUM(p.rt_sum)
+                      / NULLIF(SUM(p.cnt), 0))::numeric, 3) as resp
+            FROM per_site p
+            JOIN monitored_sites ms ON p.site = ms.site
+            LEFT JOIN site_categories sc ON sc.id = ms.site_group
+            GROUP BY 1
+        """, (SELF_MONITORING_SITES,))
+        group_agg_rows = cur.fetchall()
+        if group_agg_rows and group_agg_rows[0][0] is not None:
+            group_agg = {r['grp']: r for r in group_agg_rows}
+        else:
+            cur.execute("""
+                SELECT 
+                    COALESCE(sc.sort_order, 2) as grp,
+                    ROUND(COUNT(*) FILTER (WHERE l.status = 200) * 100.0
+                          / NULLIF(COUNT(*), 0)::numeric, 2) as upt,
+                    ROUND(AVG(l.response_time)::numeric, 3) as resp
+                FROM logs l
+                JOIN monitored_sites ms ON l.site = ms.site
+                LEFT JOIN site_categories sc ON sc.id = ms.site_group
+                WHERE l.timestamp > NOW() - INTERVAL '30 days'
+                  AND l.site <> ALL(%s)
+                GROUP BY 1
+            """, (SELF_MONITORING_SITES,))
+            group_agg = {r['grp']: r for r in cur.fetchall()}
+
+        cur.close()
+    finally:
+        conn.close()
+    data = {
+        "s30": s30, "s24": s24,
+        "stats": {k: dict(v) for k, v in stats.items()},
+        "group_agg": {k: dict(v) for k, v in group_agg.items()},
+    }
+    return data
+
+
+_heavy_stats = _StaleCache("dashboard-30d", _compute_heavy_stats, HEAVY_STATS_TTL,
+                           on_refresh=lambda: _invalidate_dashboard_cache())
+
+
+def _get_heavy_stats():
+    return _heavy_stats.get()
+
+
 def _build_dashboard_data():
     """Все SQL-запросы главной страницы; результат кладётся в _dashboard_cache."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
-    s30 = _get_stats_from_agg(cur, '30 days')
-    s24 = _get_stats_from_agg(cur, '24 hours')
+    heavy = _get_heavy_stats()
+    s30, s24 = heavy["s30"], heavy["s24"]
+    stats, group_agg = heavy["stats"], heavy["group_agg"]
 
     # Загружаем активные сайты из БД (не используем глобальный SITES)
     cur.execute("SELECT site FROM monitored_sites WHERE is_active = TRUE AND site_group != 'self'")
@@ -4600,97 +4786,6 @@ def _build_dashboard_data():
     for s in latest:
         if latest[s].get('status') == 401:
             latest[s]['status'] = 200
-
-    cur.execute("""
-        SELECT site,
-            ROUND(SUM(status_200_count) * 100.0
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            COALESCE(SUM(down_sec), 0) as down_sec
-        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
-          AND site <> ALL(%s)
-        GROUP BY site
-    """, (SELF_MONITORING_SITES,))
-    stats_rows = cur.fetchall()
-    if stats_rows and stats_rows[0][0] is not None:
-        stats = {r['site']: r for r in stats_rows}
-    else:
-        cur.execute("""
-            SELECT site,
-                ROUND((COUNT(*) FILTER (WHERE status = 200) * 100.0
-                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                COUNT(*) FILTER (WHERE status != 200) * 60 as down_sec
-            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-              AND site <> ALL(%s)
-            GROUP BY site
-        """, (SELF_MONITORING_SITES,))
-        stats = {r['site']: r for r in cur.fetchall()}
-
-    cur.execute("""
-        SELECT site,
-            ROUND(SUM(CASE WHEN status_200_count > 0 OR last_ssl_days IS NULL THEN checks_count ELSE status_200_count END) * 100.0
-                  / NULLIF(SUM(checks_count), 0)::numeric, 2) as upt,
-            COALESCE(SUM(down_sec), 0) as down_sec
-        FROM checks_agg WHERE bucket > NOW() - INTERVAL '30 days'
-          AND site = ANY(%s)
-        GROUP BY site
-    """, (SELF_MONITORING_SITES,))
-    self_stats_rows = cur.fetchall()
-    if self_stats_rows and self_stats_rows[0][0] is not None:
-        self_stats = {r['site']: r for r in self_stats_rows}
-    else:
-        cur.execute("""
-            SELECT site,
-                ROUND((COUNT(*) FILTER (WHERE status = 200 OR status = 401) * 100.0
-                       / NULLIF(COUNT(*), 0))::numeric, 2) as upt,
-                COUNT(*) FILTER (WHERE status != 200 AND status != 401) * 60 as down_sec
-            FROM logs WHERE timestamp > NOW() - INTERVAL '30 days'
-              AND site = ANY(%s)
-            GROUP BY site
-        """, (SELF_MONITORING_SITES,))
-        self_stats = {r['site']: r for r in cur.fetchall()}
-
-    # Сначала суммы по сайтам, затем один раз подставляем группу (раньше подзапрос
-    # к site_categories выполнялся для каждой из ~400 тыс. строк: 54 с на проде, monitor.17)
-    cur.execute("""
-        WITH per_site AS (
-            SELECT site,
-                SUM(status_200_count) AS ok_cnt,
-                SUM(checks_count) AS cnt,
-                SUM(avg_response_time * checks_count) AS rt_sum
-            FROM checks_agg
-            WHERE bucket > NOW() - INTERVAL '30 days'
-              AND site <> ALL(%s)
-            GROUP BY site
-        )
-        SELECT
-            COALESCE(sc.sort_order, 2) as grp,
-            ROUND(SUM(p.ok_cnt) * 100.0
-                  / NULLIF(SUM(p.cnt), 0)::numeric, 2) as upt,
-            ROUND((SUM(p.rt_sum)
-                  / NULLIF(SUM(p.cnt), 0))::numeric, 3) as resp
-        FROM per_site p
-        JOIN monitored_sites ms ON p.site = ms.site
-        LEFT JOIN site_categories sc ON sc.id = ms.site_group
-        GROUP BY 1
-    """, (SELF_MONITORING_SITES,))
-    group_agg_rows = cur.fetchall()
-    if group_agg_rows and group_agg_rows[0][0] is not None:
-        group_agg = {r['grp']: r for r in group_agg_rows}
-    else:
-        cur.execute("""
-            SELECT 
-                COALESCE(sc.sort_order, 2) as grp,
-                ROUND(COUNT(*) FILTER (WHERE l.status = 200) * 100.0
-                      / NULLIF(COUNT(*), 0)::numeric, 2) as upt,
-                ROUND(AVG(l.response_time)::numeric, 3) as resp
-            FROM logs l
-            JOIN monitored_sites ms ON l.site = ms.site
-            LEFT JOIN site_categories sc ON sc.id = ms.site_group
-            WHERE l.timestamp > NOW() - INTERVAL '30 days'
-              AND l.site <> ALL(%s)
-            GROUP BY 1
-        """, (SELF_MONITORING_SITES,))
-        group_agg = {r['grp']: r for r in cur.fetchall()}
 
     cur.execute("""
         SELECT site, start_time,
