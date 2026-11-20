@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.15"
+APP_VERSION = "2026.11.21-monitor.16"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -122,6 +122,47 @@ STDO_SITES = ["icenter.tdms.nipigas.ru/cp/", "tdms.progress-epc.ru/cp/", "icente
 EXTERNAL_SITES = [s for s in SITES if s not in KEY_SITES and s not in STDO_SITES]
 
 app = FastAPI()
+
+
+class _SlowRequestLog:
+    """ASGI-middleware: пишет в лог HTTP-запросы дольше SLOW_HTTP_SEC (без изменения ответа)."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        t0 = time.monotonic()
+        status = {"code": None}
+
+        async def _send(message):
+            if message.get("type") == "http.response.start":
+                status["code"] = message.get("status")
+            await send(message)
+        try:
+            await self.app(scope, receive, _send)
+        finally:
+            dt = time.monotonic() - t0
+            if dt >= SLOW_HTTP_SEC:
+                print(f"[SLOW HTTP] {dt:.1f}s {scope.get('method')} {scope.get('path')} -> {status['code']}",
+                      flush=True)
+
+
+app.add_middleware(_SlowRequestLog)
+
+
+_loop_lag_task = None
+
+
+async def _loop_lag_watchdog():
+    """Пишет в лог, если event loop был занят дольше LOOP_LAG_SEC (сервер не отвечал никому)."""
+    step = 0.5
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(step)
+        lag = time.monotonic() - t0 - step
+        if lag >= LOOP_LAG_SEC:
+            print(f"[LOOP LAG] event loop был занят {lag:.1f}s", flush=True)
 
 # ============================================================================
 # BATCH-BUFFER для накопления результатов (Этап 2.1)
@@ -286,10 +327,72 @@ def admin_auth(request: Request, response: Response, admin_session: str = Cookie
 DB_CONNECT_TIMEOUT = 10  # с: недоступная БД не должна вешать воркеры и /health
 
 
+SLOW_SQL_SEC = float(os.getenv("SLOW_SQL_SEC", "2"))        # порог записи [SLOW SQL] в лог
+SLOW_HTTP_SEC = float(os.getenv("SLOW_HTTP_SEC", "3"))      # порог записи [SLOW HTTP] в лог
+LOOP_LAG_SEC = float(os.getenv("LOOP_LAG_SEC", "1"))        # порог записи [LOOP LAG] в лог
+_timed_cursor_classes = {}
+
+
+def _sql_label(query) -> str:
+    if isinstance(query, bytes):
+        query = query.decode("utf-8", "replace")
+    return " ".join(str(query).split())[:160]
+
+
+def _timed_cursor_class(base):
+    """Подкласс курсора, который пишет в лог запросы дольше SLOW_SQL_SEC."""
+    cls = _timed_cursor_classes.get(base)
+    if cls is None:
+        class _Timed(base):
+            def execute(self, query, vars=None):
+                t0 = time.monotonic()
+                try:
+                    return super().execute(query, vars)
+                finally:
+                    dt = time.monotonic() - t0
+                    if dt >= SLOW_SQL_SEC:
+                        print(f"[SLOW SQL] {dt:.1f}s thread={threading.current_thread().name} {_sql_label(query)}",
+                              flush=True)
+        _Timed.__name__ = f"Timed{base.__name__}"
+        cls = _timed_cursor_classes[base] = _Timed
+    return cls
+
+
+class _TimedConnection(psycopg2.extensions.connection):
+    def cursor(self, *args, **kwargs):
+        base = kwargs.get("cursor_factory") or self.cursor_factory or psycopg2.extensions.cursor
+        kwargs["cursor_factory"] = _timed_cursor_class(base)
+        return super().cursor(*args, **kwargs)
+
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT,
+    t0 = time.monotonic()
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT,
                             keepalives=1, keepalives_idle=30, keepalives_interval=10,
-                            keepalives_count=3)
+                            keepalives_count=3, connection_factory=_TimedConnection)
+    dt = time.monotonic() - t0
+    if dt >= SLOW_SQL_SEC:
+        print(f"[SLOW SQL] {dt:.1f}s connect thread={threading.current_thread().name}", flush=True)
+    return conn
+
+
+class _BadJSON:
+    def __init__(self, error):
+        self.error = error
+
+
+async def _json_body(request: Request):
+    """Читает JSON в event loop, чтобы сам обработчик мог быть синхронным (работать в пуле потоков)."""
+    try:
+        return await request.json()
+    except Exception as e:
+        return _BadJSON(e)
+
+
+def _json_data(body):
+    if isinstance(body, _BadJSON):
+        raise body.error
+    return body
 
 
 def load_active_sites():
@@ -2643,6 +2746,8 @@ async def startup_event():
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
     threading.Thread(target=release_digest_worker, daemon=True).start()
+    global _loop_lag_task
+    _loop_lag_task = asyncio.create_task(_loop_lag_watchdog())
     # Временный диагностический проход: отдельный поток, без записи рабочих результатов.
     if os.getenv("NETWORK_DIAGNOSTICS_ENABLED", "1") == "1":
         threading.Thread(target=run_diagnostics, name="network-diagnostics", daemon=True).start()
@@ -2656,7 +2761,7 @@ async def startup_event():
 # ENDPOINTS
 # ============================================================================
 @app.get('/favicon.ico', include_in_schema=False)
-async def favicon():
+def favicon():
     file_path = 'favicon.ico'
     if os.path.exists(file_path):
         return FileResponse(file_path)
@@ -2700,7 +2805,7 @@ async def test_screen(site_name: str, auth: bool = Depends(check_auth)):
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
-async def admin_login_page():
+def admin_login_page():
     """Страница входа в админ-панель"""
     return """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Вход — Управление</title>
@@ -2730,10 +2835,10 @@ async def admin_login_page():
 
 
 @app.post("/admin/auth")
-async def admin_login_handler(request: Request, response: Response):
+def admin_login_handler(request: Request, response: Response, body=Depends(_json_body)):
     """Проверка пароля для админ-панели"""
     try:
-        data = await request.json()
+        data = _json_data(body)
         pwd = data.get("password", "")
         if bcrypt.checkpw(pwd.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
             response.set_cookie(
@@ -2750,20 +2855,20 @@ async def admin_login_handler(request: Request, response: Response):
 
 
 @app.get("/admin/page", response_class=HTMLResponse)
-async def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
+def admin_page(request: Request, response: Response, admin_session: str = Cookie(None)):
     """Страница управления сайтами (требует admin-пароль) + Self Monitoring"""
     if admin_session != "authenticated_admin":
         # HTML-редирект + удаление возможной stale cookie с secure=True
         return HTMLResponse("""<script>document.cookie='admin_session=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;';location.href='/admin/login';</script>""")
     try:
-        return await _admin_page_inner(request, response)
+        return _admin_page_inner(request, response)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         print(f"[ADMIN PAGE FATAL] {e}\n{tb}")
         return HTMLResponse(f"""<html><body style="padding:20px;font-family:monospace"><h2 style="color:#dc2626">Ошибка: {e}</h2><pre style="background:#fee2e2;padding:15px;border-radius:8px;overflow:auto">{tb}</pre><p><a href="/">← Назад</a></p></body></html>""", status_code=500)
 
-async def _admin_page_inner(request, response):
+def _admin_page_inner(request, response):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=DictCursor)
@@ -3528,7 +3633,7 @@ async def _admin_page_inner(request, response):
 # API: Настройки приложения (content match, названия категорий, Telegram-флаги)
 # ============================================================================
 @app.get("/api/settings")
-async def get_settings(auth: bool = Depends(admin_auth)):
+def get_settings(auth: bool = Depends(admin_auth)):
     """Получить все настройки приложения"""
     try:
         return {"status": "ok", "settings": load_settings()}
@@ -3537,10 +3642,10 @@ async def get_settings(auth: bool = Depends(admin_auth)):
 
 
 @app.put("/api/settings/{key}")
-async def update_setting(key: str, request: Request, auth: bool = Depends(admin_auth)):
+def update_setting(key: str, request: Request, body=Depends(_json_body), auth: bool = Depends(admin_auth)):
     """Обновить одну настройку (content_match_pattern, category_*_label, tg_*_enabled)"""
     try:
-        data = await request.json()
+        data = _json_data(body)
         value = data.get("value", "").strip()
         allowed_keys = {
             'content_match_pattern',
@@ -3579,7 +3684,7 @@ async def update_setting(key: str, request: Request, auth: bool = Depends(admin_
 
 
 @app.get("/api/categories")
-async def get_categories(auth: bool = Depends(admin_auth)):
+def get_categories(auth: bool = Depends(admin_auth)):
     """Получить сайты по категориям (динамические из БД)"""
     try:
         conn = get_db_connection()
@@ -3613,7 +3718,7 @@ async def get_categories(auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/site-categories")
-async def list_site_categories(auth: bool = Depends(admin_auth)):
+def list_site_categories(auth: bool = Depends(admin_auth)):
     """Получить список категорий сайтов"""
     try:
         conn = get_db_connection()
@@ -3628,10 +3733,10 @@ async def list_site_categories(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/site-categories")
-async def create_site_category(request: Request, auth: bool = Depends(admin_auth)):
+def create_site_category(request: Request, body=Depends(_json_body), auth: bool = Depends(admin_auth)):
     """Создать новую категорию сайтов"""
     try:
-        data = await request.json()
+        data = _json_data(body)
         cat_id = data.get("id", "").strip().lower()
         label = data.get("label", "").strip()
         cm_enabled = data.get("content_match_enabled", False)
@@ -3659,10 +3764,10 @@ async def create_site_category(request: Request, auth: bool = Depends(admin_auth
 
 
 @app.put("/api/site-categories/{cat_id}")
-async def update_site_category(cat_id: str, request: Request, auth: bool = Depends(admin_auth)):
+def update_site_category(cat_id: str, request: Request, body=Depends(_json_body), auth: bool = Depends(admin_auth)):
     """Обновить категорию сайтов"""
     try:
-        data = await request.json()
+        data = _json_data(body)
         label = data.get("label", "").strip()
         cm_enabled = data.get("content_match_enabled")
         sort_order = data.get("sort_order")
@@ -3686,7 +3791,7 @@ async def update_site_category(cat_id: str, request: Request, auth: bool = Depen
 
 
 @app.delete("/api/site-categories/{cat_id}")
-async def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
+def delete_site_category(cat_id: str, auth: bool = Depends(admin_auth)):
     """Удалить категорию (сайты перемещаются в 'external')"""
     try:
         conn = get_db_connection()
@@ -3753,7 +3858,7 @@ def _health_sync():
 
 
 @app.get("/api/sites")
-async def list_sites(auth: bool = Depends(admin_auth)):
+def list_sites(auth: bool = Depends(admin_auth)):
     """Список всех сайтов в мониторинге (без self-monitoring)"""
     try:
         conn = get_db_connection()
@@ -3768,10 +3873,10 @@ async def list_sites(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites")
-async def add_site(request: Request, auth: bool = Depends(admin_auth)):
+def add_site(request: Request, body=Depends(_json_body), auth: bool = Depends(admin_auth)):
     """Добавить сайт в мониторинг"""
     try:
-        data = await request.json()
+        data = _json_data(body)
         site = data.get("site", "").strip()
         group = data.get("group", "external")
         threshold = int(data.get("threshold", 5))
@@ -3831,11 +3936,11 @@ async def add_site(request: Request, auth: bool = Depends(admin_auth)):
         return JSONResponse({"status": "error", "msg": str(e)}, status_code=500)
 
 @app.put("/api/sites/{site_name:path}")
-async def update_site(site_name: str, request: Request, auth: bool = Depends(admin_auth)):
+def update_site(site_name: str, request: Request, body=Depends(_json_body), auth: bool = Depends(admin_auth)):
     """Обновить группу, порог и таймаут; не трогать SSL/CM и рабочие результаты."""
     conn = None
     try:
-        data = await request.json()
+        data = _json_data(body)
         group = data.get("group")
         threshold = data.get("threshold")
         fields, values = [], []
@@ -3900,7 +4005,7 @@ async def update_site(site_name: str, request: Request, auth: bool = Depends(adm
 
 
 @app.post("/api/sites/{site_name:path}/toggle")
-async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / отключить сайт (toggle is_active)"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -3928,7 +4033,7 @@ async def toggle_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-email")
-async def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
     """Включить / выключить e-mail оповещение для сайта. Включение — только при заданных адресах."""
     conn = None
     try:
@@ -3966,7 +4071,7 @@ async def toggle_site_email(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/email/status")
-async def email_status(auth: bool = Depends(admin_auth)):
+def email_status(auth: bool = Depends(admin_auth)):
     """Состояние почтового сервера (без пароля)."""
     return {"status": "ok", "smtp": email_alerts.smtp_public_status()}
 
@@ -4021,7 +4126,7 @@ async def email_notifications(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-ssl")
-async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить ssl_verify для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4065,7 +4170,7 @@ async def toggle_site_ssl(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/sites/{site_name:path}/toggle-cm")
-async def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
+def toggle_site_cm(site_name: str, auth: bool = Depends(admin_auth)):
     """Переключить content_match_enabled для сайта"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4102,15 +4207,18 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
             return JSONResponse({"status": "error", "msg": "site required"}, status_code=400)
         # Load current pattern from DB if not provided
         if not pattern:
-            settings = load_settings()
+            settings = await asyncio.to_thread(load_settings)
             pattern = settings.get('content_match_pattern', 'sibur|сибур')
         # Check SSL setting for this site
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT ssl_verify, http_timeout_seconds FROM monitored_sites WHERE site = %s", (site,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        def _site_row():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT ssl_verify, http_timeout_seconds FROM monitored_sites WHERE site = %s", (site,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            return row
+        row = await asyncio.to_thread(_site_row)
         verify_ssl = row[0] if row and row[0] is not None else True
         timeout_seconds = _effective_http_timeout(row[1] if row else None)
         # Make HTTP request
@@ -4163,7 +4271,7 @@ async def test_content_match(request: Request, auth: bool = Depends(admin_auth))
 
 
 @app.delete("/api/sites/{site_name:path}")
-async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
+def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
     """Деактивация сайта (is_active=FALSE) + закрытие активных инцидентов"""
     try:
         if site_name in SELF_MONITORING_SITES:
@@ -4191,7 +4299,7 @@ async def delete_site(site_name: str, auth: bool = Depends(admin_auth)):
 
 
 @app.get("/api/incidents")
-async def get_incidents(auth: bool = Depends(admin_auth)):
+def get_incidents(auth: bool = Depends(admin_auth)):
     """Список всех инцидентов (последние 100)"""
     try:
         conn = get_db_connection()
@@ -4215,7 +4323,7 @@ async def get_incidents(auth: bool = Depends(admin_auth)):
 
 
 @app.post("/api/incidents/{incident_id}/resolve")
-async def resolve_incident_endpoint(incident_id: int, admin_session: str = Cookie(None)):
+def resolve_incident_endpoint(incident_id: int, admin_session: str = Cookie(None)):
     """Ручное закрытие инцидента по ID (требует admin-пароль)"""
     if admin_session != "authenticated_admin":
         return JSONResponse({"status": "error", "msg": "Требуется авторизация в админке"}, status_code=401)
@@ -4233,7 +4341,7 @@ async def resolve_incident_endpoint(incident_id: int, admin_session: str = Cooki
 # API: Self Monitoring (для админ-панели)
 # ============================================================================
 @app.get("/api/self-monitoring")
-async def api_self_monitoring(auth: bool = Depends(check_auth)):
+def api_self_monitoring(auth: bool = Depends(check_auth)):
     """Данные self-monitoring для админ-панели"""
     try:
         conn = get_db_connection()
@@ -4397,7 +4505,7 @@ def _get_stats_from_agg(cur, interval: str):
 
 
 @app.get("/api/functional")
-async def api_functional(auth: bool = Depends(check_auth)):
+def api_functional(auth: bool = Depends(check_auth)):
     """Отдает содержимое FUNCTIONAL.md — документацию функционала"""
     try:
         md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FUNCTIONAL.md")
@@ -4414,7 +4522,7 @@ async def api_functional(auth: bool = Depends(check_auth)):
 # API для графиков — lazy load фоном после first paint
 # ============================================================================
 @app.get("/api/charts")
-async def api_charts(auth: bool = Depends(check_auth)):
+def api_charts(auth: bool = Depends(check_auth)):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
 
@@ -4468,7 +4576,7 @@ async def api_charts(auth: bool = Depends(check_auth)):
 # DASHBOARD — shell (KPI + таблица + инциденты + календарь)
 # Графики подгружаются фоном через /api/charts
 # ============================================================================
-async def _index_stream():
+def _index_stream():
     """Генератор: мгновенно yield-ит head с троббером, потом SQL, потом body.
     Браузер получает <head> за миллисекунды — троббер показывается ДО загрузки данных."""
     # === CHUNK 1: HEAD + INLINE SPINNER (мгновенно) ===
@@ -4728,7 +4836,7 @@ async def _index_stream():
 
 
 @app.get("/")
-async def index(auth: bool = Depends(check_auth)):
+def index(auth: bool = Depends(check_auth)):
     """StreamingResponse: троббер показывается мгновенно, данные приходят потом."""
     global _dashboard_cache
     now = time.time()

@@ -86,14 +86,13 @@ class TimeoutRequestTests(unittest.IsolatedAsyncioTestCase):
         for endpoint in (app.add_site, app.update_site):
             for value in (None, True, 0, 61, 8.5, "bad"):
                 request = MagicMock()
-                request.json = AsyncMock(return_value={
-                    "site": "example.org", "http_timeout_seconds": value})
+                body = {"site": "example.org", "http_timeout_seconds": value}
                 with self.subTest(endpoint=endpoint.__name__, value=value), \
                         patch.object(app, "get_db_connection") as db:
                     if endpoint is app.add_site:
-                        response = await endpoint(request, auth=True)
+                        response = endpoint(request, body=body, auth=True)
                     else:
-                        response = await endpoint("example.org", request, auth=True)
+                        response = endpoint("example.org", request, body=body, auth=True)
                     self.assertEqual(response.status_code, 400)
                     db.assert_not_called()
 
