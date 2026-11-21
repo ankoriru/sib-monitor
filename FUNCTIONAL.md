@@ -1,6 +1,6 @@
 === ПОЛНОЕ ОПИСАНИЕ ФУНКЦИОНАЛА ===
 
-Версия: 2026.11.21-monitor.18
+Версия: 2026.11.21-monitor.19
 Обновляется при каждом релизе (правило RULES.md). История изменений — CHANGELOG.md,
 порядок проверок релиза — QA_QC.md.
 
@@ -350,6 +350,20 @@
     считается только первый раз; при старте поток cache-warmup прогревает кэш и пишет
     [DB STATS] (размер, живые/мёртвые строки, автоочистка checks_agg, logs, incidents,
     latest_status). Неиспользуемый запрос self_stats из сборки главной удалён.
+19. Обслуживание checks_agg (monitor.19, модуль db_maintenance): на проде [DB STATS] показал
+    checks_agg 640 МБ при ~70 МБ данных и last_autovacuum=None — UPSERT воркера оставляет
+    старые версии строк, автоочистка не срабатывала. Для таблицы задаются fillfactor=80 и
+    autovacuum/analyze scale_factor=0.02, threshold=1000. Расписание (МСК): ежедневно 03:20
+    VACUUM (ANALYZE) — без блокировок; по воскресеньям 04:30 VACUUM (FULL, ANALYZE) — запись в
+    таблицу ждёт до его окончания; при первом запуске monitor.19 — однократный VACUUM FULL в
+    потоке cache-warmup до прогрева кэша. Пропущенный слот выполняется при следующей проверке
+    (поток db-maintenance, раз в минуту); время выполнения хранится в app_meta
+    (maint_checks_agg_vacuum_last, maint_checks_agg_vacuum_full_last). lock_timeout 60 с,
+    statement_timeout 20 мин; после ошибки повтор не раньше чем через 30 мин. В лог пишутся
+    [DB MAINT] с размером до/после и [DB MAINT ERROR]. Переменные: DB_MAINT_ENABLED (1),
+    DB_MAINT_DAILY_HOUR/MINUTE, DB_MAINT_FULL_WEEKDAY/HOUR/MINUTE. Тест:
+    tests/test_db_maintenance.py. Исправлено предупреждение «[STARTUP WARN] Pattern update:
+    tuple index out of range» (экранирование % в LIKE).
     Тест: tests/test_stale_cache.py.
 
 === ПРОВЕРКА РЕГРЕССИЙ ===

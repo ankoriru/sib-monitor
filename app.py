@@ -23,6 +23,7 @@ from network_diagnostics import run_diagnostics
 import tls_chain
 import release_digest
 import email_alerts
+import db_maintenance
 from external_checks import checker as external_checker, UNKNOWN as CHECK_UNKNOWN
 import external_checks
 from psycopg2.extras import DictCursor, execute_values
@@ -37,7 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.18"
+APP_VERSION = "2026.11.21-monitor.19"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -173,8 +174,17 @@ def _log_db_table_stats():
 
 
 def _warm_dashboard_caches():
-    """Прогрев тяжёлой статистики при старте, чтобы первый посетитель не ждал."""
+    """Прогрев тяжёлой статистики при старте, чтобы первый посетитель не ждал.
+
+    Перед прогревом — обслуживание checks_agg, если оно положено по расписанию
+    (в том числе однократный VACUUM FULL при первом запуске monitor.19).
+    """
     _log_db_table_stats()
+    try:
+        if db_maintenance.run_if_due(get_db_connection, datetime.datetime.now(TZ_MOSCOW)):
+            _log_db_table_stats()
+    except Exception as e:
+        print(f"[DB MAINT ERROR] старт: {type(e).__name__}: {e}", flush=True)
     for cache in (_heavy_stats, _charts_cache):
         try:
             cache.get()
@@ -2690,6 +2700,24 @@ def release_digest_worker():
 # ============================================================================
 # ROTATION WORKER (Этап 1)
 # ============================================================================
+def db_maintenance_worker():
+    """Регулярное обслуживание checks_agg: ежедневно VACUUM (ANALYZE) в 03:20 МСК,
+    по воскресеньям VACUUM FULL в 04:30 МСК (см. db_maintenance). После ошибки —
+    повтор не раньше чем через 30 минут."""
+    time.sleep(300)  # стартовое обслуживание выполняет поток cache-warmup
+    retry_after = 0.0
+    while True:
+        if time.monotonic() >= retry_after:
+            try:
+                action = db_maintenance.run_if_due(get_db_connection, datetime.datetime.now(TZ_MOSCOW))
+                if action:
+                    retry_after = time.monotonic() + 1800
+            except Exception as e:
+                print(f"[DB MAINT ERROR] {type(e).__name__}: {e}", flush=True)
+                retry_after = time.monotonic() + 1800
+        time.sleep(60)
+
+
 def rotation_worker():
     """Ежедневная ротация логов в 03:00 МСК + создание партиций"""
     while True:
@@ -2735,7 +2763,7 @@ async def startup_event():
             new_pattern_v2 = 'sibur|сибур|логин|пароль|login|username|password|вход|войти|auth|authorization|транспорт|заказ|spnego|configured|browser|401|unauthorized|refresh'
             cur.execute("""
                 UPDATE app_settings SET value = %s
-                WHERE key = 'content_match_pattern' AND value NOT LIKE '%spnego%'
+                WHERE key = 'content_match_pattern' AND value NOT LIKE '%%spnego%%'
             """, (new_pattern_v2,))
             if cur.rowcount > 0:
                 print(f"[STARTUP] Content match pattern updated to v2 ({cur.rowcount} rows)")
@@ -2825,6 +2853,7 @@ async def startup_event():
     threading.Thread(target=ssl_whois_worker, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
     threading.Thread(target=rotation_worker, daemon=True).start()
+    threading.Thread(target=db_maintenance_worker, name="db-maintenance", daemon=True).start()
     threading.Thread(target=release_digest_worker, daemon=True).start()
     threading.Thread(target=_warm_dashboard_caches, name="cache-warmup", daemon=True).start()
     global _loop_lag_task
