@@ -48,6 +48,15 @@ class DueActionTests(unittest.TestCase):
         full = datetime.datetime(2026, 11, 22, 1, 31, tzinfo=datetime.timezone.utc)  # 04:31 МСК
         self.assertIsNone(m.due_action(msk(2026, 11, 22, 5, 0), None, full))
 
+    def test_retention_not_applied_forces_full(self):
+        full = msk(2026, 11, 21, 3, 25)
+        self.assertEqual(m.due_action(msk(2026, 11, 21, 3, 30), full, full, retention_done=False), "full")
+        self.assertIsNone(m.due_action(msk(2026, 11, 21, 3, 30), full, full, retention_done=True))
+
+    def test_retention_floor(self):
+        self.assertGreaterEqual(m.RETENTION_DAYS, 31)
+        self.assertEqual(m.RETENTION_DAYS, 90)
+
     def test_parse_ts(self):
         self.assertIsNone(m._parse_ts(None))
         self.assertIsNone(m._parse_ts("мусор"))
@@ -60,6 +69,7 @@ class _Cur:
         self.fail_on = fail_on
         self.reloptions = reloptions
         self._last = None
+        self.rowcount = 0
 
     def execute(self, q, vars=None):
         self.sql.append(q)
@@ -102,6 +112,8 @@ class RunTests(unittest.TestCase):
         self.assertIn("ALTER TABLE checks_agg SET (", joined)
         self.assertIn("fillfactor = 80", joined)
         self.assertIn("VACUUM (FULL, ANALYZE) checks_agg", joined)
+        self.assertIn("DELETE FROM checks_agg", joined)
+        self.assertLess(joined.index("DELETE FROM checks_agg"), joined.index("VACUUM (FULL"))
         self.assertTrue(any(m.META_FULL in str(q) or "app_meta" in q for q in cur.sql))
         self.assertTrue(any("готово" in l for l in logs))
 
@@ -141,8 +153,11 @@ class PostgreSQLMaintenanceTests(unittest.TestCase):
             cur.execute("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMP)")
             cur.execute("CREATE TABLE checks_agg (site TEXT, bucket TIMESTAMP, checks_count INT, "
                         "PRIMARY KEY (site, bucket))")
+            # 5000 строк за последние ~17 дней и 3000 строк старше 90 дней.
             cur.execute("INSERT INTO checks_agg SELECT 's' || (g % 10), "
-                        "TIMESTAMP '2026-01-01' + g * INTERVAL '5 min', 1 FROM generate_series(1, 5000) g")
+                        "date_trunc('minute', NOW()) - g * INTERVAL '5 min', 1 FROM generate_series(1, 5000) g")
+            cur.execute("INSERT INTO checks_agg SELECT 'old' || (g % 10), "
+                        "NOW() - INTERVAL '91 days' - g * INTERVAL '5 min', 1 FROM generate_series(1, 3000) g")
             for _ in range(5):
                 cur.execute("UPDATE checks_agg SET checks_count = checks_count + 1")
         conn.commit()
@@ -159,6 +174,8 @@ class PostgreSQLMaintenanceTests(unittest.TestCase):
         admin.close()
 
     def test_full_then_schedule(self):
+        m.DELETE_BATCH, saved = 700, m.DELETE_BATCH  # несколько порций
+        self.addCleanup(setattr, m, "DELETE_BATCH", saved)
         now = msk(2026, 11, 21, 3, 5)
         self.assertEqual(m.run_if_due(self.conn, now, log=lambda *a, **k: None), "full")
         conn = self.conn()

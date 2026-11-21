@@ -1,6 +1,6 @@
 === ПОЛНОЕ ОПИСАНИЕ ФУНКЦИОНАЛА ===
 
-Версия: 2026.11.21-monitor.19
+Версия: 2026.11.21-monitor.20
 Обновляется при каждом релизе (правило RULES.md). История изменений — CHANGELOG.md,
 порядок проверок релиза — QA_QC.md.
 
@@ -364,6 +364,15 @@
     DB_MAINT_DAILY_HOUR/MINUTE, DB_MAINT_FULL_WEEKDAY/HOUR/MINUTE. Тест:
     tests/test_db_maintenance.py. Исправлено предупреждение «[STARTUP WARN] Pattern update:
     tuple index out of range» (экранирование % в LIKE).
+    Итог на проде: VACUUM FULL 75 с, 640 -> 498 МБ; live=2 984 181 — раздута не столько
+    мёртвыми строками, сколько историей (checks_agg никогда не очищалась), а неверная
+    статистика (live≈5 тыс.) давала плохие планы; после ANALYZE графики 58 -> 1,7 с.
+20. Хранение checks_agg 90 дней (monitor.20): перед ежедневным и еженедельным VACUUM
+    db_maintenance.purge_old удаляет строки с bucket старше CHECKS_AGG_RETENTION_DAYS (90,
+    не меньше 31) порциями по DB_MAINT_DELETE_BATCH (50 000) строк в autocommit — без долгих
+    блокировок. Пока ключа app_meta maint_checks_agg_retention_v1 нет (первый запуск
+    monitor.20), выполняется удаление + однократный VACUUM FULL, чтобы сразу вернуть место.
+    Экраны используют не больше 30 дней. В лог: «[DB MAINT] checks_agg: удалено N строк».
     Тест: tests/test_stale_cache.py.
 
 === ПРОВЕРКА РЕГРЕССИЙ ===

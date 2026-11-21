@@ -14,6 +14,11 @@ checks_agg — 5-минутные агрегаты проверок; ворке�
   выполнения (на проде — порядка минуты) запись в таблицу ждёт;
 - однократный VACUUM FULL при первом запуске версии с этим модулем.
 
+Хранение (monitor.20): в checks_agg остаются данные за RETENTION_DAYS (90) дней; всё старше
+удаляется ежедневно перед VACUUM порциями по DELETE_BATCH строк, чтобы не держать долгих
+блокировок. Все экраны используют не больше 30 дней. После первого удаления (на проде —
+около 2,5 млн строк) один раз выполняется VACUUM FULL, чтобы сразу вернуть место.
+
 Время последнего выполнения хранится в app_meta, поэтому расписание переживает перезапуски.
 """
 import datetime
@@ -23,6 +28,10 @@ import time
 TABLE = "checks_agg"
 META_ANALYZE = "maint_checks_agg_vacuum_last"
 META_FULL = "maint_checks_agg_vacuum_full_last"
+META_RETENTION = "maint_checks_agg_retention_v1"
+
+RETENTION_DAYS = max(31, int(os.getenv("CHECKS_AGG_RETENTION_DAYS", "90")))
+DELETE_BATCH = int(os.getenv("DB_MAINT_DELETE_BATCH", "50000"))
 
 # Расписание (МСК). 03:00 — ротация логов, поэтому обслуживание после неё.
 DAILY_HOUR = int(os.getenv("DB_MAINT_DAILY_HOUR", "3"))
@@ -69,14 +78,17 @@ def _slot(now, hour, minute, weekday=None):
     return slot
 
 
-def due_action(now, last_analyze, last_full):
+def due_action(now, last_analyze, last_full, retention_done=True):
     """Что пора выполнить: 'full', 'analyze' или None.
 
     now — aware datetime (МСК); last_* — aware datetime или None.
     VACUUM FULL: если ни разу не выполнялся или пропущен последний недельный слот.
     VACUUM (ANALYZE): если пропущен последний ежедневный слот. FULL заменяет ANALYZE.
     Пропущенный слот (приложение было выключено) выполняется при следующей проверке.
+    retention_done=False (хранение 90 дней ещё ни разу не применялось) — сразу 'full'.
     """
+    if not retention_done:
+        return "full"
     full_slot = _slot(now, FULL_HOUR, FULL_MINUTE, FULL_WEEKDAY)
     if last_full is None or last_full < full_slot:
         return "full"
@@ -103,6 +115,26 @@ def _write_meta(cur, key, ts):
 def table_size(cur):
     cur.execute("SELECT pg_size_pretty(pg_total_relation_size(%s::regclass))", (TABLE,))
     return cur.fetchone()[0]
+
+
+def purge_old(cur, log=print):
+    """Удаляет строки старше RETENTION_DAYS порциями (autocommit — каждая порция отдельно)."""
+    total = 0
+    t0 = time.monotonic()
+    while True:
+        cur.execute(f"""
+            DELETE FROM {TABLE} WHERE ctid = ANY(ARRAY(
+                SELECT ctid FROM {TABLE}
+                WHERE bucket < NOW() - make_interval(days => %s)
+                LIMIT %s))
+        """, (RETENTION_DAYS, DELETE_BATCH))
+        n = cur.rowcount or 0
+        total += n
+        if n < DELETE_BATCH:
+            break
+    log(f"[DB MAINT] {TABLE}: удалено {total} строк старше {RETENTION_DAYS} дн. "
+        f"за {time.monotonic() - t0:.1f}s", flush=True)
+    return total
 
 
 def apply_table_options(cur):
@@ -133,6 +165,7 @@ def run(conn_factory, action, log=print, now=None):
         changed = apply_table_options(cur)
         if changed:
             log(f"[DB MAINT] {TABLE}: заданы параметры {', '.join(changed)}", flush=True)
+        purge_old(cur, log=log)
         before = table_size(cur)
         t0 = time.monotonic()
         log(f"[DB MAINT] {sql}: старт, размер {before}", flush=True)
@@ -140,6 +173,8 @@ def run(conn_factory, action, log=print, now=None):
         dt = time.monotonic() - t0
         after = table_size(cur)
         _write_meta(cur, META_FULL if action == "full" else META_ANALYZE, now)
+        if action == "full":
+            _write_meta(cur, META_RETENTION, now)
         log(f"[DB MAINT] {sql}: готово за {dt:.1f}s, размер {before} -> {after}", flush=True)
         return True
     except Exception as e:
@@ -161,10 +196,11 @@ def run_if_due(conn_factory, now_msk, log=print):
         cur = conn.cursor()
         last_analyze = _read_meta(cur, META_ANALYZE)
         last_full = _read_meta(cur, META_FULL)
+        retention_done = _read_meta(cur, META_RETENTION) is not None
         conn.rollback()
     finally:
         conn.close()
-    action = due_action(now_msk, last_analyze, last_full)
+    action = due_action(now_msk, last_analyze, last_full, retention_done)
     if action:
         run(conn_factory, action, log=log, now=now_msk)
     return action
