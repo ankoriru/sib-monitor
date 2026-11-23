@@ -38,7 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.21"
+APP_VERSION = "2026.11.23-monitor.22"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -99,20 +99,24 @@ def _clean_env_value(value):
     return value
 
 
-def _load_auth_password_hash():
-    """Возвращает (хеш, источник, ошибка). Хеш — пустая строка, если не задан или неверен."""
-    b64 = _clean_env_value(os.getenv("AUTH_PASSWORD_HASH_B64", ""))
+def _load_auth_password_hash(name="AUTH_PASSWORD_HASH"):
+    """Возвращает (хеш, источник, ошибка) из <name>_B64 или <name>.
+
+    Хеш — пустая строка, если не задан или неверен.
+    """
+    b64_name = f"{name}_B64"
+    b64 = _clean_env_value(os.getenv(b64_name, ""))
     if b64:
         try:
             value = _clean_env_value(base64.b64decode(b64, validate=True).decode("utf-8"))
         except Exception:
-            return "", "AUTH_PASSWORD_HASH_B64", "значение не является корректным base64"
-        source = "AUTH_PASSWORD_HASH_B64"
+            return "", b64_name, "значение не является корректным base64"
+        source = b64_name
     else:
-        value = _clean_env_value(os.getenv("AUTH_PASSWORD_HASH", ""))
-        source = "AUTH_PASSWORD_HASH"
+        value = _clean_env_value(os.getenv(name, ""))
+        source = name
         if not value:
-            return "", "", "не задан ни AUTH_PASSWORD_HASH_B64, ни AUTH_PASSWORD_HASH"
+            return "", "", f"не задан ни {b64_name}, ни {name}"
     if not _BCRYPT_HASH_RE.match(value):
         return "", source, (f"значение не похоже на bcrypt-хеш (длина {len(value)}, "
                             f"ожидается 60 символов вида $2b$12$...)")
@@ -128,8 +132,31 @@ else:
     print(f"[AUTH] ВНИМАНИЕ: вход в панель невозможен — {AUTH_HASH_SOURCE or 'хеш'}: "
           f"{AUTH_HASH_ERROR}", flush=True)
 
-# --- ADMIN: Пароль для вкладки Управление (bcrypt hash for "flvby") ---
-ADMIN_PASSWORD_HASH = "$2b$12$rsNPWPiJyP5NSwg71GUw9uBxPAbGk..gOD2W.CU9SGLrNuFO.bIgC"
+# --- ADMIN: пароль вкладки «Управление» — только из окружения ---
+# ADMIN_PASSWORD_HASH_B64 (bcrypt-хеш в base64, основной способ) или ADMIN_PASSWORD_HASH.
+# Если не задан — вход в админку невозможен (в коде пароля нет).
+ADMIN_PASSWORD_HASH, ADMIN_HASH_SOURCE, ADMIN_HASH_ERROR = _load_auth_password_hash("ADMIN_PASSWORD_HASH")
+if ADMIN_PASSWORD_HASH:
+    print(f"[AUTH] вход в админку: хеш из {ADMIN_HASH_SOURCE} "
+          f"({ADMIN_PASSWORD_HASH[:7]}..., корректный формат)", flush=True)
+else:
+    print(f"[AUTH] ВНИМАНИЕ: вход в админку невозможен — {ADMIN_HASH_SOURCE or 'хеш'}: "
+          f"{ADMIN_HASH_ERROR}", flush=True)
+
+
+def _admin_password_ok(password):
+    """Проверка пароля админки; без загруженного хеша всегда False."""
+    if not ADMIN_PASSWORD_HASH:
+        print(f"[AUTH] отказ (админка): хеш пароля не загружен — {ADMIN_HASH_ERROR}", flush=True)
+        return False
+    try:
+        if bcrypt.checkpw((password or "").encode("utf-8"), ADMIN_PASSWORD_HASH.encode("utf-8")):
+            return True
+    except Exception as e:
+        print(f"[AUTH] отказ (админка): ошибка проверки ({type(e).__name__})", flush=True)
+        return False
+    print("[AUTH] отказ (админка): неверный пароль", flush=True)
+    return False
 
 SITES = [
     "sibur.ru", "eshop.sibur.ru", "shop.sibur.ru", "srm.sibur.ru",
@@ -423,13 +450,13 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
 # УТИЛИТЫ
 # ============================================================================
 def admin_check_auth(request: Request, response: Response, admin_session: str = Cookie(None)):
-    """Аутентификация для вкладки Управление (пароль 'flvby')"""
+    """Аутентификация для вкладки Управление (пароль из ADMIN_PASSWORD_HASH_B64)"""
     if admin_session == "authenticated_admin":
         return True
     auth = request.headers.get("X-Admin-Auth")
     if auth:
         try:
-            if bcrypt.checkpw(auth.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+            if _admin_password_ok(auth):
                 response.set_cookie(
                     key="admin_session",
                     value="authenticated_admin",
@@ -450,7 +477,7 @@ def admin_auth(request: Request, response: Response, admin_session: str = Cookie
     auth = request.headers.get("X-Admin-Auth")
     if auth:
         try:
-            if bcrypt.checkpw(auth.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+            if _admin_password_ok(auth):
                 response.set_cookie(
                     key="admin_session",
                     value="authenticated_admin",
@@ -3000,7 +3027,7 @@ def admin_login_handler(request: Request, response: Response, body=Depends(_json
     try:
         data = _json_data(body)
         pwd = data.get("password", "")
-        if bcrypt.checkpw(pwd.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8')):
+        if _admin_password_ok(pwd):
             response.set_cookie(
                 key="admin_session",
                 value="authenticated_admin",

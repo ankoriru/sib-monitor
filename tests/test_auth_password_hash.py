@@ -91,5 +91,39 @@ class GeneratorTests(unittest.TestCase):
         self.assertTrue(bcrypt.checkpw(PASSWORD.encode(), value.encode()))
 
 
+class AdminPasswordTests(unittest.TestCase):
+    def test_no_admin_hash_in_source(self):
+        src = open(app.__file__, encoding="utf-8").read()
+        self.assertNotRegex(src, r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
+        self.assertNotIn("flvby", src)
+
+    def test_admin_hash_loaded_from_own_variables(self):
+        env = {"ADMIN_PASSWORD_HASH_B64": HASH_B64}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("ADMIN_PASSWORD_HASH", None)
+            self.assertEqual(app._load_auth_password_hash("ADMIN_PASSWORD_HASH"),
+                             (HASH, "ADMIN_PASSWORD_HASH_B64", ""))
+
+    def test_admin_password_check(self):
+        with mock.patch.object(app, "ADMIN_PASSWORD_HASH", HASH):
+            self.assertTrue(app._admin_password_ok(PASSWORD))
+            self.assertFalse(app._admin_password_ok("wrong"))
+            self.assertFalse(app._admin_password_ok(None))
+
+    def test_admin_locked_without_hash(self):
+        with mock.patch.object(app, "ADMIN_PASSWORD_HASH", ""):
+            self.assertFalse(app._admin_password_ok(PASSWORD))
+            request = mock.Mock(headers={"X-Admin-Auth": PASSWORD})
+            with self.assertRaises(HTTPException):
+                app.admin_auth(request, mock.Mock(), None)
+
+    def test_admin_and_dashboard_hashes_are_independent(self):
+        other = bcrypt.hashpw(b"AdminOnly1", bcrypt.gensalt(rounds=4)).decode()
+        with mock.patch.object(app, "ADMIN_PASSWORD_HASH", other), \
+             mock.patch.object(app, "AUTH_PASSWORD_HASH", HASH):
+            self.assertFalse(app._admin_password_ok(PASSWORD))
+            self.assertTrue(app._admin_password_ok("AdminOnly1"))
+
+
 if __name__ == "__main__":
     unittest.main()

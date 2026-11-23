@@ -163,5 +163,70 @@ class HealthTimeoutTests(unittest.TestCase):
         self.assertEqual(json.loads(resp.body)["version"], app.APP_VERSION)
 
 
+TOPIC_SAMPLE = """# Изменения
+
+## 2026.11.10-monitor.23 — 2026-11-10
+<!-- отменяет: 2026.11.10-monitor.21 -->
+### Исправлено
+- Главная открывается за 1 с: кэш и сжатие таблицы. <!-- тема: скорость-главной -->
+### Прочее
+- Откат monitor.21.
+
+## 2026.11.10-monitor.22 — 2026-11-10
+### Исправлено
+- Главная открывается быстрее (кэш). <!-- тема: скорость-главной -->
+- Отдельное исправление.
+### Улучшения
+- Новая опция.
+
+## 2026.11.10-monitor.21 — 2026-11-10
+### Улучшения
+- Неудачная функция.
+
+## 2026.11.10-monitor.20 — 2026-11-10
+### Исправлено
+- Главная грузится быстрее (запрос
+  переписан). <!-- тема: Скорость-главной -->
+- Отдельное исправление.
+"""
+
+
+class DigestDedupTests(unittest.TestCase):
+    def setUp(self):
+        self.rel = rd.parse_changelog(TOPIC_SAMPLE)
+        self.text = rd.build_digest(self.rel, datetime.date(2026, 11, 10))
+
+    def test_same_topic_keeps_only_latest_item(self):
+        self.assertIn("Главная открывается за 1 с: кэш и сжатие таблицы.", self.text)
+        self.assertNotIn("Главная открывается быстрее (кэш)", self.text)
+        self.assertNotIn("Главная грузится быстрее", self.text)
+        self.assertEqual(self.text.count("Главная"), 1)
+
+    def test_exact_duplicates_removed(self):
+        self.assertEqual(self.text.count("Отдельное исправление."), 1)
+
+    def test_reverted_release_items_skipped(self):
+        self.assertNotIn("Неудачная функция", self.text)
+        self.assertIn("Новая опция.", self.text)
+        self.assertIn("Откат monitor.21.", self.text)
+
+    def test_service_comments_hidden(self):
+        self.assertNotIn("<!--", self.text)
+        self.assertNotIn("тема", self.text)
+
+    def test_parse_topics_and_reverts(self):
+        latest = self.rel[0]
+        self.assertEqual(latest["reverts"], ["2026.11.10-monitor.21"])
+        self.assertEqual(latest["topics"]["Исправлено"], ["скорость-главной"])
+        self.assertEqual(self.rel[3]["sections"]["Исправлено"][0],
+                         "Главная грузится быстрее (запрос переписан).")
+
+    def test_untagged_changelog_unchanged(self):
+        rel = rd.parse_changelog(SAMPLE)
+        text = rd.build_digest(rel, datetime.date(2026, 11, 8))
+        self.assertIn("Первый релиз.", text)
+        self.assertIn("Второй релиз: продолжение строки.", text)
+
+
 if __name__ == "__main__":
     unittest.main()
