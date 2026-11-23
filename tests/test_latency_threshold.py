@@ -11,6 +11,8 @@ class LatencyThresholdTests(unittest.TestCase):
         self.last_status = {}
         self.fail_count = {}
         self.first_fail = {}
+        app._latency_streak.clear()
+        self.addCleanup(app._latency_streak.clear)
         for name, kwargs in (
             ("send_tg_msg", {}),
             ("_db_incident_start", {}),
@@ -42,10 +44,35 @@ class LatencyThresholdTests(unittest.TestCase):
                 self.assertFalse(self.latency.get("latency.example", False))
         self.incident.assert_not_called()
 
-    def test_strictly_above_25_alerts_once(self):
+    def test_single_slow_check_is_not_reported(self):
+        self.sample(40)
+        self.telegram.assert_not_called()
+        self.assertFalse(self.latency.get("latency.example", False))
+        self.sample(3)
+        self.sample(40)
+        self.sample(25)
+        self.telegram.assert_not_called()
+
+    def test_slow_check_interrupted_by_failure_is_not_confirmed(self):
+        self.sample(30)
+        self.sample(0, status=0)
+        self.telegram.reset_mock()
+        self.sample(30)
+        self.assertFalse(any("ЗАДЕРЖКА" in c.args[0] for c in self.telegram.call_args_list))
+
+    def test_unknown_check_breaks_latency_confirmation(self):
+        self.sample(30)
+        self.sample(0, status=app.CHECK_UNKNOWN)
+        self.sample(30)
+        self.telegram.assert_not_called()
+
+    def test_strictly_above_25_alerts_once_after_confirmation(self):
+        self.sample(25.01)
+        self.telegram.assert_not_called()
         self.sample(25.01)
         self.telegram.assert_called_once()
         self.assertIn("ЗАДЕРЖКА", self.telegram.call_args.args[0])
+        self.assertIn("25.01", self.telegram.call_args.args[0])
         self.assertTrue(self.latency["latency.example"])
         self.sample(26)
         self.sample(40)
@@ -55,10 +82,14 @@ class LatencyThresholdTests(unittest.TestCase):
     def test_boundary_fluctuations_do_not_create_message_spam(self):
         for elapsed in (26, 25, 24, 25.1, 10, 27):
             self.sample(elapsed)
+        self.telegram.assert_not_called()
+        for elapsed in (26, 27, 25, 24, 25.1, 10, 27, 28):
+            self.sample(elapsed)
         self.telegram.assert_called_once()
         self.assertTrue(self.latency["latency.example"])
 
     def test_existing_recovery_hysteresis_is_preserved(self):
+        self.sample(26)
         self.sample(26)
         self.sample(9.99)
         self.assertEqual(self.telegram.call_count, 2)
@@ -66,6 +97,12 @@ class LatencyThresholdTests(unittest.TestCase):
         self.assertFalse(self.latency["latency.example"])
         self.sample(25)
         self.assertEqual(self.telegram.call_count, 2)
+
+    def test_fast_check_resets_pending_latency(self):
+        self.sample(30)
+        self.assertIn("latency.example", app._latency_streak)
+        self.sample(20)
+        self.assertNotIn("latency.example", app._latency_streak)
 
     def test_network_failure_still_creates_down_alert(self):
         self.sample(24, status=0)

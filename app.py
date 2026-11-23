@@ -38,10 +38,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.22"
+APP_VERSION = "2026.11.23-monitor.23"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
+# Задержка сообщается только после подтверждения: 2 медленных проверки подряд.
+LATENCY_CONFIRM_CHECKS = 2
+# Сайты, у которых последняя проверка была медленной, но задержка ещё не подтверждена.
+_latency_streak = {}
 DEFAULT_HTTP_TIMEOUT = 8
 SSL_CONNECT_TIMEOUT = 8  # было 3 с: медленные сайты ошибочно попадали в «нет данных»
 SSL_FULL_CYCLE_SECONDS = 4 * 3600
@@ -2237,6 +2241,9 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
         sample = (site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_valid, check_error)
         if check_details is not None:
             sample += (check_details,)
+        if curr_status != 200:
+            # Задержка подтверждается только подряд идущими успешными медленными проверками.
+            _latency_streak.pop(site, None)
         if curr_status == CHECK_UNKNOWN:
             # Break consecutive failures; do not declare DOWN or UP, or close incidents.
             fail_count[site] = 0
@@ -2308,9 +2315,17 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             first_fail_time.pop(site, None)
 
             if resp_time > LATENCY_ALERT_THRESHOLD_SECONDS and not last_latency_map.get(site, False):
-                ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
-                last_latency_map[site] = True
-            elif resp_time < LATENCY_RECOVERY_THRESHOLD_SECONDS and last_latency_map.get(site, False):
+                streak = _latency_streak.get(site, 0) + 1
+                if streak >= LATENCY_CONFIRM_CHECKS:
+                    _latency_streak.pop(site, None)
+                    ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
+                    last_latency_map[site] = True
+                else:
+                    _latency_streak[site] = streak
+                    print(f"[LATENCY PENDING] {site} {round(resp_time, 2)}s — ждём подтверждения следующей проверкой")
+            elif resp_time <= LATENCY_ALERT_THRESHOLD_SECONDS:
+                _latency_streak.pop(site, None)
+            if resp_time < LATENCY_RECOVERY_THRESHOLD_SECONDS and last_latency_map.get(site, False):
                 ok = send_tg_msg(f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек.")
                 last_latency_map[site] = False
     except Exception as e:
@@ -2456,6 +2471,7 @@ def check_worker():
                     del last_status[site]
                     del fail_count[site]
                     del last_latency_map[site]
+                    _latency_streak.pop(site, None)
 
             # SITES loaded from DB
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
