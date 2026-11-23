@@ -1,3 +1,4 @@
+import datetime
 import unittest
 from unittest.mock import patch
 
@@ -12,7 +13,9 @@ class LatencyThresholdTests(unittest.TestCase):
         self.fail_count = {}
         self.first_fail = {}
         app._latency_streak.clear()
+        app._latency_started.clear()
         self.addCleanup(app._latency_streak.clear)
+        self.addCleanup(app._latency_started.clear)
         for name, kwargs in (
             ("send_tg_msg", {}),
             ("_db_incident_start", {}),
@@ -105,6 +108,35 @@ class LatencyThresholdTests(unittest.TestCase):
         self.assertIn("latency.example", app._latency_streak)
         self.sample(10)
         self.assertNotIn("latency.example", app._latency_streak)
+
+    def test_recovery_reports_duration_from_first_slow_check(self):
+        self.sample(30)
+        first_slow = app._latency_streak["latency.example"][1]
+        self.sample(30)
+        self.assertEqual(app._latency_started["latency.example"], first_slow)
+        # Задержка началась 17 минут назад — с первой медленной проверки.
+        app._latency_started["latency.example"] = (
+            datetime.datetime.now() - datetime.timedelta(minutes=17, seconds=20))
+        self.sample(7)  # 5..10 с — ещё не восстановление
+        self.assertEqual(self.telegram.call_count, 1)
+        self.sample(2)
+        text = self.telegram.call_args.args[0]
+        self.assertIn("СКОРОСТЬ ВОССТАНОВЛЕНА", text)
+        self.assertIn("Задержка длилась: 17 мин.", text)
+        self.assertNotIn("latency.example", app._latency_started)
+
+    def test_short_latency_duration_is_at_least_one_minute(self):
+        self.sample(30)
+        self.sample(30)
+        self.sample(1)
+        self.assertIn("Задержка длилась: 1 мин.", self.telegram.call_args.args[0])
+
+    def test_recovery_without_known_start_has_no_duration(self):
+        self.latency["latency.example"] = True  # задержка была до перезапуска
+        self.sample(1)
+        text = self.telegram.call_args.args[0]
+        self.assertIn("СКОРОСТЬ ВОССТАНОВЛЕНА", text)
+        self.assertNotIn("длилась", text)
 
     def test_network_failure_still_creates_down_alert(self):
         self.sample(24, status=0)
