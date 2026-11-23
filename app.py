@@ -38,14 +38,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.25"
-LATENCY_ALERT_THRESHOLD_SECONDS = 10
-# Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
-LATENCY_RECOVERY_THRESHOLD_SECONDS = 5
-# Задержка сообщается только после подтверждения: 2 медленных проверки подряд.
-LATENCY_CONFIRM_CHECKS = 2
-# Сайты, у которых последняя проверка была медленной, но задержка ещё не подтверждена:
-# site -> (число медленных проверок подряд, время первой медленной проверки).
+APP_VERSION = "2026.11.23-monitor.26"
+LATENCY_ALERT_THRESHOLD_SECONDS = 15
+# Задержка сообщается только после подтверждения: первая проверка дольше
+# LATENCY_ALERT_THRESHOLD_SECONDS, следующая — дольше LATENCY_CONFIRM_THRESHOLD_SECONDS.
+LATENCY_CONFIRM_THRESHOLD_SECONDS = 10
+# Задержка заканчивается, когда ответ не дольше этого порога («скорость восстановлена»).
+LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
+# Сайты, у которых первая проверка была медленной, но задержка ещё не подтверждена:
+# site -> время первой медленной проверки.
 _latency_streak = {}
 # Начало подтверждённой задержки (время первой медленной проверки) — для длительности
 # в сообщении о восстановлении скорости.
@@ -2318,21 +2319,17 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             fail_count[site] = 0
             first_fail_time.pop(site, None)
 
-            if resp_time > LATENCY_ALERT_THRESHOLD_SECONDS and not last_latency_map.get(site, False):
-                prev_count, slow_since = _latency_streak.get(site, (0, None))
-                streak = prev_count + 1
-                slow_since = slow_since or datetime.datetime.now()
-                if streak >= LATENCY_CONFIRM_CHECKS:
-                    _latency_streak.pop(site, None)
+            if not last_latency_map.get(site, False):
+                slow_since = _latency_streak.pop(site, None)
+                if slow_since is not None and resp_time > LATENCY_CONFIRM_THRESHOLD_SECONDS:
+                    # Повторная проверка подтвердила задержку — сообщаем.
                     _latency_started[site] = slow_since
                     ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                     last_latency_map[site] = True
-                else:
-                    _latency_streak[site] = (streak, slow_since)
+                elif slow_since is None and resp_time > LATENCY_ALERT_THRESHOLD_SECONDS:
+                    _latency_streak[site] = datetime.datetime.now()
                     print(f"[LATENCY PENDING] {site} {round(resp_time, 2)}s — ждём подтверждения следующей проверкой")
-            elif resp_time <= LATENCY_ALERT_THRESHOLD_SECONDS:
-                _latency_streak.pop(site, None)
-            if resp_time < LATENCY_RECOVERY_THRESHOLD_SECONDS and last_latency_map.get(site, False):
+            elif resp_time <= LATENCY_RECOVERY_THRESHOLD_SECONDS:
                 started = _latency_started.pop(site, None)
                 msg = f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."
                 if started is not None:
