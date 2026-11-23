@@ -38,10 +38,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.23"
-LATENCY_ALERT_THRESHOLD_SECONDS = 25
+APP_VERSION = "2026.11.23-monitor.24"
+LATENCY_ALERT_THRESHOLD_SECONDS = 10
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
-LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
+LATENCY_RECOVERY_THRESHOLD_SECONDS = 5
 # Задержка сообщается только после подтверждения: 2 медленных проверки подряд.
 LATENCY_CONFIRM_CHECKS = 2
 # Сайты, у которых последняя проверка была медленной, но задержка ещё не подтверждена.
