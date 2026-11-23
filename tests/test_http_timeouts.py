@@ -23,7 +23,7 @@ class TimeoutValidationTests(unittest.TestCase):
 
     def test_bad_stored_value_cannot_disable_timeout(self):
         for value in (None, 0, -1, 10000, True):
-            self.assertEqual(app._effective_http_timeout(value), 8)
+            self.assertEqual(app._effective_http_timeout(value), 50)
 
     def test_experiment_sites_exclude_retired_tst_stdo(self):
         self.assertEqual(set(app.TIMEOUT_EXPERIMENT_SITES), {
@@ -80,7 +80,7 @@ class TimeoutRequestTests(unittest.IsolatedAsyncioTestCase):
                                      {"slow.example": 30})
         options = {call.args[1]: call.kwargs for call in check.call_args_list}
         self.assertEqual(options["slow.example"], dict(verify_ssl=False, timeout_seconds=30))
-        self.assertEqual(options["normal.example"], dict(verify_ssl=True, timeout_seconds=8))
+        self.assertEqual(options["normal.example"], dict(verify_ssl=True, timeout_seconds=50))
 
     async def test_invalid_api_input_does_not_open_database(self):
         for endpoint in (app.add_site, app.update_site):
@@ -166,13 +166,15 @@ class TimeoutPostgresTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_only_requested_sites_receive_thirty_seconds(self):
+    def test_all_sites_receive_fifty_seconds(self):
         rows = self.query("SELECT site, http_timeout_seconds, ssl_verify FROM monitored_sites")
-        self.assertEqual(sum(r[1] == 30 for r in rows), 9)
+        self.assertTrue(rows)
+        self.assertTrue(all(r[1] == 50 for r in rows))
         self.assertTrue(all(r[2] is False for r in rows))
+        self.query("INSERT INTO monitored_sites (site) VALUES ('fresh.example')")
         self.assertEqual(self.query("""
-            SELECT http_timeout_seconds FROM monitored_sites WHERE site='normal.example'
-        """), [(8,)])
+            SELECT http_timeout_seconds FROM monitored_sites WHERE site='fresh.example'
+        """), [(50,)])
 
     def test_restart_does_not_overwrite_manual_settings(self):
         self.query("UPDATE monitored_sites SET http_timeout_seconds=45 WHERE site='bopp.sibur.ru'")
@@ -198,7 +200,7 @@ class TimeoutPostgresTests(unittest.TestCase):
         self.assertEqual(row["http_timeout_seconds"], 40)
         self.assertFalse(row["ssl_verify"])
         self.assertEqual(loaded[5]["cp.tdms.sibur.ru/cp/"], 40)
-        self.assertEqual(loaded[5]["normal.example"], 8)
+        self.assertEqual(loaded[5]["normal.example"], 50)
 
     def test_legacy_update_preserves_timeout(self):
         request = MagicMock()
@@ -209,7 +211,7 @@ class TimeoutPostgresTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(self.query("""
             SELECT alert_threshold, http_timeout_seconds FROM monitored_sites WHERE site='bopp.sibur.ru'
-        """), [(9, 30)])
+        """), [(9, 50)])
 
     def test_add_new_site_with_custom_timeout(self):
         request = MagicMock()
@@ -238,8 +240,9 @@ class TimeoutPostgresTests(unittest.TestCase):
         with patch.object(app, "get_db_connection", side_effect=self.connection):
             response = asyncio.run(app._admin_page_inner(MagicMock(), MagicMock()))
         html = response.body.decode()
-        self.assertIn('id="timeout-bopp.sibur.ru" value="30"', html)
-        self.assertIn('id="timeout-normal.example" value="8"', html)
+        self.assertIn('id="timeout-bopp.sibur.ru" value="50"', html)
+        self.assertIn('id="timeout-normal.example" value="50"', html)
+        self.assertIn('id="newTimeout" value="50"', html)
         self.assertIn("Таймаут HTTP, с", html)
 
 

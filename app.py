@@ -38,7 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.26"
+APP_VERSION = "2026.11.23-monitor.27"
 LATENCY_ALERT_THRESHOLD_SECONDS = 15
 # Задержка сообщается только после подтверждения: первая проверка дольше
 # LATENCY_ALERT_THRESHOLD_SECONDS, следующая — дольше LATENCY_CONFIRM_THRESHOLD_SECONDS.
@@ -51,7 +51,7 @@ _latency_streak = {}
 # Начало подтверждённой задержки (время первой медленной проверки) — для длительности
 # в сообщении о восстановлении скорости.
 _latency_started = {}
-DEFAULT_HTTP_TIMEOUT = 8
+DEFAULT_HTTP_TIMEOUT = 50  # дольше 50 с без ответа — простой (Offline)
 SSL_CONNECT_TIMEOUT = 8  # было 3 с: медленные сайты ошибочно попадали в «нет данных»
 SSL_FULL_CYCLE_SECONDS = 4 * 3600
 SSL_RETRY_SECONDS = 15 * 60  # повтор для сайтов без данных SSL, не ждём 4 часа
@@ -1486,9 +1486,10 @@ def _migrate_http_timeouts(cur):
     """One-time experiment, in the init transaction; never reset later admin edits."""
     cur.execute("""
         ALTER TABLE monitored_sites ADD COLUMN IF NOT EXISTS
-        http_timeout_seconds INTEGER NOT NULL DEFAULT 8
+        http_timeout_seconds INTEGER NOT NULL DEFAULT 50
         CHECK (http_timeout_seconds BETWEEN 1 AND 60)
     """)
+    cur.execute("ALTER TABLE monitored_sites ALTER COLUMN http_timeout_seconds SET DEFAULT 50")
     cur.execute("""
         INSERT INTO app_meta (key, value)
         VALUES ('http_timeout_experiment_20261030_v1', '30 seconds for 10 selected sites')
@@ -1501,6 +1502,19 @@ def _migrate_http_timeouts(cur):
         """, (list(TIMEOUT_EXPERIMENT_SITES),))
         print(f"[INIT] HTTP timeout experiment: {cur.rowcount} existing sites set to 30 seconds",
               flush=True)
+    # 2026-11-23: таймаут HTTP 50 с для всех сайтов — однократно, ручные правки в админке
+    # после этого не перезаписываются.
+    cur.execute("""
+        INSERT INTO app_meta (key, value)
+        VALUES ('http_timeout_all_50s_20261123_v1', '50 seconds for all sites')
+        ON CONFLICT (key) DO NOTHING RETURNING key
+    """)
+    if cur.fetchone():
+        cur.execute("""
+            UPDATE monitored_sites SET http_timeout_seconds = 50
+            WHERE site_group != 'self'
+        """)
+        print(f"[INIT] HTTP timeout: {cur.rowcount} sites set to 50 seconds", flush=True)
 
 
 class _SelfSignedRejected(Exception):
@@ -1668,7 +1682,8 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
 
 async def check_all_sites(sites_list, ssl_verify_map=None, timeout_map=None):
     """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
-    semaphore = asyncio.Semaphore(15)
+    # 30 одновременных запросов: при таймауте 50 с недоступные сайты не растягивают цикл.
+    semaphore = asyncio.Semaphore(30)
     ssl_map = ssl_verify_map or {}
     timeout_map = timeout_map or {}
     async with aiohttp.ClientSession() as session:
@@ -3172,7 +3187,7 @@ def _admin_page_inner(request, response):
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <label style="display:flex;align-items:center;gap:6px;">Таймаут HTTP, с
-                <input type="number" id="newTimeout" value="8" min="1" max="60" step="1"
+                <input type="number" id="newTimeout" value="50" min="1" max="60" step="1"
                        required aria-label="Таймаут HTTP нового сайта, секунды" style="width:75px;">
             </label>
             <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">

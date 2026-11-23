@@ -73,7 +73,7 @@ class RequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app.time, "perf_counter", side_effect=[100.0, 108.25]):
             result = await app.check_single_site(
                 session, "example.org", asyncio.Semaphore(1))
-        self.assertEqual(session.get.call_args.kwargs["timeout"].total, 8)
+        self.assertEqual(session.get.call_args.kwargs["timeout"].total, app.DEFAULT_HTTP_TIMEOUT)
         self.assertTrue(session.get.call_args.kwargs["allow_redirects"])
         return result
 
