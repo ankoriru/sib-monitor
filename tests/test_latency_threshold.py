@@ -14,6 +14,8 @@ class LatencyThresholdTests(unittest.TestCase):
         self.first_fail = {}
         app._latency_streak.clear()
         app._latency_started.clear()
+        app._latency_max.clear()
+        self.addCleanup(app._latency_max.clear)
         self.addCleanup(app._latency_streak.clear)
         self.addCleanup(app._latency_started.clear)
         for name, kwargs in (
@@ -24,6 +26,9 @@ class LatencyThresholdTests(unittest.TestCase):
             ("_invalidate_dashboard_cache", {}),
             ("batch_buffer", {"new": []}),
             ("BATCH_SIZE", {"new": 1000}),
+            ("_db_latency_start", {}),
+            ("_db_latency_update", {}),
+            ("_db_latency_end", {"return_value": None}),
         ):
             p = patch.object(app, name, **kwargs)
             value = p.start()
@@ -32,12 +37,21 @@ class LatencyThresholdTests(unittest.TestCase):
                 self.telegram = value
             elif name == "_db_incident_start":
                 self.incident = value
+            elif name == "_db_latency_start":
+                self.db_start = value
+            elif name == "_db_latency_update":
+                self.db_update = value
+            elif name == "_db_latency_end":
+                self.db_end = value
 
-    def sample(self, elapsed, status=200):
+    def sample(self, elapsed, status=200, threshold=1):
         app._process_site_result(
             "latency.example", status, elapsed, 90, 100, True,
             self.last_status, self.fail_count, self.latency,
-            {"latency.example": 1}, self.first_fail)
+            {"latency.example": threshold}, self.first_fail)
+
+    def messages(self):
+        return [c.args[0] for c in self.telegram.call_args_list]
 
     def test_first_check_up_to_15_seconds_inclusive_does_not_start_latency(self):
         for elapsed in (0, 5, 10, 10.01, 14.99, 15):
@@ -145,6 +159,83 @@ class LatencyThresholdTests(unittest.TestCase):
         text = self.telegram.call_args.args[0]
         self.assertIn("СКОРОСТЬ ВОССТАНОВЛЕНА", text)
         self.assertNotIn("длилась", text)
+
+    def test_down_during_latency_closes_it_without_double_message(self):
+        self.sample(20)
+        self.sample(12)
+        self.assertTrue(self.latency["latency.example"])
+        self.sample(0, status=0)  # порог 1 — сразу DOWN
+        self.assertFalse(self.latency["latency.example"])
+        self.assertNotIn("latency.example", app._latency_started)
+        self.db_end.assert_called_once_with("latency.example", "down")
+        self.sample(1)
+        msgs = self.messages()
+        self.assertEqual(len(msgs), 3)
+        self.assertIn("ЗАДЕРЖКА", msgs[0])
+        self.assertIn("DOWN", msgs[1])
+        self.assertIn("UP", msgs[2])
+        self.assertFalse(any("СКОРОСТЬ ВОССТАНОВЛЕНА" in m for m in msgs))
+
+    def test_short_failure_below_down_threshold_keeps_latency(self):
+        self.sample(20, threshold=5)
+        self.sample(12, threshold=5)
+        self.sample(0, status=0, threshold=5)
+        self.assertTrue(self.latency["latency.example"])
+        self.db_end.assert_not_called()
+        self.sample(2, threshold=5)
+        self.assertIn("СКОРОСТЬ ВОССТАНОВЛЕНА", self.messages()[-1])
+        self.db_end.assert_called_once_with("latency.example", "recovered")
+
+    def test_latency_is_recorded_in_history(self):
+        self.sample(20)
+        first_slow = app._latency_streak["latency.example"]
+        self.db_start.assert_not_called()
+        self.sample(12)
+        self.db_start.assert_called_once_with("latency.example", first_slow, 12)
+        self.sample(11)      # не выше максимума — без записи
+        self.db_update.assert_not_called()
+        self.sample(25)
+        self.db_update.assert_called_once_with("latency.example", 25)
+        self.sample(3)
+        self.db_end.assert_called_once_with("latency.example", "recovered")
+
+    def test_restored_latency_uses_db_duration(self):
+        self.latency["latency.example"] = True
+        self.db_end.return_value = 42
+        self.sample(1)
+        self.assertIn("Задержка длилась: 42 мин.", self.messages()[-1])
+
+    def test_dashboard_marks_confirmed_latency_below_start_threshold(self):
+        data = dashboard_fixture()
+        data["latest"]["online.example"].update(response_time=12, ssl_days=90)
+        data["latency_events"] = [dict(site="online.example", start_time=app.datetime.datetime.now(),
+                                       resolved=False, end_reason=None, max_response=20.5, dur=7)]
+        html = app._build_body(data)
+        self.assertIn("Задержка 12с, 7 мин", html)
+        self.assertIn("Задержки (30 дней)", html)
+        self.assertIn("Идёт", html)
+        self.assertIn("20.5с", html)
+
+    def test_dashboard_latency_history_statuses(self):
+        data = dashboard_fixture()
+        now = app.datetime.datetime.now()
+        data["latency_events"] = [
+            dict(site="online.example", start_time=now, resolved=True, end_reason="recovered",
+                 max_response=18.0, dur=3),
+            dict(site="offline.example", start_time=now, resolved=True, end_reason="down",
+                 max_response=None, dur=5),
+        ]
+        html = app._build_body(data)
+        self.assertIn("Завершена", html)
+        self.assertIn("Перешла в простой", html)
+        self.assertNotIn("Задержка 18", html)
+        self.assertEqual(html.count('<div id="t3"'), 1)
+        t3 = html[html.index('<div id="t3"'):html.index('<div id="t4"')]
+        self.assertIn("Задержки (30 дней)", t3)
+
+    def test_dashboard_without_latency_history(self):
+        html = app._build_body(dashboard_fixture())
+        self.assertIn("Задержек не было", html)
 
     def test_network_failure_still_creates_down_alert(self):
         self.sample(24, status=0)

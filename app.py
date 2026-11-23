@@ -38,7 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.23-monitor.27"
+APP_VERSION = "2026.11.23-monitor.28"
 LATENCY_ALERT_THRESHOLD_SECONDS = 15
 # Задержка сообщается только после подтверждения: первая проверка дольше
 # LATENCY_ALERT_THRESHOLD_SECONDS, следующая — дольше LATENCY_CONFIRM_THRESHOLD_SECONDS.
@@ -51,7 +51,9 @@ _latency_streak = {}
 # Начало подтверждённой задержки (время первой медленной проверки) — для длительности
 # в сообщении о восстановлении скорости.
 _latency_started = {}
-DEFAULT_HTTP_TIMEOUT = 50  # дольше 50 с без ответа — простой (Offline)
+# Максимальное время отклика текущей задержки (чтобы не писать в БД каждую проверку).
+_latency_max = {}
+DEFAULT_HTTP_TIMEOUT = 30  # дольше 30 с без ответа — простой (Offline)
 SSL_CONNECT_TIMEOUT = 8  # было 3 с: медленные сайты ошибочно попадали в «нет данных»
 SSL_FULL_CYCLE_SECONDS = 4 * 3600
 SSL_RETRY_SECONDS = 15 * 60  # повтор для сайтов без данных SSL, не ждём 4 часа
@@ -922,6 +924,30 @@ def init_db():
     except psycopg2.Error:
         conn.rollback()
 
+    # История задержек: начало — первая медленная проверка, конец — восстановление отклика
+    # (end_reason='recovered') или переход в простой ('down').
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS latency_events (
+            id SERIAL PRIMARY KEY,
+            site TEXT NOT NULL,
+            start_time TIMESTAMP NOT NULL,
+            confirmed_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            end_time TIMESTAMP,
+            duration_min INTEGER,
+            max_response REAL,
+            end_reason TEXT,
+            resolved BOOLEAN NOT NULL DEFAULT FALSE
+        )
+    """)
+    _safe_index(cur, conn, "idx_latency_events_site_start", "latency_events", "site, start_time DESC")
+    try:
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_latency_events_open
+            ON latency_events (site) WHERE resolved = FALSE
+        """)
+    except psycopg2.Error:
+        conn.rollback()
+
     # Таблица управляемых сайтов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS monitored_sites (
@@ -1486,10 +1512,10 @@ def _migrate_http_timeouts(cur):
     """One-time experiment, in the init transaction; never reset later admin edits."""
     cur.execute("""
         ALTER TABLE monitored_sites ADD COLUMN IF NOT EXISTS
-        http_timeout_seconds INTEGER NOT NULL DEFAULT 50
+        http_timeout_seconds INTEGER NOT NULL DEFAULT 30
         CHECK (http_timeout_seconds BETWEEN 1 AND 60)
     """)
-    cur.execute("ALTER TABLE monitored_sites ALTER COLUMN http_timeout_seconds SET DEFAULT 50")
+    cur.execute("ALTER TABLE monitored_sites ALTER COLUMN http_timeout_seconds SET DEFAULT 30")
     cur.execute("""
         INSERT INTO app_meta (key, value)
         VALUES ('http_timeout_experiment_20261030_v1', '30 seconds for 10 selected sites')
@@ -1502,19 +1528,19 @@ def _migrate_http_timeouts(cur):
         """, (list(TIMEOUT_EXPERIMENT_SITES),))
         print(f"[INIT] HTTP timeout experiment: {cur.rowcount} existing sites set to 30 seconds",
               flush=True)
-    # 2026-11-23: таймаут HTTP 50 с для всех сайтов — однократно, ручные правки в админке
+    # 2026-11-23: таймаут HTTP 30 с для всех сайтов — однократно, ручные правки в админке
     # после этого не перезаписываются.
     cur.execute("""
         INSERT INTO app_meta (key, value)
-        VALUES ('http_timeout_all_50s_20261123_v1', '50 seconds for all sites')
+        VALUES ('http_timeout_all_30s_20261123_v1', '30 seconds for all sites')
         ON CONFLICT (key) DO NOTHING RETURNING key
     """)
     if cur.fetchone():
         cur.execute("""
-            UPDATE monitored_sites SET http_timeout_seconds = 50
+            UPDATE monitored_sites SET http_timeout_seconds = 30
             WHERE site_group != 'self'
         """)
-        print(f"[INIT] HTTP timeout: {cur.rowcount} sites set to 50 seconds", flush=True)
+        print(f"[INIT] HTTP timeout: {cur.rowcount} sites set to 30 seconds", flush=True)
 
 
 class _SelfSignedRejected(Exception):
@@ -1682,7 +1708,7 @@ async def check_single_site(session, site, semaphore, verify_ssl=True,
 
 async def check_all_sites(sites_list, ssl_verify_map=None, timeout_map=None):
     """Параллельная HTTP-проверка всех сайтов (только status + response_time)"""
-    # 30 одновременных запросов: при таймауте 50 с недоступные сайты не растягивают цикл.
+    # 30 одновременных запросов: при долгом таймауте недоступные сайты не растягивают цикл.
     semaphore = asyncio.Semaphore(30)
     ssl_map = ssl_verify_map or {}
     timeout_map = timeout_map or {}
@@ -1928,6 +1954,90 @@ def _downtime_minutes(resolved_min=None, started_at=None, fallback_checks=0):
         secs = (datetime.datetime.now() - started_at).total_seconds()
         return max(1, int(secs // 60))
     return max(1, int(fallback_checks or 0))
+
+
+def _db_latency_start(site, start_time, response_time):
+    """Фиксирует подтверждённую задержку. Повторно открытую запись не дублирует."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM latency_events WHERE site = %s AND resolved = FALSE LIMIT 1", (site,))
+        if cur.fetchone() is None:
+            cur.execute("""
+                INSERT INTO latency_events (site, start_time, confirmed_time, max_response)
+                VALUES (%s, %s, %s, %s)
+            """, (site, start_time, datetime.datetime.now(), float(response_time)))
+            conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[LATENCY DB ERR] start {site}: {type(e).__name__}: {e}")
+
+
+def _db_latency_update(site, response_time):
+    """Обновляет максимальное время отклика открытой задержки."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE latency_events SET max_response = GREATEST(COALESCE(max_response, 0), %s)
+            WHERE site = %s AND resolved = FALSE
+        """, (float(response_time), site))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[LATENCY DB ERR] update {site}: {type(e).__name__}: {e}")
+
+
+def _db_latency_end(site, reason):
+    """Закрывает открытую задержку; возвращает длительность в минутах (минимум 1) или None."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE latency_events
+            SET end_time = %s,
+                duration_min = GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (%s - start_time))/60)::INT),
+                end_reason = %s,
+                resolved = TRUE
+            WHERE site = %s AND resolved = FALSE
+            RETURNING duration_min
+        """, (datetime.datetime.now(), datetime.datetime.now(), reason, site))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[LATENCY DB ERR] end {site}: {type(e).__name__}: {e}")
+        return None
+
+
+def _db_latency_open():
+    """Открытые задержки (site -> время начала) — восстановление состояния после перезапуска."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT site, MIN(start_time) FROM latency_events WHERE resolved = FALSE GROUP BY site")
+        rows = {r[0]: r[1] for r in cur.fetchall()}
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[LATENCY DB ERR] load: {type(e).__name__}: {e}")
+        return {}
+
+
+def _close_latency_silently(site, last_latency_map, reason):
+    """Закрывает задержку без сообщения в Telegram (сайт упал или удалён из мониторинга)."""
+    _latency_streak.pop(site, None)
+    _latency_max.pop(site, None)
+    if last_latency_map.get(site, False) or _latency_started.get(site) is not None:
+        _latency_started.pop(site, None)
+        last_latency_map[site] = False
+        _db_latency_end(site, reason)
+        print(f"[LATENCY END] {site} reason={reason} (без сообщения)")
 
 
 def _db_incident_resolve_by_id(incident_id):
@@ -2294,6 +2404,9 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                 print(f"[INCIDENT START] {site} fail={fail_count[site]} thr={alert_threshold} status={curr_status} (start: {incident_start})")
                 _db_incident_start(site, curr_status, ssl_chain_valid, incident_start)
                 print(f"[ALERT TRIGGER] {site} fail={fail_count[site]} thr={alert_threshold}")
+                # Задержка переходит в простой: закрываем её без отдельного сообщения, чтобы
+                # после восстановления не было пары «UP» + «СКОРОСТЬ ВОССТАНОВЛЕНА».
+                _close_latency_silently(site, last_latency_map, "down")
                 ok = send_tg_msg(f"🚨 DOWN: {site} (Код: {curr_status})")
                 print(f"[ALERT RESULT] {site} DOWN send_tg_msg={'OK' if ok else 'FAIL'}")
                 _send_screenshot_async(site, f"📸 Скриншот при падении: {site}")
@@ -2337,8 +2450,10 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
             if not last_latency_map.get(site, False):
                 slow_since = _latency_streak.pop(site, None)
                 if slow_since is not None and resp_time > LATENCY_CONFIRM_THRESHOLD_SECONDS:
-                    # Повторная проверка подтвердила задержку — сообщаем.
+                    # Повторная проверка подтвердила задержку — сообщаем и фиксируем в истории.
                     _latency_started[site] = slow_since
+                    _latency_max[site] = resp_time
+                    _db_latency_start(site, slow_since, resp_time)
                     ok = send_tg_msg(f"🐢 ЗАДЕРЖКА! {site}: {round(resp_time, 2)} сек.")
                     last_latency_map[site] = True
                 elif slow_since is None and resp_time > LATENCY_ALERT_THRESHOLD_SECONDS:
@@ -2346,11 +2461,18 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                     print(f"[LATENCY PENDING] {site} {round(resp_time, 2)}s — ждём подтверждения следующей проверкой")
             elif resp_time <= LATENCY_RECOVERY_THRESHOLD_SECONDS:
                 started = _latency_started.pop(site, None)
+                _latency_max.pop(site, None)
+                db_minutes = _db_latency_end(site, "recovered")
                 msg = f"⚡️ СКОРОСТЬ ВОССТАНОВЛЕНА! {site}: {round(resp_time, 2)} сек."
                 if started is not None:
                     msg += f" (Задержка длилась: {_downtime_minutes(started_at=started)} мин.)"
+                elif db_minutes:
+                    msg += f" (Задержка длилась: {db_minutes} мин.)"
                 ok = send_tg_msg(msg)
                 last_latency_map[site] = False
+            elif resp_time > _latency_max.get(site, 0):
+                _latency_max[site] = resp_time
+                _db_latency_update(site, resp_time)
     except Exception as e:
         print(f"[ERR] {site}: {e}")
 
@@ -2427,6 +2549,10 @@ def check_worker():
     fail_count = {}
     last_latency_map = {}
     first_fail_time = {}
+    # Открытые задержки из БД: после перезапуска задержка не теряется и её длительность известна.
+    restored_latency = _db_latency_open()
+    if restored_latency:
+        print(f"[LATENCY] restored open latency for {len(restored_latency)} sites")
 
     # Инициализация self-monitoring состояния
     for site in SELF_MONITORING_SITES:
@@ -2487,15 +2613,16 @@ def check_worker():
                 if site not in last_status:
                     last_status[site] = 200
                     fail_count[site] = 0
-                    last_latency_map[site] = False
+                    last_latency_map[site] = site in restored_latency
+                    if site in restored_latency:
+                        _latency_started[site] = restored_latency.pop(site)
             # Убираем удаленные сайты
             for site in list(last_status.keys()):
                 if site not in SITES and site not in SELF_MONITORING_SITES:
                     del last_status[site]
                     del fail_count[site]
+                    _close_latency_silently(site, last_latency_map, "removed")
                     del last_latency_map[site]
-                    _latency_streak.pop(site, None)
-                    _latency_started.pop(site, None)
 
             # SITES loaded from DB
             print(f"[WORKER] {len(SITES)} sites loaded, {len(_categories)} categories, thresholds={len(thresholds)} sites at {datetime.datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')}")
@@ -3187,7 +3314,7 @@ def _admin_page_inner(request, response):
             </select>
             <input type="number" id="newThreshold" value="5" min="1" max="60" style="width:80px;" title="Порог в минутах">
             <label style="display:flex;align-items:center;gap:6px;">Таймаут HTTP, с
-                <input type="number" id="newTimeout" value="50" min="1" max="60" step="1"
+                <input type="number" id="newTimeout" value="30" min="1" max="60" step="1"
                        required aria-label="Таймаут HTTP нового сайта, секунды" style="width:75px;">
             </label>
             <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
@@ -4907,6 +5034,29 @@ def _get_heavy_stats():
     return _heavy_stats.get()
 
 
+def _load_latency_events():
+    """История задержек за 30 дней (не больше 100 записей) для панели."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("""
+            SELECT site, start_time, resolved, end_reason, max_response,
+                CASE WHEN resolved THEN COALESCE(duration_min, 1)
+                     ELSE GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (NOW() - start_time))/60)::INT)
+                END AS dur
+            FROM latency_events
+            WHERE start_time > NOW() - INTERVAL '30 days' OR resolved = FALSE
+            ORDER BY start_time DESC LIMIT 100
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[LATENCY DB ERR] history: {type(e).__name__}: {e}")
+        return []
+
+
 def _build_dashboard_data():
     """Все SQL-запросы главной страницы; результат кладётся в _dashboard_cache."""
     conn = get_db_connection()
@@ -5036,6 +5186,7 @@ def _build_dashboard_data():
     conn.close()
 
     active_incidents = [r for r in incidents_list if not r.get('resolved', True)]
+    latency_events = _load_latency_events()
 
     # Загружаем динамические категории + сайты по категориям
     conn2 = get_db_connection()
@@ -5069,6 +5220,7 @@ def _build_dashboard_data():
         "latest": latest, "stats": stats,
         "incidents": incidents_list,
         "active_incidents": active_incidents,
+        "latency_events": latency_events,
         "group_agg": group_agg,
         "categories": categories_data,
         "sites_by_cat": sites_by_cat,
@@ -5288,10 +5440,14 @@ def _build_body(data: dict) -> str:
     unknown_sites = [s for s, v in latest.items()
                      if s in active_sites_set and v['status'] == CHECK_UNKNOWN]
     ssl_warn = [s for s, v in latest.items() if s in active_sites_set and 0 <= v['ssl_days'] <= 20]
+    latency_events = data.get("latency_events", [])
+    latency_active = {r['site']: r for r in latency_events if not r.get('resolved', True)}
+    # Отметка «Задержка»: ответ дольше порога начала или подтверждённая задержка ещё идёт.
     latency_warn = [s for s, v in latest.items()
                     if s in active_sites_set
-                    and v['response_time'] > LATENCY_ALERT_THRESHOLD_SECONDS
-                    and v['status'] == 200]
+                    and v['status'] == 200
+                    and (v['response_time'] > LATENCY_ALERT_THRESHOLD_SECONDS
+                         or s in latency_active)]
     active_incidents = [r for r in data.get("active_incidents", []) if r['site'] in active_sites_set]
 
     # Сборка предупреждений: объединяем ❌ + ⚠️ в одну строку
@@ -5326,7 +5482,8 @@ def _build_body(data: dict) -> str:
             all_warn_list.append(f"⚠️ {r['site']} (Инцидент {r['dur']} мин, {r['description']})")
     all_warn_list += (
         [f"🔒 {s} (SSL {latest[s]['ssl_days']}д)" for s in ssl_warn]
-        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 2)}с)"
+        + [f"🐢 {s} (Задержка {round(latest[s]['response_time'], 2)}с"
+           + (f", {latency_active[s]['dur']} мин" if s in latency_active else "") + ")"
            for s in latency_warn]
     )
 
@@ -5542,6 +5699,31 @@ def _build_body(data: dict) -> str:
         </div></div></div>""")
     else:
         H.append("""</tbody></table></div></div>""")
+
+    # История задержек — в той же вкладке «Инциденты», отдельной таблицей.
+    # Последний фрагмент закрывает вкладку t3 ("...</div></div>") — снимаем закрывающий </div>,
+    # таблица задержек добавляется внутрь вкладки и закрывает её сама.
+    if H[-1].endswith("</div></div>"):
+        H[-1] = H[-1][:-len("</div>")]
+    else:
+        H.append("<div>")
+    H.append("""<h3 style="margin:20px 0 8px;">🐢 Задержки (30 дней)</h3>
+    <div class="table-wrap"><table class="incidents-table latency-table"><thead><tr><th>Начало</th><th>Сайт</th>
+    <th>Длительность</th><th>Макс. отклик</th><th>Статус</th></tr></thead><tbody>""")
+    if not latency_events:
+        H.append('<tr><td colspan="5" style="text-align:center;color:#999;">Задержек не было</td></tr>')
+    for r in latency_events:
+        if r.get('resolved'):
+            badge = ('🔴 Перешла в простой', '#fee2e2;color:#991b1b') if r.get('end_reason') == 'down' \
+                else ('✅ Завершена', '#dcfce7;color:#166534')
+        else:
+            badge = ('🐢 Идёт', '#fef3c7;color:#92400e')
+        start = r['start_time']
+        start_txt = start.astimezone(TZ_MOSCOW).strftime('%d.%m %H:%M') if start else '—'
+        max_txt = f"{round(r['max_response'], 2)}с" if r.get('max_response') is not None else '—'
+        H.append(f"""<tr><td>{start_txt}</td><td>{escape(r['site'])}</td><td class='txt-warn'>{r['dur']} мин</td>
+            <td>{max_txt}</td><td><span style="font-size:12px;padding:3px 8px;border-radius:4px;background:{badge[1]}">{badge[0]}</span></td></tr>""")
+    H.append("""</tbody></table></div></div>""")
 
     H.append("""<div id="t4" class="tab-content">
     <div class="table-wrap"><table><thead><tr><th>Тип события</th><th>Сайт</th><th>Осталось дней</th>
