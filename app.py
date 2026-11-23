@@ -38,7 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.21-monitor.20"
+APP_VERSION = "2026.11.23-monitor.21"
 LATENCY_ALERT_THRESHOLD_SECONDS = 25
 # Keep recovery hysteresis to avoid repeated alerts around the warning boundary.
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
@@ -85,8 +85,48 @@ _cm_sites_set = set()
 SELF_SIGNED_SITES = set()
 
 # --- SEC-2: BCrypt-хеширование паролей через env ---
-AUTH_USERNAME = os.getenv("AUTH_USERNAME", "sibur")
-AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
+# Хеш bcrypt начинается с «$» и содержит «$» внутри; Amvera может искажать такие
+# значения переменных. Поэтому основной способ — AUTH_PASSWORD_HASH_B64 (хеш в base64).
+# AUTH_PASSWORD_HASH (хеш как есть) поддерживается для совместимости.
+_BCRYPT_HASH_RE = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
+
+
+def _clean_env_value(value):
+    """Убирает пробелы/переносы по краям и обрамляющие кавычки."""
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    return value
+
+
+def _load_auth_password_hash():
+    """Возвращает (хеш, источник, ошибка). Хеш — пустая строка, если не задан или неверен."""
+    b64 = _clean_env_value(os.getenv("AUTH_PASSWORD_HASH_B64", ""))
+    if b64:
+        try:
+            value = _clean_env_value(base64.b64decode(b64, validate=True).decode("utf-8"))
+        except Exception:
+            return "", "AUTH_PASSWORD_HASH_B64", "значение не является корректным base64"
+        source = "AUTH_PASSWORD_HASH_B64"
+    else:
+        value = _clean_env_value(os.getenv("AUTH_PASSWORD_HASH", ""))
+        source = "AUTH_PASSWORD_HASH"
+        if not value:
+            return "", "", "не задан ни AUTH_PASSWORD_HASH_B64, ни AUTH_PASSWORD_HASH"
+    if not _BCRYPT_HASH_RE.match(value):
+        return "", source, (f"значение не похоже на bcrypt-хеш (длина {len(value)}, "
+                            f"ожидается 60 символов вида $2b$12$...)")
+    return value, source, ""
+
+
+AUTH_USERNAME = _clean_env_value(os.getenv("AUTH_USERNAME", "sibur")) or "sibur"
+AUTH_PASSWORD_HASH, AUTH_HASH_SOURCE, AUTH_HASH_ERROR = _load_auth_password_hash()
+if AUTH_PASSWORD_HASH:
+    print(f"[AUTH] вход в панель: логин '{AUTH_USERNAME}', хеш из {AUTH_HASH_SOURCE} "
+          f"({AUTH_PASSWORD_HASH[:7]}..., корректный формат)", flush=True)
+else:
+    print(f"[AUTH] ВНИМАНИЕ: вход в панель невозможен — {AUTH_HASH_SOURCE or 'хеш'}: "
+          f"{AUTH_HASH_ERROR}", flush=True)
 
 # --- ADMIN: Пароль для вкладки Управление (bcrypt hash for "flvby") ---
 ADMIN_PASSWORD_HASH = "$2b$12$rsNPWPiJyP5NSwg71GUw9uBxPAbGk..gOD2W.CU9SGLrNuFO.bIgC"
@@ -350,10 +390,14 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
 
     try:
         scheme, credentials = auth.split()
-        decoded = base64.b64decode(credentials).decode("ascii")
+        decoded = base64.b64decode(credentials).decode("utf-8")
         u, p = decoded.split(":", 1)
 
-        if u == AUTH_USERNAME and AUTH_PASSWORD_HASH:
+        if u != AUTH_USERNAME:
+            print("[AUTH] отказ: неверный логин", flush=True)
+        elif not AUTH_PASSWORD_HASH:
+            print(f"[AUTH] отказ: хеш пароля не загружен — {AUTH_HASH_ERROR}", flush=True)
+        else:
             if bcrypt.checkpw(p.encode('utf-8'), AUTH_PASSWORD_HASH.encode('utf-8')):
                 response.set_cookie(
                     key="session_auth",
@@ -364,9 +408,15 @@ def check_auth(request: Request, response: Response, session_auth: str = Cookie(
                     samesite="lax"
                 )
                 return True
-    except Exception:
-        pass
-    raise HTTPException(status_code=401)
+            print("[AUTH] отказ: неверный пароль", flush=True)
+    except Exception as e:
+        print(f"[AUTH] отказ: некорректный заголовок Authorization ({type(e).__name__})", flush=True)
+    # Заголовок WWW-Authenticate нужен, чтобы браузер снова показал окно входа,
+    # а не повторял сохранённый старый пароль.
+    raise HTTPException(
+        status_code=401,
+        headers={"WWW-Authenticate": "Basic realm='Sibur Monitoring'"}
+    )
 
 
 # ============================================================================
