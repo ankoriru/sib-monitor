@@ -84,12 +84,13 @@ class LatencyThresholdTests(unittest.TestCase):
         self.sample(30)
         self.telegram.assert_not_called()
 
-    def test_above_15_then_two_above_10_alerts_once_on_third_check(self):
+    def test_above_15_then_four_above_10_alerts_once_on_fifth_check(self):
         self.sample(15.01)
         self.telegram.assert_not_called()
-        self.sample(10.02)
-        self.telegram.assert_not_called()
-        self.assertFalse(self.latency.get("latency.example", False))
+        for elapsed in (10.02, 10.03, 10.04):
+            self.sample(elapsed)
+            self.telegram.assert_not_called()
+            self.assertFalse(self.latency.get("latency.example", False))
         self.sample(10.01)
         self.telegram.assert_called_once()
         self.assertIn("ЗАДЕРЖКА", self.telegram.call_args.args[0])
@@ -101,25 +102,34 @@ class LatencyThresholdTests(unittest.TestCase):
         self.telegram.assert_called_once()
         self.incident.assert_not_called()
 
-    def test_two_slow_checks_are_not_enough(self):
+    def test_four_slow_checks_are_not_enough(self):
         self.sample(20)
         self.sample(12)
-        self.assertEqual(app._latency_streak["latency.example"][0], 2)
-        self.sample(10)  # третья проверка не дольше 10 с — задержка не подтверждена
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(app._latency_streak["latency.example"][0], 4)
+        self.sample(10)  # пятая проверка не дольше 10 с — задержка не подтверждена
         self.telegram.assert_not_called()
         self.assertNotIn("latency.example", app._latency_streak)
         self.db_start.assert_not_called()
 
-    def test_failure_on_third_check_breaks_confirmation(self):
-        self.sample(20, threshold=5)
-        self.sample(12, threshold=5)
+    def test_three_slow_checks_are_not_enough(self):
+        for elapsed in (20, 12, 12):
+            self.sample(elapsed)
+        self.telegram.assert_not_called()
+        self.assertEqual(app._latency_streak["latency.example"][0], 3)
+
+    def test_failure_on_fifth_check_breaks_confirmation(self):
+        for elapsed in (20, 12, 12, 12):
+            self.sample(elapsed, threshold=5)
         self.sample(0, status=0, threshold=5)
         self.sample(12, threshold=5)
         self.assertFalse(any("ЗАДЕРЖКА" in m for m in self.messages()))
 
-    def test_third_check_above_15_also_confirms(self):
-        self.sample(20)
-        self.sample(25)
+    def test_checks_above_15_also_confirm_on_fifth(self):
+        for elapsed in (20, 25, 29, 16):
+            self.sample(elapsed)
+        self.telegram.assert_not_called()
         self.sample(29)
         self.assertIn("ЗАДЕРЖКА", self.messages()[0])
 
@@ -132,13 +142,15 @@ class LatencyThresholdTests(unittest.TestCase):
         for elapsed in (16, 10, 9, 15, 5, 12):
             self.sample(elapsed)
         self.telegram.assert_not_called()
-        for elapsed in (16, 11, 12, 10.5, 15, 20, 11):
+        for elapsed in (16, 11, 12, 10.5, 15, 20, 11):  # подтверждение на пятой (15 с)
             self.sample(elapsed)
         self.telegram.assert_called_once()
         self.assertTrue(self.latency["latency.example"])
 
     def test_recovery_at_10_seconds_inclusive(self):
         self.sample(16)
+        self.sample(11)
+        self.sample(11)
         self.sample(11)
         self.sample(10.01)
         self.assertEqual(self.telegram.call_count, 1)
@@ -159,8 +171,8 @@ class LatencyThresholdTests(unittest.TestCase):
     def test_recovery_reports_duration_from_first_slow_check(self):
         self.sample(30)
         first_slow = app._latency_streak["latency.example"][1]
-        self.sample(12)
-        self.sample(12)
+        for _ in range(4):
+            self.sample(12)
         self.assertEqual(app._latency_started["latency.example"], first_slow)
         # Задержка началась 17 минут назад — с первой медленной проверки.
         app._latency_started["latency.example"] = (
@@ -174,9 +186,8 @@ class LatencyThresholdTests(unittest.TestCase):
         self.assertNotIn("latency.example", app._latency_started)
 
     def test_short_latency_duration_is_at_least_one_minute(self):
-        self.sample(30)
-        self.sample(30)
-        self.sample(30)
+        for _ in range(5):
+            self.sample(30)
         self.sample(1)
         self.assertIn("Задержка длилась: 1 мин.", self.telegram.call_args.args[0])
 
@@ -188,9 +199,8 @@ class LatencyThresholdTests(unittest.TestCase):
         self.assertNotIn("длилась", text)
 
     def test_down_during_latency_closes_it_without_double_message(self):
-        self.sample(20)
-        self.sample(12)
-        self.sample(12)
+        for elapsed in (20, 12, 12, 12, 12):
+            self.sample(elapsed)
         self.assertTrue(self.latency["latency.example"])
         self.sample(0, status=0)  # порог 1 — сразу DOWN
         self.assertFalse(self.latency["latency.example"])
@@ -205,9 +215,8 @@ class LatencyThresholdTests(unittest.TestCase):
         self.assertFalse(any("СКОРОСТЬ ВОССТАНОВЛЕНА" in m for m in msgs))
 
     def test_short_failure_below_down_threshold_keeps_latency(self):
-        self.sample(20, threshold=5)
-        self.sample(12, threshold=5)
-        self.sample(12, threshold=5)
+        for elapsed in (20, 12, 12, 12, 12):
+            self.sample(elapsed, threshold=5)
         self.sample(0, status=0, threshold=5)
         self.assertTrue(self.latency["latency.example"])
         self.db_end.assert_not_called()
@@ -218,8 +227,9 @@ class LatencyThresholdTests(unittest.TestCase):
     def test_latency_is_recorded_in_history(self):
         self.sample(20)
         first_slow = app._latency_streak["latency.example"][1]
-        self.sample(13)
-        self.db_start.assert_not_called()
+        for elapsed in (13, 13, 13):
+            self.sample(elapsed)
+            self.db_start.assert_not_called()
         self.sample(12)
         self.db_start.assert_called_once_with("latency.example", first_slow, 12)
         self.sample(11)      # не выше максимума — без записи

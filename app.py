@@ -38,13 +38,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 TZ_MOSCOW = pytz.timezone('Europe/Moscow')
-APP_VERSION = "2026.11.24-monitor.29"
+APP_VERSION = "2026.11.26-monitor.30"
 LATENCY_ALERT_THRESHOLD_SECONDS = 15
 # Задержка сообщается только после подтверждения: первая проверка дольше
 # LATENCY_ALERT_THRESHOLD_SECONDS, каждая следующая — дольше LATENCY_CONFIRM_THRESHOLD_SECONDS;
-# всего LATENCY_CONFIRM_CHECKS медленных проверок подряд (первая + две подтверждающие).
+# всего LATENCY_CONFIRM_CHECKS медленных проверок подряд (первая + четыре подтверждающие).
 LATENCY_CONFIRM_THRESHOLD_SECONDS = 10
-LATENCY_CONFIRM_CHECKS = 3
+LATENCY_CONFIRM_CHECKS = 5
 # Задержка заканчивается, когда ответ не дольше этого порога («скорость восстановлена»).
 LATENCY_RECOVERY_THRESHOLD_SECONDS = 10
 # Сайты, у которых задержка началась, но ещё не подтверждена:
@@ -2457,7 +2457,7 @@ def _process_site_result(site, curr_status, resp_time, ssl_d, dom_d, ssl_chain_v
                     print(f"[LATENCY PENDING] {site} {round(resp_time, 2)}s — подтверждение "
                           f"{pending[0] + 1}/{LATENCY_CONFIRM_CHECKS}")
                 elif pending is not None and resp_time > LATENCY_CONFIRM_THRESHOLD_SECONDS:
-                    # Третья подряд медленная проверка подтвердила задержку — сообщаем и фиксируем.
+                    # Пятая подряд медленная проверка подтвердила задержку — сообщаем и фиксируем.
                     slow_since = pending[1]
                     _latency_started[site] = slow_since
                     _latency_max[site] = resp_time
